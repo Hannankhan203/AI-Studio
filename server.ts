@@ -6,6 +6,41 @@ import fs from 'fs';
 import crypto from 'crypto';
 import multer from 'multer';
 import { GoogleGenAI } from '@google/genai';
+// @ts-ignore - Document extraction JavaScript service
+import { extractDocumentContent } from './src/services/documentExtractor.js';
+
+export interface DocumentExtractionResult {
+  fileId: string;
+  filename: string;
+  originalName: string;
+  format: string;
+  mimeType: string;
+  sizeBytes: number;
+  status: string;
+  success: boolean;
+  text: string;
+  summaryText?: string;
+  totalCharacters: number;
+  totalWords: number;
+  pageCount?: number;
+  pages?: Array<{ pageNumber: number; text: string; charCount: number }>;
+  slideCount?: number;
+  slides?: Array<{ slideNumber: number; title?: string; text: string; notes?: string; charCount: number }>;
+  sectionCount?: number;
+  sections?: Array<{ heading: string; level: number; content: string; charCount: number }>;
+  table?: {
+    headers: string[];
+    rowCount: number;
+    columnCount: number;
+    previewRows: string[][];
+    markdownTable: string;
+  };
+  isScanned?: boolean;
+  isTruncated?: boolean;
+  warning?: string;
+  error?: string;
+  extractedAt: string;
+}
 
 dotenv.config();
 
@@ -833,7 +868,7 @@ const uploadMiddleware = multer({
     fileSize: MAX_FILE_SIZE_BYTES,
     files: MAX_ATTACHMENTS_PER_UPLOAD
   },
-  fileFilter: uploadFilter
+  fileFilter: uploadFilter as any
 });
 
 interface UploadedFileRecord {
@@ -847,6 +882,7 @@ interface UploadedFileRecord {
   status: 'uploaded' | 'ready';
   uploadedAt: string;
   expiresAt: number;
+  extraction?: DocumentExtractionResult;
 }
 
 // In-memory registry tracking uploaded temporary files and their lifecycle
@@ -902,6 +938,63 @@ app.get(['/api/upload/config', '/upload/config'], (_req, res) => {
   });
 });
 
+// Upload Attachment Metadata Endpoint
+app.get(['/api/upload/:id', '/upload/:id'], (req, res) => {
+  const fileId = req.params.id;
+  if (!fileId || !/^[0-9a-fA-F-]{36}$/.test(fileId)) {
+    return res.status(400).json({ error: 'Invalid attachment ID format.' });
+  }
+
+  const record = fileRegistry.get(fileId);
+  if (!record) {
+    return res.status(404).json({ error: 'Attachment not found or has expired.' });
+  }
+
+  return res.json({
+    id: record.id,
+    name: record.originalName,
+    originalName: record.originalName,
+    extension: record.extension,
+    mimeType: record.mimeType,
+    type: record.mimeType,
+    size: record.size,
+    formattedSize: record.formattedSize,
+    status: record.status,
+    uploadedAt: record.uploadedAt,
+    expiresAt: record.expiresAt,
+    extraction: record.extraction
+  });
+});
+
+// Dedicated Document Extraction Detail Endpoint
+app.get(['/api/upload/:id/extraction', '/upload/:id/extraction'], async (req, res) => {
+  const fileId = req.params.id;
+  if (!fileId || !/^[0-9a-fA-F-]{36}$/.test(fileId)) {
+    return res.status(400).json({ error: 'Invalid attachment ID format.' });
+  }
+
+  const record = fileRegistry.get(fileId);
+  if (!record) {
+    return res.status(404).json({ error: 'Attachment not found or has expired.' });
+  }
+
+  if (record.extraction) {
+    return res.json(record.extraction);
+  }
+
+  const filePath = path.join(UPLOAD_DIR, record.diskFilename);
+  const ext = path.extname(record.diskFilename);
+  const extraction = (await extractDocumentContent(
+    filePath,
+    record.originalName,
+    ext,
+    record.mimeType,
+    record.id
+  )) as DocumentExtractionResult;
+  record.extraction = extraction;
+  return res.json(extraction);
+});
+
 // Upload Deletion Endpoint (cleans up staging file if removed before submission)
 app.delete(['/api/upload/:id', '/upload/:id'], async (req, res) => {
   const fileId = req.params.id;
@@ -926,7 +1019,7 @@ app.delete(['/api/upload/:id', '/upload/:id'], async (req, res) => {
 
 // Dedicated Multipart File Upload Endpoint
 app.post(['/api/upload', '/upload'], (req, res) => {
-  uploadMiddleware.array('files', MAX_ATTACHMENTS_PER_UPLOAD)(req, res, async (err: any) => {
+  uploadMiddleware.array('files', MAX_ATTACHMENTS_PER_UPLOAD)(req as any, res as any, async (err: any) => {
     if (err) {
       if (err instanceof multer.MulterError) {
         if (err.code === 'LIMIT_FILE_SIZE') {
@@ -1020,6 +1113,25 @@ app.post(['/api/upload', '/upload'], (req, res) => {
       });
     }
 
+    // Execute server-side text and structure extraction for each uploaded file
+    for (const rec of uploadedResults) {
+      try {
+        const fullDiskPath = path.join(UPLOAD_DIR, rec.diskFilename);
+        const ext = path.extname(rec.diskFilename);
+        const extraction = (await extractDocumentContent(
+          fullDiskPath,
+          rec.originalName,
+          ext,
+          rec.mimeType,
+          rec.id
+        )) as DocumentExtractionResult;
+        rec.extraction = extraction;
+        rec.status = extraction.success || extraction.status === 'scanned_or_image_only' ? 'ready' : 'uploaded';
+      } catch (err: any) {
+        console.warn(`[Document Extraction] Extraction error for ${rec.originalName}:`, err);
+      }
+    }
+
     // Return structured metadata without exposing server-internal storage paths
     return res.status(200).json({
       success: true,
@@ -1034,7 +1146,24 @@ app.post(['/api/upload', '/upload'], (req, res) => {
         size: r.size,
         formattedSize: r.formattedSize,
         status: r.status,
-        uploadedAt: r.uploadedAt
+        uploadedAt: r.uploadedAt,
+        extraction: r.extraction
+          ? {
+              status: r.extraction.status,
+              success: r.extraction.success,
+              format: r.extraction.format,
+              totalCharacters: r.extraction.totalCharacters,
+              totalWords: r.extraction.totalWords,
+              summaryText: r.extraction.summaryText,
+              pageCount: r.extraction.pageCount,
+              slideCount: r.extraction.slideCount,
+              sectionCount: r.extraction.sectionCount,
+              isScanned: r.extraction.isScanned,
+              isTruncated: r.extraction.isTruncated,
+              warning: r.extraction.warning,
+              error: r.extraction.error
+            }
+          : undefined
       }))
     });
   });
