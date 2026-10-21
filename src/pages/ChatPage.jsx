@@ -666,7 +666,8 @@ export default function ChatPage() {
     historyContext,
     targetChatId,
     assistantMessageId,
-    overrideProvider = null
+    overrideProvider = null,
+    currentAttachments = []
   ) => {
     const providerToUse = overrideProvider || selectedProvider;
     setIsLoading(true);
@@ -847,6 +848,8 @@ export default function ChatPage() {
           beginnerFriendly: Boolean(settings?.beginnerFriendly)
         },
         signal: abortController.signal,
+        conversationId: targetChatId,
+        attachments: currentAttachments,
 
         onStart: ({ modelUsed, provider: reportedProvider } = {}) => {
           if (modelUsed) activeModel = modelUsed;
@@ -1167,6 +1170,9 @@ export default function ChatPage() {
       if (filesToUpload.length > 0) {
         try {
           const formData = new FormData();
+          if (activeChatIdRef.current) {
+            formData.append('conversationId', activeChatIdRef.current);
+          }
           filesToUpload.forEach((att) => {
             formData.append('files', att.file, att.name);
           });
@@ -1213,7 +1219,8 @@ export default function ChatPage() {
           formattedSize: att.formattedSize,
           type: att.type || att.mimeType,
           extension: att.extension,
-          status: att.status || 'uploaded'
+          status: att.status || 'uploaded',
+          extraction: att.extraction
         }));
       }
     }
@@ -1347,7 +1354,9 @@ export default function ChatPage() {
         promptText,
         validHistory,
         currentChatId,
-        assistantMessageId
+        assistantMessageId,
+        null,
+        processedAttachments
       );
       return true;
     } catch (error) {
@@ -1405,12 +1414,17 @@ export default function ChatPage() {
       (message) => !message.isError && !message.isInterrupted
     );
 
+    const failedIdx = messages.findIndex((m) => m.id === failedMessage.id);
+    const precedingUser = failedIdx > 0 ? messages[failedIdx - 1] : null;
+    const retryAttachments = precedingUser?.attachments || [];
+
     void executePrompt(
       failedMessage.failedPrompt,
       validHistory,
       currentChatId,
       assistantMessageId,
-      providerToUse
+      providerToUse,
+      retryAttachments
     );
   };
 
@@ -1462,12 +1476,17 @@ export default function ChatPage() {
       (message) => !message.isError && !message.isInterrupted
     );
 
+    const failedSwitchIdx = messages.findIndex((m) => m.id === failedMessage.id);
+    const precedingSwitchUser = failedSwitchIdx > 0 ? messages[failedSwitchIdx - 1] : null;
+    const switchAttachments = precedingSwitchUser?.attachments || [];
+
     void executePrompt(
       failedMessage.failedPrompt,
       validHistory,
       currentChatId,
       assistantMessageId,
-      newProviderId
+      newProviderId,
+      switchAttachments
     );
   };
 
@@ -1536,11 +1555,15 @@ export default function ChatPage() {
       )
     );
 
+    const precedingAttachments = precedingUserMessage?.attachments || [];
+
     await executePrompt(
       userPromptText,
       validHistory,
       currentChatId,
-      targetAssistantId
+      targetAssistantId,
+      null,
+      precedingAttachments
     );
   };
 
@@ -1720,7 +1743,9 @@ export default function ChatPage() {
       trimmed,
       validHistory,
       currentChatId,
-      assistantMessageId
+      assistantMessageId,
+      null,
+      updatedUserMessage.attachments || []
     );
   };
 

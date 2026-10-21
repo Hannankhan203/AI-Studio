@@ -8,6 +8,14 @@ import multer from 'multer';
 import { GoogleGenAI } from '@google/genai';
 // @ts-ignore - Document extraction JavaScript service
 import { extractDocumentContent } from './src/services/documentExtractor.js';
+import {
+  prepareDocumentContext,
+  generateSimulatedDocumentResponse,
+  adaptDocumentContextForProvider,
+  formatOpenAIMessages,
+  DocumentData,
+  PreparedDocumentContext
+} from './src/services/documentContextService.ts';
 
 export interface DocumentExtractionResult {
   fileId: string;
@@ -882,11 +890,14 @@ interface UploadedFileRecord {
   status: 'uploaded' | 'ready';
   uploadedAt: string;
   expiresAt: number;
+  conversationId?: string;
   extraction?: DocumentExtractionResult;
 }
 
 // In-memory registry tracking uploaded temporary files and their lifecycle
 const fileRegistry = new Map<string, UploadedFileRecord>();
+// Conversation to file IDs association mapping (strictly isolates documents per conversation)
+const conversationDocuments = new Map<string, Set<string>>();
 
 /**
  * Automated lifecycle cleanup: Sweeps the temporary upload directory and registry,
@@ -1004,6 +1015,9 @@ app.delete(['/api/upload/:id', '/upload/:id'], async (req, res) => {
 
   const record = fileRegistry.get(fileId);
   fileRegistry.delete(fileId);
+  if (record?.conversationId && conversationDocuments.has(record.conversationId)) {
+    conversationDocuments.get(record.conversationId)!.delete(fileId);
+  }
 
   try {
     const files = await fs.promises.readdir(UPLOAD_DIR);
@@ -1055,6 +1069,7 @@ app.post(['/api/upload', '/upload'], (req, res) => {
       });
     }
 
+    const conversationId = req.body?.conversationId ? String(req.body.conversationId).trim() : undefined;
     const uploadedResults: UploadedFileRecord[] = [];
     const validationErrors: string[] = [];
 
@@ -1092,10 +1107,19 @@ app.post(['/api/upload', '/upload'], (req, res) => {
         formattedSize: formatBytes(file.size),
         status: 'uploaded',
         uploadedAt: nowIso,
-        expiresAt: Date.now() + TEMP_FILE_TTL_MS
+        expiresAt: Date.now() + TEMP_FILE_TTL_MS,
+        conversationId
       };
 
       fileRegistry.set(fileId, record);
+      if (conversationId) {
+        let docSet = conversationDocuments.get(conversationId);
+        if (!docSet) {
+          docSet = new Set<string>();
+          conversationDocuments.set(conversationId, docSet);
+        }
+        docSet.add(fileId);
+      }
       uploadedResults.push(record);
     }
 
@@ -1103,6 +1127,9 @@ app.post(['/api/upload', '/upload'], (req, res) => {
     if (validationErrors.length > 0) {
       for (const rec of uploadedResults) {
         fileRegistry.delete(rec.id);
+        if (conversationId && conversationDocuments.has(conversationId)) {
+          conversationDocuments.get(conversationId)!.delete(rec.id);
+        }
         try {
           await fs.promises.unlink(path.join(UPLOAD_DIR, rec.diskFilename));
         } catch (_) {}
@@ -1196,15 +1223,19 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
       history = [],
       username = null,
       preferences = null,
-      stream = true
+      stream = true,
+      conversationId = null,
+      attachments = []
     } = req.body as {
       provider?: string;
       mode?: string;
       prompt?: string;
-      history?: Array<{ sender?: string; content?: string }>;
+      history?: Array<{ sender?: string; content?: string; attachments?: any[] }>;
       username?: string | null;
       preferences?: UserPreferences | null;
       stream?: boolean;
+      conversationId?: string | null;
+      attachments?: any[];
     };
 
     if (!prompt || typeof prompt !== 'string') {
@@ -1219,14 +1250,135 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
       }
     });
 
+    // Associate attachments sent in this turn with the conversation
+    if (conversationId && Array.isArray(attachments)) {
+      let docSet = conversationDocuments.get(conversationId);
+      if (!docSet) {
+        docSet = new Set<string>();
+        conversationDocuments.set(conversationId, docSet);
+      }
+      for (const att of attachments) {
+        if (att?.id) {
+          docSet.add(att.id);
+          const existing = fileRegistry.get(att.id);
+          if (existing) {
+            existing.conversationId = conversationId;
+          } else if (att.extraction) {
+            fileRegistry.set(att.id, {
+              id: att.id,
+              originalName: att.originalName || att.name || 'document',
+              diskFilename: att.id,
+              mimeType: att.type || att.mimeType || 'application/octet-stream',
+              extension: att.extension || '',
+              size: att.size || 0,
+              formattedSize: att.formattedSize || '',
+              status: att.status || 'ready',
+              uploadedAt: att.uploadedAt || new Date().toISOString(),
+              expiresAt: Date.now() + TEMP_FILE_TTL_MS,
+              conversationId,
+              extraction: att.extraction
+            });
+          }
+        }
+      }
+    }
+
+    // Collect available documents for this specific conversation (Requirement 3: strict conversation isolation)
+    const availableDocs: DocumentData[] = [];
+    const seenDocIds = new Set<string>();
+
+    const addDocIfValid = (docData: DocumentData, fromConvId?: string) => {
+      // Never use a document associated with a different conversation!
+      if (fromConvId && conversationId && fromConvId !== conversationId) {
+        return;
+      }
+      const docKey = docData.fileId || docData.id || docData.originalName || docData.filename;
+      if (docKey && !seenDocIds.has(docKey)) {
+        seenDocIds.add(docKey);
+        availableDocs.push(docData);
+      }
+    };
+
+    // 1. Current turn attachments
+    if (Array.isArray(attachments)) {
+      for (const att of attachments) {
+        if (!att?.id) continue;
+        const record = fileRegistry.get(att.id);
+        if (record?.extraction) {
+          addDocIfValid(record.extraction as DocumentData, record.conversationId);
+        } else if (att.extraction) {
+          addDocIfValid(att.extraction as DocumentData, conversationId || undefined);
+        }
+      }
+    }
+
+    // 2. Attachments in history of this conversation
+    if (Array.isArray(history)) {
+      for (const hMsg of history) {
+        if (Array.isArray(hMsg?.attachments)) {
+          for (const hAtt of hMsg.attachments) {
+            if (!hAtt?.id) continue;
+            const record = fileRegistry.get(hAtt.id);
+            if (record?.extraction) {
+              addDocIfValid(record.extraction as DocumentData, record.conversationId || conversationId || undefined);
+            } else if (hAtt.extraction) {
+              addDocIfValid(hAtt.extraction as DocumentData, conversationId || undefined);
+            }
+          }
+        }
+      }
+    }
+
+    // 3. Conversation-registered files for this conversation
+    if (conversationId && conversationDocuments.has(conversationId)) {
+      const convSet = conversationDocuments.get(conversationId)!;
+      for (const fileId of convSet) {
+        const record = fileRegistry.get(fileId);
+        if (record?.extraction) {
+          addDocIfValid(record.extraction as DocumentData, record.conversationId || conversationId);
+        }
+      }
+    }
+
+    // Prepare document context for the prompt
+    const prepDoc = prepareDocumentContext(prompt, availableDocs);
+    const normalizedProvider = String(provider).toLowerCase();
+    const shouldStream = stream !== false;
+
+    // If an immediate direct answer is determined (e.g. unreadable scanned file, empty doc, page out of bounds)
+    if (prepDoc.directAnswer) {
+      if (!shouldStream) {
+        return res.json({
+          text: prepDoc.directAnswer,
+          modelUsed: 'Document Analyzer',
+          provider: normalizedProvider
+        });
+      }
+      initSSE(res);
+      sendSSE(res, { type: 'start', modelUsed: 'Document Analyzer', provider: normalizedProvider });
+      sendSSE(res, { type: 'chunk', text: prepDoc.directAnswer });
+      sendSSE(res, { type: 'done', text: prepDoc.directAnswer, modelUsed: 'Document Analyzer', provider: normalizedProvider });
+      res.end();
+      return;
+    }
+
     const cleanUsername =
       typeof username === 'string' && username.trim()
         ? username.trim().slice(0, 50).replace(/[\r\n\t]/g, ' ')
         : null;
 
-    const systemInstruction = buildSystemInstruction(cleanUsername, preferences, mode);
-    const normalizedProvider = String(provider).toLowerCase();
-    const shouldStream = stream !== false;
+    const baseSystemInstruction = buildSystemInstruction(cleanUsername, preferences, mode);
+
+    // Shared Provider-Independent Document Context Adaptation (Requirements 2, 3, 5, 7, 8)
+    const adapted = adaptDocumentContextForProvider({
+      provider: normalizedProvider,
+      prompt,
+      baseSystemInstruction,
+      preparedContext: prepDoc
+    });
+
+    const effectiveSystemInstruction = adapted.effectiveSystemInstruction;
+    const effectivePrompt = adapted.effectivePrompt;
 
     // 1. Google Gemini Provider
     if (normalizedProvider === 'gemini') {
@@ -1234,24 +1386,27 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
       // If no API key is configured, return simulated response (with progressive reveal if streaming)
       if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-        const text = generateSimulatedResponse(prompt, cleanUsername, preferences, mode);
+        const text = availableDocs.length > 0
+          ? generateSimulatedDocumentResponse(prompt, prepDoc)
+          : generateSimulatedResponse(prompt, cleanUsername, preferences, mode);
+        const demoModel = availableDocs.length > 0 ? 'Document Analyzer (demo)' : 'gemini-3.1-flash-lite (demo)';
         if (!shouldStream) {
           return res.json({
             text,
-            modelUsed: 'gemini-3.1-flash-lite (demo)',
+            modelUsed: demoModel,
             provider: 'gemini'
           });
         }
         initSSE(res);
-        sendSSE(res, { type: 'start', modelUsed: 'gemini-3.1-flash-lite (demo)', provider: 'gemini' });
+        sendSSE(res, { type: 'start', modelUsed: demoModel, provider: 'gemini' });
         const tokens = text.split(/(\s+)/);
         for (const token of tokens) {
           if (isClientClosed || res.writableEnded) break;
           sendSSE(res, { type: 'chunk', text: token });
-          await new Promise((r) => setTimeout(r, 20));
+          await new Promise((r) => setTimeout(r, 15));
         }
         if (!res.writableEnded) {
-          sendSSE(res, { type: 'done', text, modelUsed: 'gemini-3.1-flash-lite (demo)', provider: 'gemini' });
+          sendSSE(res, { type: 'done', text, modelUsed: demoModel, provider: 'gemini' });
           res.end();
         }
         return;
@@ -1266,7 +1421,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         }
       });
 
-      const contents = formatGeminiHistory(history, prompt);
+      const contents = formatGeminiHistory(history, effectivePrompt);
       // Attempt sequence: max 3 attempts total (initial attempt + up to 2 retries)
       // Attempt 1 & 2 try gemini-3.8-flash (primary recommended model)
       // Attempt 3 tries gemini-3.1-flash-lite (alternative fallback model)
@@ -1289,7 +1444,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
               model,
               contents,
               config: {
-                systemInstruction
+                systemInstruction: effectiveSystemInstruction
               }
             });
 
@@ -1371,7 +1526,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
               model,
               contents,
               config: {
-                systemInstruction
+                systemInstruction: effectiveSystemInstruction
               }
             });
 
@@ -1506,44 +1661,37 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
     if (normalizedProvider === 'groq') {
       const apiKey = process.env.GROQ_API_KEY || process.env.VITE_GROQ_API_KEY;
       if (!apiKey || apiKey === 'YOUR_GROQ_API_KEY') {
-        const text = generateSimulatedResponse(prompt, cleanUsername, preferences, mode);
+        const text = availableDocs.length > 0
+          ? generateSimulatedDocumentResponse(prompt, prepDoc)
+          : generateSimulatedResponse(prompt, cleanUsername, preferences, mode);
+        const demoModel = availableDocs.length > 0 ? 'Document Analyzer (demo)' : 'Llama 3.3 70B (demo)';
         if (!shouldStream) {
           return res.json({
             text,
-            modelUsed: 'Llama 3.3 70B (demo)',
+            modelUsed: demoModel,
             provider: 'groq'
           });
         }
         initSSE(res);
-        sendSSE(res, { type: 'start', modelUsed: 'Llama 3.3 70B (demo)', provider: 'groq' });
+        sendSSE(res, { type: 'start', modelUsed: demoModel, provider: 'groq' });
         const tokens = text.split(/(\s+)/);
         for (const token of tokens) {
           if (isClientClosed || res.writableEnded) break;
           sendSSE(res, { type: 'chunk', text: token });
-          await new Promise((r) => setTimeout(r, 20));
+          await new Promise((r) => setTimeout(r, 15));
         }
         if (!res.writableEnded) {
-          sendSSE(res, { type: 'done', text, modelUsed: 'Llama 3.3 70B (demo)', provider: 'groq' });
+          sendSSE(res, { type: 'done', text, modelUsed: demoModel, provider: 'groq' });
           res.end();
         }
         return;
       }
 
-      const messages = [
-        {
-          role: 'system',
-          content: systemInstruction
-        }
-      ];
-
-      for (const msg of history.slice(-12)) {
-        if (!msg.content) continue;
-        messages.push({
-          role: msg.sender === 'user' ? 'user' : 'assistant',
-          content: msg.content.trim()
-        });
-      }
-      messages.push({ role: 'user', content: prompt.trim() });
+      const messages = formatOpenAIMessages({
+        systemInstruction: effectiveSystemInstruction,
+        history,
+        prompt: effectivePrompt
+      });
 
       if (!shouldStream) {
         const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -1561,8 +1709,17 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
         if (!groqRes.ok) {
           const errText = await groqRes.text();
+          let friendlyError = `Groq request failed (${groqRes.status}): ${errText}`;
+          if (errText.includes('context_length_exceeded') || errText.includes('maximum context length') || errText.includes('tokens')) {
+            friendlyError = 'The attached document exceeds Groq\'s context length limit. Please switch to Google Gemini (which supports 1M tokens) or ask about specific pages or slides.';
+          }
           return res.status(groqRes.status).json({
-            error: `Groq request failed (${groqRes.status}): ${errText}`
+            error: friendlyError,
+            code: groqRes.status,
+            provider: 'groq',
+            model: 'openai/gpt-oss-120b',
+            canFallback: true,
+            suggestedProviders: ['gemini', 'openrouter']
           });
         }
 
@@ -1590,8 +1747,17 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
         if (!groqRes.ok) {
           const errText = await groqRes.text();
+          let friendlyError = `Groq request failed (${groqRes.status}): ${errText}`;
+          if (errText.includes('context_length_exceeded') || errText.includes('maximum context length') || errText.includes('tokens')) {
+            friendlyError = 'The attached document exceeds Groq\'s context length limit. Please switch to Google Gemini (which supports 1M tokens) or ask about specific pages or slides.';
+          }
           return res.status(groqRes.status).json({
-            error: `Groq request failed (${groqRes.status}): ${errText}`
+            error: friendlyError,
+            code: groqRes.status,
+            provider: 'groq',
+            model: 'openai/gpt-oss-120b',
+            canFallback: true,
+            suggestedProviders: ['gemini', 'openrouter']
           });
         }
 
@@ -1641,44 +1807,37 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
     if (normalizedProvider === 'openrouter') {
       const apiKey = process.env.OPENROUTER_API_KEY || process.env.VITE_OPENROUTER_API_KEY;
       if (!apiKey || apiKey === 'YOUR_OPENROUTER_API_KEY') {
-        const text = generateSimulatedResponse(prompt, cleanUsername, preferences, mode);
+        const text = availableDocs.length > 0
+          ? generateSimulatedDocumentResponse(prompt, prepDoc)
+          : generateSimulatedResponse(prompt, cleanUsername, preferences, mode);
+        const demoModel = availableDocs.length > 0 ? 'Document Analyzer (demo)' : 'openrouter/free (demo)';
         if (!shouldStream) {
           return res.json({
             text,
-            modelUsed: 'openrouter/free (demo)',
+            modelUsed: demoModel,
             provider: 'openrouter'
           });
         }
         initSSE(res);
-        sendSSE(res, { type: 'start', modelUsed: 'openrouter/free (demo)', provider: 'openrouter' });
+        sendSSE(res, { type: 'start', modelUsed: demoModel, provider: 'openrouter' });
         const tokens = text.split(/(\s+)/);
         for (const token of tokens) {
           if (isClientClosed || res.writableEnded) break;
           sendSSE(res, { type: 'chunk', text: token });
-          await new Promise((r) => setTimeout(r, 20));
+          await new Promise((r) => setTimeout(r, 15));
         }
         if (!res.writableEnded) {
-          sendSSE(res, { type: 'done', text, modelUsed: 'openrouter/free (demo)', provider: 'openrouter' });
+          sendSSE(res, { type: 'done', text, modelUsed: demoModel, provider: 'openrouter' });
           res.end();
         }
         return;
       }
 
-      const messages = [
-        {
-          role: 'system',
-          content: systemInstruction
-        }
-      ];
-
-      for (const msg of history.slice(-12)) {
-        if (!msg.content) continue;
-        messages.push({
-          role: msg.sender === 'user' ? 'user' : 'assistant',
-          content: msg.content.trim()
-        });
-      }
-      messages.push({ role: 'user', content: prompt.trim() });
+      const messages = formatOpenAIMessages({
+        systemInstruction: effectiveSystemInstruction,
+        history,
+        prompt: effectivePrompt
+      });
 
       if (!shouldStream) {
         const orRes = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -1697,8 +1856,17 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
         if (!orRes.ok) {
           const errText = await orRes.text();
+          let friendlyError = `OpenRouter request failed (${orRes.status}): ${errText}`;
+          if (errText.includes('context_length_exceeded') || errText.includes('maximum context length') || errText.includes('too large') || errText.includes('tokens')) {
+            friendlyError = 'The attached document exceeds OpenRouter\'s context limit. Please switch to Google Gemini (which supports 1M tokens) or ask about specific pages or slides.';
+          }
           return res.status(orRes.status).json({
-            error: `OpenRouter request failed (${orRes.status}): ${errText}`
+            error: friendlyError,
+            code: orRes.status,
+            provider: 'openrouter',
+            model: 'openrouter/free',
+            canFallback: true,
+            suggestedProviders: ['gemini', 'groq']
           });
         }
 
@@ -1727,8 +1895,17 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
         if (!orRes.ok) {
           const errText = await orRes.text();
+          let friendlyError = `OpenRouter request failed (${orRes.status}): ${errText}`;
+          if (errText.includes('context_length_exceeded') || errText.includes('maximum context length') || errText.includes('too large') || errText.includes('tokens')) {
+            friendlyError = 'The attached document exceeds OpenRouter\'s context limit. Please switch to Google Gemini (which supports 1M tokens) or ask about specific pages or slides.';
+          }
           return res.status(orRes.status).json({
-            error: `OpenRouter request failed (${orRes.status}): ${errText}`
+            error: friendlyError,
+            code: orRes.status,
+            provider: 'openrouter',
+            model: 'openrouter/free',
+            canFallback: true,
+            suggestedProviders: ['gemini', 'groq']
           });
         }
 
@@ -1788,8 +1965,10 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         accountId === 'YOUR_CLOUDFLARE_ACCOUNT_ID' ||
         apiToken === 'YOUR_CLOUDFLARE_API_TOKEN'
       ) {
-        const text = generateSimulatedResponse(prompt, cleanUsername, preferences, mode);
-        const demoModel = 'Cloudflare Workers AI — Llama 3.1 8B (demo)';
+        const text = availableDocs.length > 0
+          ? generateSimulatedDocumentResponse(prompt, prepDoc)
+          : generateSimulatedResponse(prompt, cleanUsername, preferences, mode);
+        const demoModel = availableDocs.length > 0 ? 'Document Analyzer (demo)' : 'Cloudflare Workers AI — Llama 3.1 8B (demo)';
         if (!shouldStream) {
           return res.json({
             text,
@@ -1803,7 +1982,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         for (const token of tokens) {
           if (isClientClosed || res.writableEnded) break;
           sendSSE(res, { type: 'chunk', text: token });
-          await new Promise((r) => setTimeout(r, 20));
+          await new Promise((r) => setTimeout(r, 15));
         }
         if (!res.writableEnded) {
           sendSSE(res, { type: 'done', text, modelUsed: demoModel, provider: 'cloudflare' });
@@ -1812,21 +1991,11 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         return;
       }
 
-      const messages = [
-        {
-          role: 'system',
-          content: systemInstruction
-        }
-      ];
-
-      for (const msg of history.slice(-12)) {
-        if (!msg.content) continue;
-        messages.push({
-          role: msg.sender === 'user' ? 'user' : 'assistant',
-          content: msg.content.trim()
-        });
-      }
-      messages.push({ role: 'user', content: prompt.trim() });
+      const messages = formatOpenAIMessages({
+        systemInstruction: effectiveSystemInstruction,
+        history,
+        prompt: effectivePrompt
+      });
 
       const cfEndpoint = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId.trim())}/ai/run/${modelId}`;
 
