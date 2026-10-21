@@ -2333,6 +2333,14 @@ html, body {
   color: #c4b5fd;
 }
 
+.format-image {
+  color: #38bdf8;
+  background-color: rgba(56, 189, 248, 0.12);
+}
+.format-image .attachment-ext-tag {
+  color: #7dd3fc;
+}
+
 .format-default {
   color: var(--text-secondary);
   background-color: rgba(255, 255, 255, 0.06);
@@ -3735,6 +3743,92 @@ html, body {
 .attachment-chip-remove:hover {
   background-color: rgba(239, 68, 68, 0.16);
   color: #ef4444;
+}
+
+/* Image Attachment Chip in Composer */
+.composer-attachment-chip.composer-image-chip {
+  padding: 3px 8px 3px 4px;
+  gap: 8px;
+  align-items: center;
+  max-width: 260px;
+  background-color: var(--bg-card);
+}
+
+.composer-image-thumb-wrap {
+  width: 34px;
+  height: 34px;
+  min-width: 34px;
+  min-height: 34px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background-color: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--border-medium);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.composer-image-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.composer-image-fallback-icon {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #38bdf8;
+  background-color: rgba(56, 189, 248, 0.12);
+}
+
+.composer-image-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  flex: 1;
+}
+
+.composer-image-meta .attachment-chip-name {
+  max-width: 130px;
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.25;
+}
+
+.composer-image-meta .attachment-chip-size {
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  line-height: 1.2;
+}
+
+[data-theme="light"] .composer-attachment-chip.composer-image-chip {
+  background-color: #f1f5f9;
+  border-color: rgba(0, 0, 0, 0.12);
+}
+
+[data-theme="light"] .composer-image-thumb-wrap {
+  background-color: #e2e8f0;
+  border-color: rgba(0, 0, 0, 0.1);
+}
+
+[data-theme="light"] .format-image {
+  color: #0284c7;
+  background-color: #e0f2fe;
+}
+
+[data-theme="light"] .format-image .attachment-ext-tag {
+  color: #0369a1;
 }
 
 .composer-textarea {
