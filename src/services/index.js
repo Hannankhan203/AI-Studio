@@ -12,4 +12,4 @@ export * from './aiRouter.js';
 export * from './geminiService.js';
 export * from './groqService.js';
 export * from './openrouterService.js';
-export * from './documentContextService.ts';
+export * from './documentContextService.js';

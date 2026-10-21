@@ -19,6 +19,7 @@ import {
 import Button from '../ui/Button.jsx';
 import OrvixLogo from '../ui/OrvixLogo.jsx';
 import CodeBlock from './CodeBlock.jsx';
+import AttachmentCard from './AttachmentCard.jsx';
 import { useSpeech } from '../../context/SpeechContext.jsx';
 import { PROVIDER_OPTIONS } from '../../services/aiRouter.js';
 
@@ -513,18 +514,7 @@ export default function ChatMessage({
                 {message.attachments && message.attachments.length > 0 && (
                   <div className="message-attachments-list" role="region" aria-label="Attached files">
                     {message.attachments.map((att, idx) => (
-                      <div key={att.id || idx} className="message-attachment-card" title={`${att.name} (${att.formattedSize || ''})`}>
-                        <div className="message-attachment-icon-badge">
-                          <Paperclip size={13} className="attachment-icon" />
-                          <span className="attachment-ext-tag">{att.extension || 'FILE'}</span>
-                        </div>
-                        <div className="message-attachment-details">
-                          <span className="message-attachment-name" title={att.name}>{att.name}</span>
-                          <span className="message-attachment-size">
-                            {att.formattedSize || (att.size ? `${Math.round(att.size / 1024)} KB` : '')}
-                          </span>
-                        </div>
-                      </div>
+                      <AttachmentCard key={att.id || idx} attachment={att} />
                     ))}
                   </div>
                 )}
@@ -543,6 +533,20 @@ export default function ChatMessage({
           ) : (
             /* Render AI messages as rich, safe Markdown with progressive streaming cursor */
             <div className={`ai-markdown-container ${isStreaming ? 'is-streaming' : ''}`}>
+              {message.referencedAttachments && message.referencedAttachments.length > 0 && (
+                <div className="assistant-referenced-attachments" aria-label="Referenced files">
+                  <div className="referenced-attachments-header">
+                    <Paperclip size={11} className="referenced-icon" />
+                    <span>Referenced document{message.referencedAttachments.length > 1 ? 's' : ''}:</span>
+                  </div>
+                  <div className="referenced-attachments-list">
+                    {message.referencedAttachments.map((att, idx) => (
+                      <AttachmentCard key={att.id || idx} attachment={att} compact={true} />
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <ReactMarkdown
                 remarkPlugins={[remarkGfm]}
                 components={markdownComponents}

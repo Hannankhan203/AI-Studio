@@ -8,7 +8,7 @@
  */
 
 import { getChatMode } from '../config/chatModes.js';
-import { prepareDocumentContext, adaptDocumentContextForProvider } from './documentContextService.ts';
+import { prepareDocumentContext, adaptDocumentContextForProvider } from './documentContextService.js';
 
 export function getOpenRouterApiKey() {
   try {

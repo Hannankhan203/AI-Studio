@@ -8,14 +8,58 @@ import multer from 'multer';
 import { GoogleGenAI } from '@google/genai';
 // @ts-ignore - Document extraction JavaScript service
 import { extractDocumentContent } from './src/services/documentExtractor.js';
+// @ts-ignore - Document context JavaScript service
 import {
   prepareDocumentContext,
   generateSimulatedDocumentResponse,
   adaptDocumentContextForProvider,
-  formatOpenAIMessages,
-  DocumentData,
-  PreparedDocumentContext
-} from './src/services/documentContextService.ts';
+  formatOpenAIMessages
+} from './src/services/documentContextService.js';
+
+export interface DocumentData {
+  fileId?: string;
+  id?: string;
+  filename?: string;
+  originalName: string;
+  name?: string;
+  format: string;
+  mimeType?: string;
+  sizeBytes?: number;
+  status: string;
+  success?: boolean;
+  text: string;
+  summaryText?: string;
+  totalCharacters: number;
+  totalWords: number;
+  pageCount?: number;
+  pages?: Array<{ pageNumber: number; text: string; charCount: number }>;
+  slideCount?: number;
+  slides?: Array<{ slideNumber: number; title?: string; text: string; notes?: string; charCount: number }>;
+  sectionCount?: number;
+  sections?: Array<{ heading: string; level: number; content: string; charCount: number }>;
+  table?: {
+    headers: string[];
+    rowCount: number;
+    columnCount: number;
+    previewRows: string[][];
+    markdownTable: string;
+  };
+  isScanned?: boolean;
+  isTruncated?: boolean;
+  warning?: string;
+  error?: string;
+}
+
+export interface PreparedDocumentContext {
+  formattedContext: string;
+  hasErrorsOrWarnings: boolean;
+  unreadableDocNotes: string[];
+  targetedDocs: DocumentData[];
+  scope: string;
+  isBoundedOrChunked: boolean;
+  truncationNote?: string;
+  directAnswer?: string;
+}
 
 export interface DocumentExtractionResult {
   fileId: string;
@@ -1006,6 +1050,59 @@ app.get(['/api/upload/:id/extraction', '/upload/:id/extraction'], async (req, re
   return res.json(extraction);
 });
 
+// Dedicated Attachment File Serving & Download Endpoint (Requirements 4, 6, 8)
+app.get(
+  ['/api/upload/:id/file', '/upload/:id/file', '/api/upload/:id/download', '/upload/:id/download'],
+  async (req, res) => {
+    const fileId = req.params.id;
+    if (!fileId || !/^[0-9a-fA-F-]{36}$/.test(fileId)) {
+      return res.status(400).json({ error: 'Invalid attachment ID format.' });
+    }
+
+    const record = fileRegistry.get(fileId);
+    let diskFilename = record?.diskFilename;
+    let originalName = record?.originalName || 'document';
+    let mimeType = record?.mimeType || 'application/octet-stream';
+
+    if (!diskFilename) {
+      try {
+        const files = await fs.promises.readdir(UPLOAD_DIR);
+        const match = files.find((f) => f.startsWith(fileId));
+        if (match) {
+          diskFilename = match;
+          const ext = path.extname(match).toLowerCase();
+          mimeType = (ALLOWED_EXTENSIONS_MAP[ext] && ALLOWED_EXTENSIONS_MAP[ext][0]) || 'application/octet-stream';
+        }
+      } catch (_) {}
+    }
+
+    if (!diskFilename) {
+      return res.status(404).json({ error: 'Attachment file not found or has expired.' });
+    }
+
+    const filePath = path.join(UPLOAD_DIR, diskFilename);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'Attachment file not found or has expired.' });
+    }
+
+    const forceDownload = req.query.download === 'true' || req.path.includes('/download');
+    const isInline =
+      !forceDownload &&
+      (mimeType === 'application/pdf' ||
+        mimeType.startsWith('text/') ||
+        mimeType.startsWith('image/'));
+
+    const safeFilename = path.basename(originalName).replace(/["\r\n]/g, '_');
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader(
+      'Content-Disposition',
+      `${isInline ? 'inline' : 'attachment'}; filename="${encodeURIComponent(safeFilename)}"; filename*=UTF-8''${encodeURIComponent(safeFilename)}`
+    );
+
+    return res.sendFile(filePath);
+  }
+);
+
 // Upload Deletion Endpoint (cleans up staging file if removed before submission)
 app.delete(['/api/upload/:id', '/upload/:id'], async (req, res) => {
   const fileId = req.params.id;
@@ -1341,7 +1438,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
     }
 
     // Prepare document context for the prompt
-    const prepDoc = prepareDocumentContext(prompt, availableDocs);
+    const prepDoc: PreparedDocumentContext = prepareDocumentContext(prompt, availableDocs) as PreparedDocumentContext;
     const normalizedProvider = String(provider).toLowerCase();
     const shouldStream = stream !== false;
 
@@ -1370,7 +1467,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
     const baseSystemInstruction = buildSystemInstruction(cleanUsername, preferences, mode);
 
     // Shared Provider-Independent Document Context Adaptation (Requirements 2, 3, 5, 7, 8)
-    const adapted = adaptDocumentContextForProvider({
+    const adapted: any = adaptDocumentContextForProvider({
       provider: normalizedProvider,
       prompt,
       baseSystemInstruction,
@@ -1423,11 +1520,12 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
       const contents = formatGeminiHistory(history, effectivePrompt);
       // Attempt sequence: max 3 attempts total (initial attempt + up to 2 retries)
-      // Attempt 1 & 2 try gemini-3.8-flash (primary recommended model)
-      // Attempt 3 tries gemini-3.1-flash-lite (alternative fallback model)
+      // Attempt 1 tries gemini-3.8-flash (primary recommended model)
+      // Attempt 2 tries gemini-3-flash-preview (fast reliable fallback preview model)
+      // Attempt 3 tries gemini-3.1-flash-lite (alternative lite model)
       const attemptPlan = [
         { model: 'gemini-3.8-flash', attemptNum: 1 },
-        { model: 'gemini-3.8-flash', attemptNum: 2 },
+        { model: 'gemini-3-flash-preview', attemptNum: 2 },
         { model: 'gemini-3.1-flash-lite', attemptNum: 3 }
       ];
       const maxAttempts = attemptPlan.length;

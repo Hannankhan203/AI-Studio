@@ -85,22 +85,6 @@ export default function ChatArea({
 
   // Selected file attachments state
   const [attachments, setAttachments] = useState([]);
-  const [attachmentError, setAttachmentError] = useState(null);
-
-  const MAX_ATTACHMENTS_LIMIT = 5;
-  const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB
-  const ALLOWED_EXTS = [
-    'PDF', 'DOCX', 'DOC', 'TXT', 'MD', 'MARKDOWN', 'PPT', 'PPTX', 'CSV', 'TSV', 'JSON', 'XML', 'XLSX', 'XLS'
-  ];
-
-  // Auto-dismiss attachment error banner
-  useEffect(() => {
-    if (!attachmentError) return;
-    const timer = setTimeout(() => {
-      setAttachmentError(null);
-    }, 5000);
-    return () => clearTimeout(timer);
-  }, [attachmentError]);
 
   const handleAttachClick = () => {
     if (fileInputRef.current) {
@@ -112,43 +96,11 @@ export default function ChatArea({
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
-    const fileList = Array.from(files);
-    const validToAdd = [];
-    const errors = [];
-
-    const availableSlots = MAX_ATTACHMENTS_LIMIT - attachments.length;
-    if (availableSlots <= 0) {
-      setAttachmentError(`Maximum of ${MAX_ATTACHMENTS_LIMIT} attachments allowed per message.`);
-      if (fileInputRef.current) fileInputRef.current.value = '';
-      return;
-    }
-
-    for (const file of fileList) {
-      if (validToAdd.length >= availableSlots) {
-        errors.push(`Maximum limit of ${MAX_ATTACHMENTS_LIMIT} attachments reached.`);
-        break;
-      }
-
-      if (file.size === 0) {
-        errors.push(`'${file.name}' is empty (0 B).`);
-        continue;
-      }
-
-      if (file.size > MAX_FILE_SIZE_BYTES) {
-        errors.push(`'${file.name}' exceeds the 25 MB limit (${formatFileSize(file.size)}).`);
-        continue;
-      }
-
+    const newAttachments = Array.from(files).map((file) => {
       const ext = file.name.includes('.')
         ? file.name.split('.').pop().toUpperCase()
-        : '';
-
-      if (!ext || !ALLOWED_EXTS.includes(ext)) {
-        errors.push(`'${file.name}' has an unsupported file format.`);
-        continue;
-      }
-
-      validToAdd.push({
+        : 'FILE';
+      return {
         id: `att-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`,
         name: file.name,
         size: file.size,
@@ -156,19 +108,10 @@ export default function ChatArea({
         type: file.type || 'application/octet-stream',
         extension: ext,
         file
-      });
-    }
+      };
+    });
 
-    if (errors.length > 0) {
-      setAttachmentError(errors.join(' '));
-    } else {
-      setAttachmentError(null);
-    }
-
-    if (validToAdd.length > 0) {
-      setAttachments((prev) => [...prev, ...validToAdd]);
-    }
-
+    setAttachments((prev) => [...prev, ...newAttachments]);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -423,11 +366,8 @@ export default function ChatArea({
       setSuggestedRefinement(null);
       if (onSubmit && (inputValue.trim() || attachments.length > 0) && !isLoading) {
         const currentAttachments = [...attachments];
-        Promise.resolve(onSubmit(currentAttachments)).then((res) => {
-          if (res !== false) {
-            setAttachments([]);
-          }
-        });
+        setAttachments([]);
+        onSubmit(currentAttachments);
       }
     }
   };
@@ -441,11 +381,8 @@ export default function ChatArea({
     setSuggestedRefinement(null);
     if (onSubmit && (inputValue.trim() || attachments.length > 0) && !isLoading) {
       const currentAttachments = [...attachments];
-      Promise.resolve(onSubmit(currentAttachments)).then((res) => {
-        if (res !== false) {
-          setAttachments([]);
-        }
-      });
+      setAttachments([]);
+      onSubmit(currentAttachments);
     }
   };
 
@@ -578,24 +515,6 @@ Transcript:
                 className="dictation-error-dismiss"
                 onClick={clearDictationError}
                 aria-label="Dismiss error notification"
-              >
-                <X size={13} />
-              </button>
-            </div>
-          )}
-
-          {/* Attachment Validation Error Notification */}
-          {attachmentError && (
-            <div className="composer-dictation-error composer-attachment-error" role="alert">
-              <div className="dictation-error-content">
-                <AlertCircle size={14} className="dictation-error-icon text-amber-400" aria-hidden="true" />
-                <span>{attachmentError}</span>
-              </div>
-              <button
-                type="button"
-                className="dictation-error-dismiss"
-                onClick={() => setAttachmentError(null)}
-                aria-label="Dismiss attachment error"
               >
                 <X size={13} />
               </button>

@@ -22,6 +22,7 @@ import { getChatMode } from '../config/chatModes.js';
 import { useAuth } from '../context/AuthContext.jsx';
 import { useSettings } from '../context/SettingsContext.jsx';
 import { useSpeech } from '../context/SpeechContext.jsx';
+import { saveAttachmentBlob } from '../services/attachmentStorageService.js';
 import { AlertCircle, X, Check } from 'lucide-react';
 
 export default function ChatPage() {
@@ -737,7 +738,11 @@ export default function ChatPage() {
         }),
         content: contentToSave,
         isStreaming: false,
-        isStopped: Boolean(isStopped)
+        isStopped: Boolean(isStopped),
+        referencedAttachments:
+          currentAttachments && currentAttachments.length > 0
+            ? currentAttachments
+            : undefined
       };
 
       if (activeChatIdRef.current === targetChatId) {
@@ -810,7 +815,11 @@ export default function ChatPage() {
                   content: displayedText,
                   modelUsed: activeModel || message.modelUsed,
                   provider: finalProvider || message.provider,
-                  isStreaming: true
+                  isStreaming: true,
+                  referencedAttachments:
+                    currentAttachments && currentAttachments.length > 0
+                      ? currentAttachments
+                      : message.referencedAttachments
                 }
               : message
           )
@@ -862,7 +871,11 @@ export default function ChatPage() {
                   ? {
                       ...message,
                       modelUsed: activeModel,
-                      provider: finalProvider
+                      provider: finalProvider,
+                      referencedAttachments:
+                        currentAttachments && currentAttachments.length > 0
+                          ? currentAttachments
+                          : message.referencedAttachments
                     }
                   : message
               )
@@ -907,7 +920,11 @@ export default function ChatPage() {
             minute: '2-digit'
           }),
           content: resolvedText,
-          isStreaming: false
+          isStreaming: false,
+          referencedAttachments:
+            currentAttachments && currentAttachments.length > 0
+              ? currentAttachments
+              : undefined
         };
 
         if (targetChatId) {
@@ -940,7 +957,11 @@ export default function ChatPage() {
                   content: targetText,
                   modelUsed: activeModel || message.modelUsed,
                   provider: finalProvider || message.provider,
-                  isStreaming: false
+                  isStreaming: false,
+                  referencedAttachments:
+                    currentAttachments && currentAttachments.length > 0
+                      ? currentAttachments
+                      : message.referencedAttachments
                 }
               : message
           )
@@ -986,7 +1007,11 @@ export default function ChatPage() {
           }),
           content: stoppedText,
           isStreaming: false,
-          isStopped: true
+          isStopped: true,
+          referencedAttachments:
+            currentAttachments && currentAttachments.length > 0
+              ? currentAttachments
+              : undefined
         };
 
         if (activeChatIdRef.current === targetChatId) {
@@ -1083,7 +1108,11 @@ export default function ChatPage() {
             isInterrupted: true,
             failedPrompt: promptText,
             failedProvider: finalProvider || providerToUse,
-            canSwitchProvider: true
+            canSwitchProvider: true,
+            referencedAttachments:
+              currentAttachments && currentAttachments.length > 0
+                ? currentAttachments
+                : undefined
           };
 
           setMessages((previous) =>
@@ -1109,7 +1138,11 @@ export default function ChatPage() {
               hour: '2-digit',
               minute: '2-digit'
             }),
-            content: friendlyMsg
+            content: friendlyMsg,
+            referencedAttachments:
+              currentAttachments && currentAttachments.length > 0
+                ? currentAttachments
+                : undefined
           };
 
           setMessages((previous) =>
@@ -1135,7 +1168,11 @@ export default function ChatPage() {
           isInterrupted: true,
           failedPrompt: promptText,
           failedProvider: finalProvider || providerToUse,
-          canSwitchProvider: true
+          canSwitchProvider: true,
+          referencedAttachments:
+            currentAttachments && currentAttachments.length > 0
+              ? currentAttachments
+              : undefined
         };
 
         await persistMessageSafe(targetChatId, partialMessage);
@@ -1201,6 +1238,24 @@ export default function ChatPage() {
           processedAttachments = Array.isArray(uploadData?.attachments)
             ? uploadData.attachments
             : [];
+
+          // Persist file blobs into IndexedDB for robust local preview/download across reloads
+          for (let i = 0; i < filesToUpload.length; i++) {
+            const attItem = filesToUpload[i];
+            const proc =
+              processedAttachments[i] ||
+              processedAttachments.find(
+                (p) => (p.originalName || p.name) === attItem.name
+              );
+            if (proc && proc.id && attItem.file) {
+              saveAttachmentBlob(proc.id, attItem.file, {
+                name: proc.name || attItem.name,
+                originalName: proc.originalName || attItem.name,
+                mimeType: proc.type || attItem.file.type,
+                size: proc.size || attItem.file.size
+              }).catch((e) => console.warn('Could not cache blob in IndexedDB:', e));
+            }
+          }
         } catch (uploadErr) {
           console.error('File upload network error:', uploadErr);
           setPersistenceError(
@@ -1312,6 +1367,23 @@ export default function ChatPage() {
         attachments: processedAttachments
       };
 
+      // Check if current message has attachments, or if we should carry forward attachments from the conversation
+      // so follow-up questions about the document maintain context and referenced attachments
+      let activeAttachments = processedAttachments;
+      if ((!activeAttachments || activeAttachments.length === 0) && messages.length > 0) {
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const m = messages[i];
+          if (Array.isArray(m.attachments) && m.attachments.length > 0) {
+            activeAttachments = m.attachments;
+            break;
+          }
+          if (Array.isArray(m.referencedAttachments) && m.referencedAttachments.length > 0) {
+            activeAttachments = m.referencedAttachments;
+            break;
+          }
+        }
+      }
+
       const assistantMessageId =
         `${selectedProvider}-${now}-assistant`;
 
@@ -1325,7 +1397,11 @@ export default function ChatPage() {
           minute: '2-digit'
         }),
         content: '',
-        isStreaming: true
+        isStreaming: true,
+        referencedAttachments:
+          activeAttachments && activeAttachments.length > 0
+            ? activeAttachments
+            : undefined
       };
 
       const validHistory = messages.filter(
@@ -1356,7 +1432,7 @@ export default function ChatPage() {
         currentChatId,
         assistantMessageId,
         null,
-        processedAttachments
+        activeAttachments
       );
       return true;
     } catch (error) {
@@ -1389,6 +1465,26 @@ export default function ChatPage() {
       (message) => message.id !== failedMessage.id
     );
 
+    const failedIdx = messages.findIndex((m) => m.id === failedMessage.id);
+    const precedingUser = failedIdx > 0 ? messages[failedIdx - 1] : null;
+    let retryAttachments =
+      failedMessage.referencedAttachments ||
+      precedingUser?.attachments ||
+      [];
+    if ((!retryAttachments || retryAttachments.length === 0) && messages.length > 0) {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (Array.isArray(m.attachments) && m.attachments.length > 0) {
+          retryAttachments = m.attachments;
+          break;
+        }
+        if (Array.isArray(m.referencedAttachments) && m.referencedAttachments.length > 0) {
+          retryAttachments = m.referencedAttachments;
+          break;
+        }
+      }
+    }
+
     const assistantMessageId =
       `${providerToUse}-${Date.now()}-retry`;
 
@@ -1402,7 +1498,11 @@ export default function ChatPage() {
         minute: '2-digit'
       }),
       content: '',
-      isStreaming: true
+      isStreaming: true,
+      referencedAttachments:
+        retryAttachments && retryAttachments.length > 0
+          ? retryAttachments
+          : undefined
     };
 
     setMessages([
@@ -1413,10 +1513,6 @@ export default function ChatPage() {
     const validHistory = updatedMessages.filter(
       (message) => !message.isError && !message.isInterrupted
     );
-
-    const failedIdx = messages.findIndex((m) => m.id === failedMessage.id);
-    const precedingUser = failedIdx > 0 ? messages[failedIdx - 1] : null;
-    const retryAttachments = precedingUser?.attachments || [];
 
     void executePrompt(
       failedMessage.failedPrompt,
@@ -1451,6 +1547,26 @@ export default function ChatPage() {
       (message) => message.id !== failedMessage.id
     );
 
+    const failedSwitchIdx = messages.findIndex((m) => m.id === failedMessage.id);
+    const precedingSwitchUser = failedSwitchIdx > 0 ? messages[failedSwitchIdx - 1] : null;
+    let switchAttachments =
+      failedMessage.referencedAttachments ||
+      precedingSwitchUser?.attachments ||
+      [];
+    if ((!switchAttachments || switchAttachments.length === 0) && messages.length > 0) {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (Array.isArray(m.attachments) && m.attachments.length > 0) {
+          switchAttachments = m.attachments;
+          break;
+        }
+        if (Array.isArray(m.referencedAttachments) && m.referencedAttachments.length > 0) {
+          switchAttachments = m.referencedAttachments;
+          break;
+        }
+      }
+    }
+
     const assistantMessageId =
       `${newProviderId}-${Date.now()}-fallback`;
 
@@ -1464,7 +1580,11 @@ export default function ChatPage() {
         minute: '2-digit'
       }),
       content: '',
-      isStreaming: true
+      isStreaming: true,
+      referencedAttachments:
+        switchAttachments && switchAttachments.length > 0
+          ? switchAttachments
+          : undefined
     };
 
     setMessages([
@@ -1475,10 +1595,6 @@ export default function ChatPage() {
     const validHistory = updatedMessages.filter(
       (message) => !message.isError && !message.isInterrupted
     );
-
-    const failedSwitchIdx = messages.findIndex((m) => m.id === failedMessage.id);
-    const precedingSwitchUser = failedSwitchIdx > 0 ? messages[failedSwitchIdx - 1] : null;
-    const switchAttachments = precedingSwitchUser?.attachments || [];
 
     void executePrompt(
       failedMessage.failedPrompt,
@@ -1534,6 +1650,24 @@ export default function ChatPage() {
     // Allow cache/Firestore overwrite for this message ID
     persistedMessageIdsRef.current.delete(targetAssistantId);
 
+    let precedingAttachments =
+      assistantMessage.referencedAttachments ||
+      precedingUserMessage?.attachments ||
+      [];
+    if ((!precedingAttachments || precedingAttachments.length === 0) && messages.length > 0) {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (Array.isArray(m.attachments) && m.attachments.length > 0) {
+          precedingAttachments = m.attachments;
+          break;
+        }
+        if (Array.isArray(m.referencedAttachments) && m.referencedAttachments.length > 0) {
+          precedingAttachments = m.referencedAttachments;
+          break;
+        }
+      }
+    }
+
     // Update in-place to streaming state without creating duplicate messages
     setMessages((previous) =>
       previous.map((m) =>
@@ -1549,13 +1683,15 @@ export default function ChatPage() {
               }),
               isStreaming: true,
               isError: false,
-              isStopped: false
+              isStopped: false,
+              referencedAttachments:
+                precedingAttachments.length > 0
+                  ? precedingAttachments
+                  : m.referencedAttachments
             }
           : m
       )
     );
-
-    const precedingAttachments = precedingUserMessage?.attachments || [];
 
     await executePrompt(
       userPromptText,
