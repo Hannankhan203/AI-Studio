@@ -1252,7 +1252,10 @@ export default function ChatPage() {
                 name: proc.name || attItem.name,
                 originalName: proc.originalName || attItem.name,
                 mimeType: proc.type || attItem.file.type,
-                size: proc.size || attItem.file.size
+                size: proc.size || attItem.file.size,
+                formattedSize: proc.formattedSize || attItem.formattedSize,
+                extension: proc.extension || attItem.extension,
+                conversationId: activeChatIdRef.current || null
               }).catch((e) => console.warn('Could not cache blob in IndexedDB:', e));
             }
           }
@@ -1371,16 +1374,25 @@ export default function ChatPage() {
       // so follow-up questions about the document maintain context and referenced attachments
       let activeAttachments = processedAttachments;
       if ((!activeAttachments || activeAttachments.length === 0) && messages.length > 0) {
+        const found = [];
+        const seenIds = new Set();
         for (let i = messages.length - 1; i >= 0; i--) {
           const m = messages[i];
-          if (Array.isArray(m.attachments) && m.attachments.length > 0) {
-            activeAttachments = m.attachments;
-            break;
+          const atts = Array.isArray(m.attachments) && m.attachments.length > 0
+            ? m.attachments
+            : Array.isArray(m.referencedAttachments) && m.referencedAttachments.length > 0
+            ? m.referencedAttachments
+            : [];
+          for (const a of atts) {
+            const key = a.id || a.name || a.originalName;
+            if (key && !seenIds.has(key)) {
+              seenIds.add(key);
+              found.push(a);
+            }
           }
-          if (Array.isArray(m.referencedAttachments) && m.referencedAttachments.length > 0) {
-            activeAttachments = m.referencedAttachments;
-            break;
-          }
+        }
+        if (found.length > 0) {
+          activeAttachments = found.reverse();
         }
       }
 
@@ -1834,7 +1846,11 @@ export default function ChatPage() {
         minute: '2-digit'
       }),
       content: '',
-      isStreaming: true
+      isStreaming: true,
+      referencedAttachments:
+        updatedUserMessage.attachments && updatedUserMessage.attachments.length > 0
+          ? updatedUserMessage.attachments
+          : undefined
     };
 
     // 6. Truncate conversation state to: earlier + updatedUserMessage + initialAssistantMessage

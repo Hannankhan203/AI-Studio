@@ -3,7 +3,7 @@ import {
   parseDocumentQueryIntent,
   prepareDocumentContext,
   generateSimulatedDocumentResponse,
-} from './src/services/documentContextService.ts';
+} from './src/services/documentContextService.js';
 
 console.log('--- Starting Document Question Handling Tests ---');
 

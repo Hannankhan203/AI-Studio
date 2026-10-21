@@ -21,7 +21,7 @@ import {
   formatOpenAIMessages,
   generateSimulatedDocumentResponse,
   PROVIDER_PROFILES
-} from './src/services/documentContextService.ts';
+} from './src/services/documentContextService.js';
 
 const mockPdfDoc = {
   id: 'doc-report-1',

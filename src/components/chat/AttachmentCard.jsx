@@ -16,6 +16,7 @@ import {
   downloadAttachmentFile,
   checkAttachmentStatus
 } from '../../services/attachmentStorageService.js';
+import DocumentPreviewModal from './DocumentPreviewModal.jsx';
 
 /**
  * Returns an appropriate icon component for a given file extension
@@ -113,6 +114,7 @@ export default function AttachmentCard({
   const [loading, setLoading] = useState(false);
   const [isUnavailable, setIsUnavailable] = useState(false);
   const [noticeMessage, setNoticeMessage] = useState(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
 
   if (!attachment) return null;
 
@@ -130,6 +132,24 @@ export default function AttachmentCard({
     return () => clearTimeout(timer);
   }, [noticeMessage]);
 
+  // Gracefully verify attachment availability on mount (handles page refresh & reopened conversations)
+  useEffect(() => {
+    let isMounted = true;
+    if (!attachment?.id) return;
+
+    checkAttachmentStatus(attachment).then((status) => {
+      if (isMounted && !status.available) {
+        setIsUnavailable(true);
+      }
+    }).catch(() => {
+      // Keep current state on network hiccups
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [attachment?.id]);
+
   const handleCardClick = async (e) => {
     // If a sub-button was clicked, let its handler handle it
     if (e.target.closest('.attachment-action-btn')) {
@@ -143,9 +163,16 @@ export default function AttachmentCard({
       return;
     }
 
+    // If format is previewable, open in-app modal preview
+    if (canPreview || attachment.extraction?.text) {
+      setPreviewOpen(true);
+      return;
+    }
+
+    // Otherwise download original file
     setLoading(true);
     try {
-      const result = await openOrPreviewAttachment(attachment);
+      const result = await downloadAttachmentFile(attachment);
       if (!result.success) {
         setIsUnavailable(true);
         setNoticeMessage(result.error || 'This attachment is no longer available.');
@@ -158,28 +185,13 @@ export default function AttachmentCard({
     }
   };
 
-  const handlePreview = async (e) => {
+  const handlePreview = (e) => {
     e.stopPropagation();
-    if (loading) return;
-
     if (isUnavailable) {
       setNoticeMessage('This attachment has expired.');
       return;
     }
-
-    setLoading(true);
-    try {
-      const result = await openOrPreviewAttachment(attachment);
-      if (!result.success) {
-        setIsUnavailable(true);
-        setNoticeMessage(result.error || 'This attachment is no longer available.');
-      }
-    } catch (_) {
-      setIsUnavailable(true);
-      setNoticeMessage('Unable to preview attachment.');
-    } finally {
-      setLoading(false);
-    }
+    setPreviewOpen(true);
   };
 
   const handleDownload = async (e) => {
@@ -248,12 +260,12 @@ export default function AttachmentCard({
 
         {showActions && !isUnavailable && (
           <div className="attachment-card-actions" onClick={(e) => e.stopPropagation()}>
-            {canPreview && (
+            {(canPreview || attachment.extraction?.text) && (
               <button
                 type="button"
                 className="attachment-action-btn"
                 onClick={handlePreview}
-                title={`Preview ${filename} in new tab`}
+                title={`Preview ${filename}`}
                 aria-label={`Preview ${filename}`}
                 disabled={loading}
               >
@@ -279,6 +291,14 @@ export default function AttachmentCard({
           <AlertTriangle size={12} className="text-amber-400 flex-shrink-0" />
           <span>{noticeMessage}</span>
         </div>
+      )}
+
+      {previewOpen && (
+        <DocumentPreviewModal
+          isOpen={previewOpen}
+          onClose={() => setPreviewOpen(false)}
+          attachment={attachment}
+        />
       )}
     </div>
   );

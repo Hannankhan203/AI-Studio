@@ -169,7 +169,7 @@ export function isFormatPreviewable(extension = '', mimeType = '') {
   const ext = (extension || '').replace('.', '').toLowerCase();
   const mime = (mimeType || '').toLowerCase();
 
-  const previewableExts = ['pdf', 'txt', 'md', 'markdown', 'json', 'xml', 'csv', 'tsv', 'png', 'jpg', 'jpeg', 'webp', 'gif', 'svg'];
+  const previewableExts = ['pdf', 'txt', 'md', 'markdown', 'json', 'xml', 'csv', 'tsv', 'png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'heic', 'heif', 'svg'];
   if (previewableExts.includes(ext)) return true;
 
   if (
@@ -243,17 +243,20 @@ export async function openOrPreviewAttachment(attachment) {
     }
 
     if (canPreview) {
-      window.open(endpoint, '_blank');
-      return { success: true, action: 'preview' };
-    } else {
-      const link = document.createElement('a');
-      link.href = endpoint;
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      return { success: true, action: 'download' };
+      try {
+        const win = window.open(endpoint, '_blank');
+        if (win) {
+          return { success: true, action: 'preview' };
+        }
+      } catch (_) {}
     }
+    const link = document.createElement('a');
+    link.href = endpoint;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    return { success: true, action: 'download' };
   } catch (err) {
     console.warn('[Attachment Storage] openOrPreviewAttachment error:', err);
     return {

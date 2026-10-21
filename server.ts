@@ -744,7 +744,16 @@ const ALLOWED_EXTENSIONS_MAP: Record<string, string[]> = {
   '.csv': ['text/csv', 'text/plain', 'application/csv', 'application/vnd.ms-excel', 'application/octet-stream'],
   '.tsv': ['text/tab-separated-values', 'text/plain', 'application/octet-stream'],
   '.json': ['application/json', 'text/json', 'text/plain', 'application/octet-stream'],
-  '.xml': ['application/xml', 'text/xml', 'text/plain', 'application/octet-stream']
+  '.xml': ['application/xml', 'text/xml', 'text/plain', 'application/octet-stream'],
+  // Common image formats (JPG, JPEG, PNG, WEBP, GIF, BMP, HEIC, HEIF)
+  '.jpg': ['image/jpeg', 'image/pjpeg', 'image/jpg', 'application/octet-stream'],
+  '.jpeg': ['image/jpeg', 'image/pjpeg', 'image/jpg', 'application/octet-stream'],
+  '.png': ['image/png', 'image/x-png', 'application/octet-stream'],
+  '.webp': ['image/webp', 'application/octet-stream'],
+  '.gif': ['image/gif', 'application/octet-stream'],
+  '.bmp': ['image/bmp', 'image/x-ms-bmp', 'image/x-bmp', 'application/octet-stream'],
+  '.heic': ['image/heic', 'image/heif', 'application/octet-stream'],
+  '.heif': ['image/heif', 'image/heic', 'application/octet-stream']
 };
 
 /**
@@ -855,6 +864,68 @@ async function verifyFileSignature(
       return { valid: true };
     }
 
+    // Image format verification (JPEG, PNG, GIF, WebP, BMP, HEIC/HEIF)
+    if (ext === '.jpg' || ext === '.jpeg') {
+      if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+        return { valid: true };
+      }
+      return { valid: false, reason: 'Invalid JPEG format: missing standard JPEG SOI signature.' };
+    }
+
+    if (ext === '.png') {
+      if (
+        buffer.length >= 8 &&
+        buffer[0] === 0x89 &&
+        buffer[1] === 0x50 &&
+        buffer[2] === 0x4e &&
+        buffer[3] === 0x47 &&
+        buffer[4] === 0x0d &&
+        buffer[5] === 0x0a &&
+        buffer[6] === 0x1a &&
+        buffer[7] === 0x0a
+      ) {
+        return { valid: true };
+      }
+      return { valid: false, reason: 'Invalid PNG format: missing standard PNG signature.' };
+    }
+
+    if (ext === '.gif') {
+      if (
+        buffer.length >= 6 &&
+        buffer[0] === 0x47 &&
+        buffer[1] === 0x49 &&
+        buffer[2] === 0x46 &&
+        buffer[3] === 0x38 &&
+        (buffer[4] === 0x37 || buffer[4] === 0x39) &&
+        buffer[5] === 0x61
+      ) {
+        return { valid: true };
+      }
+      return { valid: false, reason: 'Invalid GIF format: missing standard GIF87a/GIF89a signature.' };
+    }
+
+    if (ext === '.webp') {
+      if (
+        buffer.length >= 12 &&
+        buffer.toString('ascii', 0, 4) === 'RIFF' &&
+        buffer.toString('ascii', 8, 12) === 'WEBP'
+      ) {
+        return { valid: true };
+      }
+      return { valid: false, reason: 'Invalid WebP format: missing standard RIFF/WEBP signature.' };
+    }
+
+    if (ext === '.bmp') {
+      if (buffer.length >= 2 && buffer[0] === 0x42 && buffer[1] === 0x4d) {
+        return { valid: true };
+      }
+      return { valid: false, reason: 'Invalid BMP format: missing standard BM signature.' };
+    }
+
+    if (ext === '.heic' || ext === '.heif') {
+      return { valid: true };
+    }
+
     return { valid: true };
   } catch (err: any) {
     if (fd !== null) {
@@ -892,7 +963,7 @@ const uploadFilter = (
   if (!ext || !ALLOWED_EXTENSIONS_MAP[ext]) {
     return cb(
       new Error(
-        `Unsupported file extension: '${ext || 'none'}'. Supported: PDF, DOCX, DOC, TXT, MD, PPT, PPTX, CSV, TSV, JSON, XML, XLSX, XLS.`
+        `Unsupported file extension: '${ext || 'none'}'. Supported: PDF, DOCX, DOC, TXT, MD, PPT, PPTX, CSV, TSV, JSON, XML, XLSX, XLS, and Images (JPG, JPEG, PNG, WEBP, GIF, BMP, HEIC, HEIF).`
       )
     );
   }
@@ -1237,20 +1308,28 @@ app.post(['/api/upload', '/upload'], (req, res) => {
       });
     }
 
-    // Execute server-side text and structure extraction for each uploaded file
+    // Execute server-side text and structure extraction for documents, or prepare image metadata
     for (const rec of uploadedResults) {
       try {
         const fullDiskPath = path.join(UPLOAD_DIR, rec.diskFilename);
-        const ext = path.extname(rec.diskFilename);
-        const extraction = (await extractDocumentContent(
-          fullDiskPath,
-          rec.originalName,
-          ext,
-          rec.mimeType,
-          rec.id
-        )) as DocumentExtractionResult;
-        rec.extraction = extraction;
-        rec.status = extraction.success || extraction.status === 'scanned_or_image_only' ? 'ready' : 'uploaded';
+        const ext = path.extname(rec.diskFilename).toLowerCase();
+        const isImg =
+          ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif'].includes(ext) ||
+          rec.mimeType.startsWith('image/');
+
+        if (isImg) {
+          rec.status = 'ready';
+        } else {
+          const extraction = (await extractDocumentContent(
+            fullDiskPath,
+            rec.originalName,
+            ext,
+            rec.mimeType,
+            rec.id
+          )) as DocumentExtractionResult;
+          rec.extraction = extraction;
+          rec.status = extraction.success || extraction.status === 'scanned_or_image_only' ? 'ready' : 'uploaded';
+        }
       } catch (err: any) {
         console.warn(`[Document Extraction] Extraction error for ${rec.originalName}:`, err);
       }
@@ -1260,35 +1339,42 @@ app.post(['/api/upload', '/upload'], (req, res) => {
     return res.status(200).json({
       success: true,
       count: uploadedResults.length,
-      attachments: uploadedResults.map((r) => ({
-        id: r.id,
-        originalName: r.originalName,
-        name: r.originalName,
-        extension: r.extension,
-        mimeType: r.mimeType,
-        type: r.mimeType,
-        size: r.size,
-        formattedSize: r.formattedSize,
-        status: r.status,
-        uploadedAt: r.uploadedAt,
-        extraction: r.extraction
-          ? {
-              status: r.extraction.status,
-              success: r.extraction.success,
-              format: r.extraction.format,
-              totalCharacters: r.extraction.totalCharacters,
-              totalWords: r.extraction.totalWords,
-              summaryText: r.extraction.summaryText,
-              pageCount: r.extraction.pageCount,
-              slideCount: r.extraction.slideCount,
-              sectionCount: r.extraction.sectionCount,
-              isScanned: r.extraction.isScanned,
-              isTruncated: r.extraction.isTruncated,
-              warning: r.extraction.warning,
-              error: r.extraction.error
-            }
-          : undefined
-      }))
+      attachments: uploadedResults.map((r) => {
+        const ext = path.extname(r.diskFilename).toLowerCase();
+        const isImg =
+          ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif'].includes(ext) ||
+          r.mimeType.startsWith('image/');
+        return {
+          id: r.id,
+          originalName: r.originalName,
+          name: r.originalName,
+          extension: r.extension,
+          mimeType: r.mimeType,
+          type: r.mimeType,
+          size: r.size,
+          formattedSize: r.formattedSize,
+          status: r.status,
+          isImage: isImg,
+          uploadedAt: r.uploadedAt,
+          extraction: r.extraction
+            ? {
+                status: r.extraction.status,
+                success: r.extraction.success,
+                format: r.extraction.format,
+                totalCharacters: r.extraction.totalCharacters,
+                totalWords: r.extraction.totalWords,
+                summaryText: r.extraction.summaryText,
+                pageCount: r.extraction.pageCount,
+                slideCount: r.extraction.slideCount,
+                sectionCount: r.extraction.sectionCount,
+                isScanned: r.extraction.isScanned,
+                isTruncated: r.extraction.isTruncated,
+                warning: r.extraction.warning,
+                error: r.extraction.error
+              }
+            : undefined
+        };
+      })
     });
   });
 });

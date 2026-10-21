@@ -1,0 +1,99 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // User profile document: strictly restricted to authenticated owner
+    match /users/{userId} {
+      allow read, delete: if isOwner(userId);
+
+      allow create: if isOwner(userId)
+                    && request.resource.data.keys().hasAll(['uid', 'username'])
+                    && request.resource.data.keys().hasOnly(['uid', 'username', 'email', 'createdAt', 'updatedAt'])
+                    && request.resource.data.uid == userId
+                    && request.resource.data.username is string
+                    && request.resource.data.username.size() >= 2
+                    && request.resource.data.username.size() <= 30;
+
+      allow update: if isOwner(userId)
+                    && request.resource.data.keys().hasOnly(['uid', 'username', 'email', 'createdAt', 'updatedAt'])
+                    && request.resource.data.uid == resource.data.uid
+                    && request.resource.data.username is string
+                    && request.resource.data.username.size() >= 2
+                    && request.resource.data.username.size() <= 30;
+
+      // User personalization settings subcollection: owner-restricted
+      match /settings/{settingId} {
+        allow read, delete: if isOwner(userId);
+
+        allow create, update: if isOwner(userId)
+                              && request.resource.data.keys().hasOnly(['theme', 'responseLength', 'beginnerFriendly', 'enterToSend', 'showTimestamps', 'updatedAt'])
+                              && (!('theme' in request.resource.data) || request.resource.data.theme in ['light', 'dark', 'system'])
+                              && (!('responseLength' in request.resource.data) || request.resource.data.responseLength in ['concise', 'balanced', 'detailed'])
+                              && (!('beginnerFriendly' in request.resource.data) || request.resource.data.beginnerFriendly is bool)
+                              && (!('enterToSend' in request.resource.data) || request.resource.data.enterToSend is bool)
+                              && (!('showTimestamps' in request.resource.data) || request.resource.data.showTimestamps is bool);
+      }
+
+      // User chats collection
+      match /chats/{chatId} {
+        allow read, delete: if isOwner(userId);
+
+        allow create: if isOwner(userId)
+                      && request.resource.data.keys().hasAll(['id', 'title', 'userId', 'createdAt', 'updatedAt'])
+                      && request.resource.data.keys().hasOnly(['id', 'title', 'userId', 'createdAt', 'updatedAt', 'isPinned', 'pinnedAt'])
+                      && request.resource.data.userId == userId
+                      && request.resource.data.id == chatId
+                      && request.resource.data.title is string
+                      && request.resource.data.title.size() > 0
+                      && request.resource.data.title.size() <= 120
+                      && (!('isPinned' in request.resource.data) || request.resource.data.isPinned is bool);
+
+        allow update: if isOwner(userId)
+                      && request.resource.data.keys().hasOnly(['id', 'title', 'userId', 'createdAt', 'updatedAt', 'isPinned', 'pinnedAt'])
+                      && request.resource.data.userId == resource.data.userId
+                      && request.resource.data.id == resource.data.id
+                      && request.resource.data.title is string
+                      && request.resource.data.title.size() > 0
+                      && request.resource.data.title.size() <= 120
+                      && (!('isPinned' in request.resource.data) || request.resource.data.isPinned is bool);
+
+        // Messages subcollection
+        match /messages/{messageId} {
+          allow read, delete: if isOwner(userId);
+
+          allow create: if isOwner(userId)
+                        && request.resource.data.keys().hasAll(['id', 'sender', 'content', 'createdAt', 'clientTimestamp'])
+                        && request.resource.data.keys().hasOnly(['id', 'sender', 'content', 'modelUsed', 'createdAt', 'clientTimestamp'])
+                        && request.resource.data.id == messageId
+                        && request.resource.data.sender in ['user', 'assistant']
+                        && request.resource.data.content is string
+                        && request.resource.data.content.size() > 0
+                        && request.resource.data.content.size() <= 100000;
+
+          allow update: if isOwner(userId)
+                        && request.resource.data.keys().hasOnly(['id', 'sender', 'content', 'modelUsed', 'createdAt', 'clientTimestamp'])
+                        && request.resource.data.id == resource.data.id
+                        && request.resource.data.sender == resource.data.sender
+                        && request.resource.data.content is string
+                        && request.resource.data.content.size() > 0
+                        && request.resource.data.content.size() <= 100000;
+        }
+      }
+    }
+
+    // Default deny all other paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
