@@ -48,6 +48,11 @@ export interface DocumentData {
   };
   isScanned?: boolean;
   isTruncated?: boolean;
+  isImage?: boolean;
+  hasText?: boolean;
+  lineCount?: number;
+  confidence?: number;
+  message?: string;
   warning?: string;
   error?: string;
 }
@@ -1501,6 +1506,11 @@ app.post(['/api/upload', '/upload'], (req, res) => {
           uploadedAt: r.uploadedAt,
           extraction: r.extraction
             ? {
+                id: r.id,
+                fileId: r.id,
+                filename: r.diskFilename,
+                originalName: r.originalName,
+                name: r.originalName,
                 status: r.extraction.status,
                 success: r.extraction.success,
                 format: r.extraction.format,
@@ -1636,10 +1646,49 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
       for (const att of attachments) {
         if (!att?.id) continue;
         const record = fileRegistry.get(att.id);
-        if (record?.extraction) {
-          addDocIfValid(record.extraction as DocumentData, record.conversationId);
-        } else if (att.extraction) {
-          addDocIfValid(att.extraction as DocumentData, conversationId || undefined);
+        if (record && !record.extraction) {
+          try {
+            const ext = path.extname(record.diskFilename).toLowerCase();
+            const isImg =
+              ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif'].includes(ext) ||
+              record.mimeType.startsWith('image/');
+            const fullDiskPath = path.join(UPLOAD_DIR, record.diskFilename);
+            if (fs.existsSync(fullDiskPath)) {
+              if (isImg) {
+                record.extraction = (await extractImageText(
+                  fullDiskPath,
+                  record.originalName,
+                  ext,
+                  record.mimeType,
+                  record.id,
+                  record.dimensions
+                )) as any;
+              } else {
+                record.extraction = (await extractDocumentContent(
+                  fullDiskPath,
+                  record.originalName,
+                  ext,
+                  record.mimeType,
+                  record.id
+                )) as any;
+              }
+            }
+          } catch (lazyErr) {
+            console.warn('[Extraction] On-demand extraction error:', lazyErr);
+          }
+        }
+
+        const rawExtraction = record?.extraction || att.extraction;
+        if (rawExtraction) {
+          const docData: DocumentData = {
+            ...(rawExtraction as DocumentData),
+            id: att.id,
+            fileId: att.id,
+            originalName: record?.originalName || att.originalName || att.name || (rawExtraction as any).originalName || 'image',
+            filename: record?.diskFilename || att.name || att.originalName || (rawExtraction as any).filename || 'image',
+            isImage: Boolean((rawExtraction as any).isImage || record?.isImage || att.isImage)
+          };
+          addDocIfValid(docData, record?.conversationId || conversationId || undefined);
         }
       }
     }
