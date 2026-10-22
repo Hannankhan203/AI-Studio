@@ -35,6 +35,10 @@ import {
   writeBatch
 } from 'firebase/firestore';
 import { db, isFirebaseConfigured } from '../config/firebaseConfig.js';
+import {
+  normalizeAssistantMessage,
+  ensureConversationAlternatives
+} from './alternativeResponseService.js';
 
 /**
  * Generates a clean, readable conversation title from the initial user prompt.
@@ -144,22 +148,26 @@ export async function saveChatMessage(userId, chatId, message) {
     return;
   }
 
-  const messageDocRef = doc(db, 'users', userId, 'chats', chatId, 'messages', message.id);
+  const targetMessage = message.sender === 'assistant'
+    ? normalizeAssistantMessage(message)
+    : message;
+
+  const messageDocRef = doc(db, 'users', userId, 'chats', chatId, 'messages', targetMessage.id);
   const chatDocRef = doc(db, 'users', userId, 'chats', chatId);
 
   const payload = {
-    id: message.id,
-    sender: message.sender,
-    content: message.content,
-    modelUsed: message.modelUsed || null,
-    provider: message.provider || null,
-    responseTimeMs: typeof message.responseTimeMs === 'number' ? message.responseTimeMs : null,
-    parentMessageId: message.parentMessageId || null,
-    activeAlternativeId: message.activeAlternativeId || null,
-    alternatives: Array.isArray(message.alternatives)
-      ? message.alternatives.map((alt) => ({
+    id: targetMessage.id,
+    sender: targetMessage.sender,
+    content: targetMessage.content,
+    modelUsed: targetMessage.modelUsed || null,
+    provider: targetMessage.provider || null,
+    responseTimeMs: typeof targetMessage.responseTimeMs === 'number' ? targetMessage.responseTimeMs : null,
+    parentMessageId: targetMessage.parentMessageId || null,
+    activeAlternativeId: targetMessage.activeAlternativeId || null,
+    alternatives: Array.isArray(targetMessage.alternatives)
+      ? targetMessage.alternatives.map((alt) => ({
           id: alt.id,
-          parentMessageId: alt.parentMessageId || message.parentMessageId || null,
+          parentMessageId: alt.parentMessageId || targetMessage.parentMessageId || null,
           sender: 'assistant',
           content: typeof alt.content === 'string' ? alt.content : '',
           provider: alt.provider || 'gemini',
@@ -184,8 +192,8 @@ export async function saveChatMessage(userId, chatId, message) {
           isStopped: Boolean(alt.isStopped)
         }))
       : [],
-    attachments: Array.isArray(message.attachments)
-      ? message.attachments.map((att) => ({
+    attachments: Array.isArray(targetMessage.attachments)
+      ? targetMessage.attachments.map((att) => ({
           id: att.id,
           name: att.name || att.originalName || 'document',
           originalName: att.originalName || att.name || 'document',
@@ -197,8 +205,8 @@ export async function saveChatMessage(userId, chatId, message) {
           extraction: att.extraction || null
         }))
       : [],
-    referencedAttachments: Array.isArray(message.referencedAttachments)
-      ? message.referencedAttachments.map((att) => ({
+    referencedAttachments: Array.isArray(targetMessage.referencedAttachments)
+      ? targetMessage.referencedAttachments.map((att) => ({
           id: att.id,
           name: att.name || att.originalName || 'document',
           originalName: att.originalName || att.name || 'document',
@@ -211,7 +219,7 @@ export async function saveChatMessage(userId, chatId, message) {
         }))
       : [],
     createdAt: serverTimestamp(),
-    clientTimestamp: message.timestamp || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    clientTimestamp: targetMessage.timestamp || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   };
 
   // Write message document idempotently
@@ -447,5 +455,5 @@ export async function loadConversationMessages(userId, chatId) {
     });
   });
 
-  return messages;
+  return ensureConversationAlternatives(messages);
 }

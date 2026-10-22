@@ -264,6 +264,47 @@ export function updateActiveAlternativeInMessage(assistantMessage, updates = {})
 }
 
 /**
+ * Updates a specific alternative by ID inside an assistant message.
+ * If the updated alternative is currently active, root projected properties are synchronized.
+ *
+ * @param {Object} assistantMessage
+ * @param {string} targetId - Alternative ID to update
+ * @param {Object} updates
+ * @returns {Object} Updated assistant message
+ */
+export function updateAlternativeByIdInMessage(assistantMessage, targetId, updates = {}) {
+  if (!assistantMessage) return assistantMessage;
+
+  const normalized = normalizeAssistantMessage(assistantMessage);
+  const targetAlternativeId = targetId || normalized.activeAlternativeId;
+
+  const updatedAlternatives = normalized.alternatives.map((alt) => {
+    if (alt.id !== targetAlternativeId) return alt;
+    return {
+      ...alt,
+      ...updates,
+      id: alt.id // Never mutate alternative ID
+    };
+  });
+
+  const activeId = normalized.activeAlternativeId;
+  const activeAlt = updatedAlternatives.find((a) => a.id === activeId) || updatedAlternatives[0];
+
+  const rootSync = targetAlternativeId === activeId ? updates : {};
+
+  return {
+    ...normalized,
+    ...rootSync,
+    activeAlternativeId: activeId,
+    alternatives: updatedAlternatives,
+    content: activeAlt.content,
+    provider: activeAlt.provider,
+    modelUsed: activeAlt.modelUsed,
+    responseTimeMs: activeAlt.responseTimeMs
+  };
+}
+
+/**
  * Normalizes all messages in a conversation so all assistant messages
  * have parentMessageId and valid alternatives array.
  *

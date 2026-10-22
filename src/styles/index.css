@@ -3525,6 +3525,161 @@ html, body {
 }
 
 /* ==========================================================================
+   Response Alternative Navigation & Model Switcher
+   ========================================================================== */
+.alternative-nav-wrapper {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-medium);
+  border-radius: var(--radius-sm);
+  padding: 2px 4px;
+  user-select: none;
+}
+
+.alternative-nav-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.alternative-nav-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+  background-color: var(--bg-card-hover);
+}
+
+.alternative-nav-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.alternative-nav-counter {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  padding: 0 4px;
+  font-family: var(--font-mono);
+  min-width: 36px;
+  text-align: center;
+}
+
+.alternative-generate-menu-wrapper {
+  position: relative;
+  display: inline-flex;
+}
+
+.alternative-trigger-btn.active {
+  color: var(--accent-primary) !important;
+  background-color: var(--accent-subtle) !important;
+}
+
+.alternative-provider-dropdown {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 60;
+  min-width: 230px;
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-medium);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  backdrop-filter: blur(12px);
+}
+
+.alternative-dropdown-header {
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 4px 8px 6px;
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 4px;
+}
+
+.alternative-provider-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.alternative-provider-option {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--radius-xs);
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+  font-size: 0.78rem;
+  transition: all var(--transition-fast);
+}
+
+.alternative-provider-option:hover:not(:disabled) {
+  background-color: var(--bg-card-hover);
+}
+
+.alternative-provider-option.is-active-provider {
+  background-color: var(--accent-subtle);
+}
+
+.alt-provider-info {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.alt-provider-name {
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.2;
+}
+
+.alt-provider-model {
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  line-height: 1.2;
+}
+
+.alt-provider-current-tag,
+.alt-provider-existing-tag {
+  font-size: 0.65rem;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: var(--radius-xs);
+  flex-shrink: 0;
+}
+
+.alt-provider-current-tag {
+  background-color: var(--accent-primary);
+  color: #ffffff;
+}
+
+.alt-provider-existing-tag {
+  background-color: rgba(255, 255, 255, 0.08);
+  color: var(--text-muted);
+}
+
+/* ==========================================================================
    Error State & AI Generation Recovery UI
    ========================================================================== */
 .error-wrapper .error-avatar {
