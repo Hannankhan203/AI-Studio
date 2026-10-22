@@ -568,7 +568,56 @@ export function generateSimulatedDocumentResponse(prompt, preparedContext) {
   const docName = primaryDoc.originalName || primaryDoc.filename || 'Uploaded Document';
   const format = (primaryDoc.format || 'FILE').toUpperCase();
 
-  // Dedicated Image Question Handling in Simulated / Demo Mode (Requirements 2, 3, 4, 5, 6, 7)
+  // Dedicated Multi-Image Handling in Simulated / Demo Mode (Requirements 2, 3, 4, 5, 8)
+  if (targetedDocs.length > 1 && targetedDocs.every(isImageAttachment)) {
+    const docSections = targetedDocs.map((doc, idx) => {
+      const name = doc.originalName || doc.filename || `Image_${idx + 1}`;
+      const fmt = (doc.format || 'IMAGE').toUpperCase();
+      const hasTxt = Boolean(doc.hasText || (doc.text && doc.text.trim().length > 0));
+
+      if (!hasTxt || doc.status === 'NO_TEXT_DETECTED') {
+        return `### Image ${idx + 1}: "${name}"
+**Source Filename:** \`${name}\` (${fmt} Format)
+*Status:* No readable text detected in this image.`;
+      }
+
+      const lines = (doc.text || '')
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean);
+      const textSnippet = doc.text.trim();
+      const charCount = doc.totalCharacters || doc.text.length;
+      const wordCount = doc.totalWords || countWordsInString(doc.text);
+
+      let contentSection = '';
+      if (scope === 'top_section') {
+        const topSlice = lines.slice(0, Math.min(5, Math.ceil(lines.length / 2)));
+        contentSection = `**Top Section Lines:**\n${topSlice.map((l) => `> ${l}`).join('\n')}`;
+      } else if (scope === 'bottom_section') {
+        const botSlice = lines.slice(-Math.min(5, Math.ceil(lines.length / 2)));
+        contentSection = `**Bottom Section Lines:**\n${botSlice.map((l) => `> ${l}`).join('\n')}`;
+      } else {
+        contentSection = `**Extracted OCR Text:**\n${lines.map((l) => `> ${l}`).join('\n')}\n\n**Key Points:**\n${formatExcerptIntoBullets(textSnippet)}`;
+      }
+
+      return `### Image ${idx + 1}: "${name}"
+**Source Filename:** \`${name}\` (${fmt} Format • ${charCount.toLocaleString()} Characters • ~${wordCount.toLocaleString()} Words)
+
+${contentSection}`;
+    });
+
+    const fileList = targetedDocs.map((d) => `\`${d.originalName || d.filename}\``).join(', ');
+    return `### Multi-Image Analysis (${targetedDocs.length} Images Attached)
+
+The following information was extracted from the attached images (${fileList}):
+
+${docSections.join('\n\n---\n\n')}
+
+#### Summary of Image Information:
+Based on the text extracted across all ${targetedDocs.length} attached images, each source is itemized above with its respective filename and OCR content.`;
+  }
+
+  // Dedicated Single Image Question Handling in Simulated / Demo Mode (Requirements 2, 3, 4, 5, 6, 7)
   if (isImageAttachment(primaryDoc)) {
     const isNoText =
       primaryDoc.status === 'NO_TEXT_DETECTED' ||
