@@ -22,10 +22,10 @@ export function formatResponseTime(ms) {
     durationMs = ms * 1000;
   }
 
-  // Under 60 seconds: format as seconds with one decimal place (e.g. 0.8s, 2.4s, 8.7s, 10.2s)
+  // Under 60 seconds: format as seconds with one decimal place (e.g. 0.1s, 0.8s, 2.4s, 8.7s, 10.2s)
   if (durationMs < 60000) {
     const sec = durationMs / 1000;
-    const rounded = Math.round(sec * 10) / 10;
+    const rounded = Math.max(0.1, Math.round(sec * 10) / 10);
     return `${rounded.toFixed(1)}s`;
   }
 

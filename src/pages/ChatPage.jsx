@@ -697,10 +697,7 @@ export default function ChatPage() {
     const abortController = new AbortController();
     activeAbortControllerRef.current = abortController;
 
-    const requestStartTime =
-      typeof customStartTime === 'number' && customStartTime > 0
-        ? customStartTime
-        : performance.now();
+    let requestStartTime = performance.now();
     let measuredResponseTimeMs = null;
 
     let targetText = '';
@@ -865,6 +862,16 @@ export default function ChatPage() {
       timerId = setTimeout(pumpAnimation, 10);
     };
 
+    requestStartTime = performance.now();
+    if (activeChatIdRef.current === targetChatId) {
+      setMessages((previous) =>
+        previous.map((message) =>
+          message.id === assistantMessageId
+            ? { ...message, requestStartTime, isStreaming: true }
+            : message
+        )
+      );
+    }
     try {
       const result = await streamAIMessage({
         provider: providerToUse,
@@ -1234,9 +1241,6 @@ export default function ChatPage() {
 
     if ((!trimmed && !hasAttachments) || isLoading || isSubmittingRef.current) return false;
 
-    // Start timing the full AI request lifecycle immediately when submission begins
-    const requestStartTime = performance.now();
-
     isSubmittingRef.current = true;
     setIsLoading(true);
     setPersistenceError(null);
@@ -1541,6 +1545,7 @@ export default function ChatPage() {
         }),
         content: '',
         isStreaming: true,
+        requestStartTime: performance.now(),
         referencedAttachments:
           activeAttachments && activeAttachments.length > 0
             ? activeAttachments
@@ -1578,8 +1583,7 @@ export default function ChatPage() {
         assistantMessageId,
         null,
         activeAttachments,
-        multiPartContext,
-        requestStartTime
+        multiPartContext
       );
       return true;
     } catch (error) {

@@ -165,6 +165,46 @@ function createMarkdownComponents(isStreaming = false) {
  * @param {() => void} [props.onStopGenerating]
  * @param {boolean} [props.isLoading=false]
  */
+/**
+ * LiveResponseTimer Component
+ * Lightweight, self-contained live timer that updates every 100ms while AI generation is actively running.
+ * Only re-renders this tiny badge component, completely avoiding chat re-renders.
+ */
+function LiveResponseTimer({ startTime }) {
+  const [elapsedSec, setElapsedSec] = useState(() => {
+    if (typeof startTime === 'number' && startTime > 0) {
+      const sec = Math.max(0, (performance.now() - startTime) / 1000);
+      return sec.toFixed(1);
+    }
+    return '0.0';
+  });
+
+  useEffect(() => {
+    if (typeof startTime !== 'number' || startTime <= 0) return;
+
+    const updateTimer = () => {
+      const sec = Math.max(0, (performance.now() - startTime) / 1000);
+      setElapsedSec(sec.toFixed(1));
+    };
+
+    updateTimer();
+    const intervalId = setInterval(updateTimer, 100);
+
+    return () => clearInterval(intervalId);
+  }, [startTime]);
+
+  return (
+    <span
+      className="response-time-badge live"
+      title={`Thinking... ${elapsedSec}s`}
+      aria-label={`Thinking... ${elapsedSec}s`}
+    >
+      <Timer size={11} className="response-time-icon" aria-hidden="true" />
+      <span>Thinking... {elapsedSec}s</span>
+    </span>
+  );
+}
+
 export default function ChatMessage({
   message,
   onRetry,
@@ -452,15 +492,23 @@ export default function ChatMessage({
             </span>
           )}
 
-          {formattedResponseTime && (
-            <span
-              className="response-time-badge"
-              title={`Response time: ${formattedResponseTime}`}
-              aria-label={`Response time: ${formattedResponseTime}`}
-            >
-              <Timer size={11} className="response-time-icon" aria-hidden="true" />
-              <span>Response time: {formattedResponseTime}</span>
-            </span>
+          {/* Response Time Badge: Live while streaming, or Final after completion */}
+          {!isUser && !isError && !isStopped && !message?.isInterrupted && (
+            <>
+              {isStreaming && typeof message?.requestStartTime === 'number' && (
+                <LiveResponseTimer startTime={message.requestStartTime} />
+              )}
+              {!isStreaming && formattedResponseTime && (
+                <span
+                  className="response-time-badge"
+                  title={`Response time: ${formattedResponseTime}`}
+                  aria-label={`Response time: ${formattedResponseTime}`}
+                >
+                  <Timer size={11} className="response-time-icon" aria-hidden="true" />
+                  <span>Response time: {formattedResponseTime}</span>
+                </span>
+              )}
+            </>
           )}
 
           {showTimestamps && message.timestamp && (
