@@ -154,6 +154,36 @@ export async function saveChatMessage(userId, chatId, message) {
     modelUsed: message.modelUsed || null,
     provider: message.provider || null,
     responseTimeMs: typeof message.responseTimeMs === 'number' ? message.responseTimeMs : null,
+    parentMessageId: message.parentMessageId || null,
+    activeAlternativeId: message.activeAlternativeId || null,
+    alternatives: Array.isArray(message.alternatives)
+      ? message.alternatives.map((alt) => ({
+          id: alt.id,
+          parentMessageId: alt.parentMessageId || message.parentMessageId || null,
+          sender: 'assistant',
+          content: typeof alt.content === 'string' ? alt.content : '',
+          provider: alt.provider || 'gemini',
+          modelUsed: alt.modelUsed || null,
+          responseTimeMs: typeof alt.responseTimeMs === 'number' ? alt.responseTimeMs : null,
+          timestamp: alt.timestamp || '',
+          createdAt: typeof alt.createdAt === 'number' ? alt.createdAt : Date.now(),
+          referencedAttachments: Array.isArray(alt.referencedAttachments)
+            ? alt.referencedAttachments.map((att) => ({
+                id: att.id,
+                name: att.name || att.originalName || 'document',
+                originalName: att.originalName || att.name || 'document',
+                size: att.size || 0,
+                formattedSize: att.formattedSize || '',
+                type: att.type || att.mimeType || '',
+                extension: att.extension || '',
+                status: att.status || 'uploaded',
+                extraction: att.extraction || null
+              }))
+            : [],
+          isError: Boolean(alt.isError),
+          isStopped: Boolean(alt.isStopped)
+        }))
+      : [],
     attachments: Array.isArray(message.attachments)
       ? message.attachments.map((att) => ({
           id: att.id,
@@ -408,6 +438,9 @@ export async function loadConversationMessages(userId, chatId) {
       modelUsed: data.modelUsed || null,
       provider: data.provider || null,
       responseTimeMs: typeof data.responseTimeMs === 'number' ? data.responseTimeMs : null,
+      parentMessageId: data.parentMessageId || null,
+      activeAlternativeId: data.activeAlternativeId || null,
+      alternatives: Array.isArray(data.alternatives) ? data.alternatives : [],
       attachments: Array.isArray(data.attachments) ? data.attachments : [],
       referencedAttachments: Array.isArray(data.referencedAttachments) ? data.referencedAttachments : [],
       timestamp: data.clientTimestamp || (data.createdAt?.toDate ? data.createdAt.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '')
