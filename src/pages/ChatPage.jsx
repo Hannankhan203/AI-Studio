@@ -674,7 +674,8 @@ export default function ChatPage() {
     assistantMessageId,
     overrideProvider = null,
     currentAttachments = [],
-    multiPartParams = {}
+    multiPartParams = {},
+    customStartTime = null
   ) => {
     const providerToUse = overrideProvider || selectedProvider;
     setIsLoading(true);
@@ -696,7 +697,10 @@ export default function ChatPage() {
     const abortController = new AbortController();
     activeAbortControllerRef.current = abortController;
 
-    const requestStartTime = performance.now();
+    const requestStartTime =
+      typeof customStartTime === 'number' && customStartTime > 0
+        ? customStartTime
+        : performance.now();
     let measuredResponseTimeMs = null;
 
     let targetText = '';
@@ -848,7 +852,9 @@ export default function ChatPage() {
         void finalizeAssistantMessage(
           targetText,
           activeModel,
-          finalProvider
+          finalProvider,
+          false,
+          measuredResponseTimeMs
         );
       }
     };
@@ -1228,6 +1234,9 @@ export default function ChatPage() {
 
     if ((!trimmed && !hasAttachments) || isLoading || isSubmittingRef.current) return false;
 
+    // Start timing the full AI request lifecycle immediately when submission begins
+    const requestStartTime = performance.now();
+
     isSubmittingRef.current = true;
     setIsLoading(true);
     setPersistenceError(null);
@@ -1569,7 +1578,8 @@ export default function ChatPage() {
         assistantMessageId,
         null,
         activeAttachments,
-        multiPartContext
+        multiPartContext,
+        requestStartTime
       );
       return true;
     } catch (error) {
@@ -1622,6 +1632,8 @@ export default function ChatPage() {
       }
     }
 
+    const requestStartTime = performance.now();
+
     const assistantMessageId =
       `${providerToUse}-${Date.now()}-retry`;
 
@@ -1659,7 +1671,8 @@ export default function ChatPage() {
       assistantMessageId,
       providerToUse,
       retryAttachments,
-      retryMultiPart
+      retryMultiPart,
+      requestStartTime
     );
   };
 
@@ -1676,6 +1689,8 @@ export default function ChatPage() {
     }
 
     handleSelectProvider(newProviderId);
+
+    const requestStartTime = performance.now();
 
     isSubmittingRef.current = true;
     setIsLoading(true);
@@ -1747,7 +1762,8 @@ export default function ChatPage() {
       assistantMessageId,
       newProviderId,
       switchAttachments,
-      switchMultiPart
+      switchMultiPart,
+      requestStartTime
     );
   };
 
@@ -1785,6 +1801,8 @@ export default function ChatPage() {
     const userPromptText = precedingUserMessage.content;
     const userMsgIndex = messages.findIndex((m) => m.id === precedingUserMessage.id);
     const validHistory = messages.slice(0, userMsgIndex).filter((m) => !m.isError);
+
+    const requestStartTime = performance.now();
 
     isSubmittingRef.current = true;
     setIsLoading(true);
@@ -1845,7 +1863,9 @@ export default function ChatPage() {
       currentChatId,
       targetAssistantId,
       null,
-      precedingAttachments
+      precedingAttachments,
+      {},
+      requestStartTime
     );
   };
 
@@ -1890,6 +1910,8 @@ export default function ChatPage() {
       .trim();
 
     if (!trimmed || isLoading || isSubmittingRef.current) return;
+
+    const requestStartTime = performance.now();
 
     const userMsgIndex = messages.findIndex((m) => m.id === userMessageId);
     if (userMsgIndex === -1) return;
@@ -2031,7 +2053,9 @@ export default function ChatPage() {
       currentChatId,
       assistantMessageId,
       null,
-      updatedUserMessage.attachments || []
+      updatedUserMessage.attachments || [],
+      {},
+      requestStartTime
     );
   };
 

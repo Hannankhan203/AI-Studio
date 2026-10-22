@@ -268,8 +268,11 @@ export default function ChatMessage({
   );
 
   const formattedResponseTime = useMemo(
-    () => (!isUser && !isStreaming && !isError && !isStopped ? formatResponseTime(message?.responseTimeMs) : null),
-    [isUser, isStreaming, isError, isStopped, message?.responseTimeMs]
+    () =>
+      !isUser && !isStreaming && !isError && !isStopped && !message?.isInterrupted
+        ? formatResponseTime(message?.responseTimeMs)
+        : null,
+    [isUser, isStreaming, isError, isStopped, message?.isInterrupted, message?.responseTimeMs]
   );
 
   // Sync draftContent whenever isEditing is toggled or message content changes
