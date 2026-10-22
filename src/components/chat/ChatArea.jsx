@@ -2,6 +2,7 @@ import React, { useRef, useEffect, useState } from 'react';
 import {
   ArrowUp,
   ArrowDown,
+  ArrowRight,
   Mic,
   Square,
   AlertCircle,
@@ -21,8 +22,9 @@ import MessageList from './MessageList.jsx';
 import Button from '../ui/Button.jsx';
 import { useVoiceDictation } from '../../hooks/useVoiceDictation.js';
 import { sendAIMessage } from '../../services/aiRouter.js';
+import { responseHasContinuationNotice } from '../../services/multiPartResponseService.js';
 
-// Supported image extensions whitelist
+// Whitelist of supported image extensions
 const SUPPORTED_IMAGE_EXTENSIONS = new Set([
   'JPG',
   'JPEG',
@@ -33,6 +35,96 @@ const SUPPORTED_IMAGE_EXTENSIONS = new Set([
   'HEIC',
   'HEIF'
 ]);
+
+// Whitelist of all supported file extensions (consistent with server upload whitelists)
+const SUPPORTED_EXTENSIONS = new Set([
+  'PDF',
+  'DOCX',
+  'DOC',
+  'PPTX',
+  'PPT',
+  'XLSX',
+  'XLS',
+  'TXT',
+  'MD',
+  'MARKDOWN',
+  'CSV',
+  'TSV',
+  'JSON',
+  'XML',
+  'JPG',
+  'JPEG',
+  'PNG',
+  'WEBP',
+  'GIF',
+  'BMP',
+  'HEIC',
+  'HEIF'
+]);
+
+// Helper to determine the standard extension from MIME type
+function getExtensionFromMime(mimeType) {
+  if (!mimeType) return null;
+  const mime = mimeType.toLowerCase();
+  if (mime.includes('png')) return 'PNG';
+  if (mime.includes('jpeg') || mime.includes('jpg')) return 'JPG';
+  if (mime.includes('webp')) return 'WEBP';
+  if (mime.includes('gif')) return 'GIF';
+  if (mime.includes('bmp')) return 'BMP';
+  if (mime.includes('heic')) return 'HEIC';
+  if (mime.includes('heif')) return 'HEIF';
+  if (mime.includes('pdf')) return 'PDF';
+  if (mime.includes('wordprocessingml') || mime.includes('docx')) return 'DOCX';
+  if (mime.includes('msword')) return 'DOC';
+  if (mime.includes('presentationml') || mime.includes('pptx')) return 'PPTX';
+  if (mime.includes('ms-powerpoint')) return 'PPT';
+  if (mime.includes('spreadsheetml') || mime.includes('xlsx')) return 'XLSX';
+  if (mime.includes('ms-excel')) return 'XLS';
+  if (mime.includes('json')) return 'JSON';
+  if (mime.includes('csv')) return 'CSV';
+  if (mime.includes('markdown')) return 'MD';
+  if (mime.includes('plain')) return 'TXT';
+  if (mime.includes('xml')) return 'XML';
+  return null;
+}
+
+// Helper to resolve a sensible filename for clipboard pasted files where browser doesn't provide one
+function resolvePastedFileName(rawFile) {
+  const mimeType = (rawFile.type || '').toLowerCase();
+  const rawName = (rawFile.name || '').trim();
+
+  // If the browser provided a specific, non-generic filename with an extension, preserve it
+  const hasSpecificName =
+    rawName &&
+    rawName !== 'image.png' &&
+    rawName !== 'blob' &&
+    rawName !== 'file' &&
+    rawName.includes('.');
+
+  if (hasSpecificName) {
+    return rawName;
+  }
+
+  // Derive extension from mime type
+  const mimeExt = getExtensionFromMime(mimeType);
+  let ext = (mimeExt || 'png').toLowerCase();
+
+  const isImage = mimeType.startsWith('image/') || SUPPORTED_IMAGE_EXTENSIONS.has(ext.toUpperCase());
+  const prefix = isImage ? 'pasted-image' : 'pasted-file';
+  return `${prefix}.${ext}`;
+}
+
+// Helper to detect if a drag event involves external files (and not dragged text/elements)
+function isFileDragEvent(e) {
+  if (!e.dataTransfer || !e.dataTransfer.types) return false;
+  const types = e.dataTransfer.types;
+  for (let i = 0; i < types.length; i++) {
+    if (types[i] === 'Files') {
+      return true;
+    }
+  }
+  return false;
+}
 
 function formatFileSize(bytes) {
   if (!bytes || bytes <= 0) return '0 B';
@@ -96,8 +188,22 @@ export default function ChatArea({
   const scrollViewportRef = useRef(null);
   const fileInputRef = useRef(null);
 
-  // Selected file attachments state
+  // Selected file attachments state (strictly capped at 1 attachment per user message)
   const [attachments, setAttachments] = useState([]);
+  const [attachmentNotice, setAttachmentNotice] = useState(null);
+
+  // Drag-and-drop file attachment state
+  const [isDraggingOver, setIsDraggingOver] = useState(false);
+  const dragDepthRef = useRef(0);
+
+  // Auto-dismiss attachment notice after 5 seconds
+  useEffect(() => {
+    if (!attachmentNotice) return;
+    const timer = setTimeout(() => {
+      setAttachmentNotice(null);
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, [attachmentNotice]);
 
   // Revoke object URLs on component unmount to prevent memory leaks
   useEffect(() => {
@@ -113,8 +219,117 @@ export default function ChatArea({
   }, [attachments]);
 
   const handleAttachClick = () => {
+    if (attachments.length > 0) {
+      setAttachmentNotice('Only one attachment can be added per message. Remove the current attachment first to select a different one.');
+      return;
+    }
     if (fileInputRef.current) {
       fileInputRef.current.click();
+    }
+  };
+
+  /**
+   * Unified attachment processor shared by upload button, clipboard paste, and drag & drop.
+   * Enforces 1-attachment limit, 25MB size restriction, format whitelist, and image preview generation.
+   */
+  const processAttachment = (rawFile, { isPaste = false, isDrop = false } = {}) => {
+    if (!rawFile) return;
+
+    // Strict Rule 1: One-attachment limit check
+    if (attachments.length > 0) {
+      const notice = isDrop
+        ? 'Only one attachment can be added per message. Remove the current attachment before adding another file.'
+        : isPaste
+        ? 'Only one attachment can be added per message. Remove the current attachment before pasting another file.'
+        : 'Only one attachment can be added per message. Remove the current attachment first to select a different one.';
+      setAttachmentNotice(notice);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+      return;
+    }
+
+    // Determine final filename (preserving original where available, generating sensible name for pasted data)
+    const resolvedName = (isPaste || isDrop) ? resolvePastedFileName(rawFile) : rawFile.name;
+
+    // Enforce 25MB maximum size limit
+    const MAX_FILE_SIZE = 25 * 1024 * 1024;
+    if (rawFile.size > MAX_FILE_SIZE) {
+      setAttachmentNotice(`File '${resolvedName}' exceeds the maximum allowed size of 25MB.`);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+      return;
+    }
+
+    // Determine extension
+    let ext = resolvedName.includes('.')
+      ? resolvedName.split('.').pop().toUpperCase()
+      : (getExtensionFromMime(rawFile.type) || 'FILE');
+
+    const isImage =
+      SUPPORTED_IMAGE_EXTENSIONS.has(ext) ||
+      Boolean(rawFile.type && rawFile.type.startsWith('image/'));
+
+    // Validate against supported formats
+    const isSupported =
+      SUPPORTED_EXTENSIONS.has(ext) ||
+      (isImage && SUPPORTED_IMAGE_EXTENSIONS.has(ext)) ||
+      Boolean(getExtensionFromMime(rawFile.type));
+
+    if (!isSupported) {
+      setAttachmentNotice(
+        `File '${resolvedName}' has an unsupported file format. Supported formats include PNG, JPG, WEBP, GIF, PDF, DOCX, TXT, PPTX, XLSX, CSV, JSON, and MD.`
+      );
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+      return;
+    }
+
+    // Reconstruct File object if filename or type needs normalization (e.g. pasted screenshots)
+    let file = rawFile;
+    if ((isPaste || isDrop) && rawFile.name !== resolvedName) {
+      try {
+        file = new File([rawFile], resolvedName, {
+          type: rawFile.type || (isImage ? `image/${ext.toLowerCase()}` : 'application/octet-stream'),
+          lastModified: rawFile.lastModified || Date.now()
+        });
+      } catch (_) {
+        file = rawFile;
+      }
+    }
+
+    let previewUrl = null;
+    if (isImage) {
+      try {
+        previewUrl = URL.createObjectURL(file);
+      } catch (err) {
+        console.warn('Could not generate image thumbnail preview URL:', err);
+      }
+    }
+
+    const singleAttachment = {
+      id: `att-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`,
+      name: resolvedName,
+      size: file.size,
+      formattedSize: formatFileSize(file.size),
+      type: file.type || (isImage ? `image/${ext.toLowerCase()}` : 'application/octet-stream'),
+      extension: ext,
+      isImage,
+      previewUrl,
+      file
+    };
+
+    setAttachmentNotice(null);
+    setAttachments([singleAttachment]);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+
+    // Keep textarea focused so user can type prompt immediately after attaching
+    if ((isPaste || isDrop) && textareaRef.current) {
+      textareaRef.current.focus();
     }
   };
 
@@ -122,43 +337,191 @@ export default function ChatArea({
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
-    const newAttachments = Array.from(files).map((file) => {
-      const ext = file.name.includes('.')
-        ? file.name.split('.').pop().toUpperCase()
-        : 'FILE';
-      const isImage =
-        SUPPORTED_IMAGE_EXTENSIONS.has(ext) ||
-        Boolean(file.type && file.type.startsWith('image/'));
+    if (attachments.length > 0) {
+      setAttachmentNotice('Only one attachment can be added per message. Remove the current attachment first to select a different one.');
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+      return;
+    }
 
-      let previewUrl = null;
-      if (isImage) {
-        try {
-          previewUrl = URL.createObjectURL(file);
-        } catch (err) {
-          console.warn('Could not generate image thumbnail preview URL:', err);
+    if (files.length > 1) {
+      setAttachmentNotice('Only one attachment can be added per message. Please select a single file or image.');
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+      return;
+    }
+
+    processAttachment(files[0], { isPaste: false, isDrop: false });
+  };
+
+  /**
+   * Clipboard paste handler for the chat composer.
+   * Detects copied images or supported files pasted via Ctrl + V and converts them
+   * into attachments, while allowing normal text paste to proceed unhindered.
+   */
+  const handlePaste = (e) => {
+    const clipboardData = e.clipboardData || window.clipboardData;
+    if (!clipboardData) return;
+
+    const items = clipboardData.items;
+    const files = clipboardData.files;
+
+    // Detect if clipboard has any file/image items
+    const candidateFiles = [];
+
+    if (files && files.length > 0) {
+      for (let i = 0; i < files.length; i++) {
+        candidateFiles.push(files[i]);
+      }
+    } else if (items && items.length > 0) {
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.kind === 'file') {
+          const file = item.getAsFile();
+          if (file) {
+            candidateFiles.push(file);
+          }
         }
       }
+    }
 
-      return {
-        id: `att-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`,
-        name: file.name,
-        size: file.size,
-        formattedSize: formatFileSize(file.size),
-        type: file.type || (isImage ? `image/${ext.toLowerCase()}` : 'application/octet-stream'),
-        extension: ext,
-        isImage,
-        previewUrl,
-        file
-      };
-    });
+    // CRITICAL: If no file/image data is in clipboard (plain text, URL, code, etc.),
+    // DO NOT prevent default! Allow normal text paste into textarea.
+    if (candidateFiles.length === 0) {
+      return;
+    }
 
-    setAttachments((prev) => [...prev, ...newAttachments]);
-    if (fileInputRef.current) {
-      fileInputRef.current.value = '';
+    // An image or file was pasted: intercept the paste event so raw paths/data aren't typed
+    e.preventDefault();
+
+    // Enforce one-attachment limit
+    if (attachments.length > 0) {
+      setAttachmentNotice(
+        'Only one attachment can be added per message. Remove the current attachment before pasting another file.'
+      );
+      return;
+    }
+
+    // Reject multiple files pasted at once
+    if (candidateFiles.length > 1) {
+      setAttachmentNotice(
+        'Only one attachment can be added per message. Please paste a single file or image.'
+      );
+      return;
+    }
+
+    processAttachment(candidateFiles[0], { isPaste: true, isDrop: false });
+  };
+
+  /**
+   * Drag & Drop event handlers.
+   * Allows dragging and dropping an image or supported file directly into the chatbot.
+   */
+  const handleDragEnter = (e) => {
+    if (!isFileDragEvent(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragDepthRef.current += 1;
+    setIsDraggingOver(true);
+  };
+
+  const handleDragOver = (e) => {
+    if (!isFileDragEvent(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.dataTransfer) {
+      e.dataTransfer.dropEffect = 'copy';
+    }
+    if (!isDraggingOver) {
+      setIsDraggingOver(true);
     }
   };
 
+  const handleDragLeave = (e) => {
+    if (!isFileDragEvent(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragDepthRef.current -= 1;
+    if (dragDepthRef.current <= 0) {
+      dragDepthRef.current = 0;
+      setIsDraggingOver(false);
+    }
+  };
+
+  const handleDrop = (e) => {
+    if (!isFileDragEvent(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragDepthRef.current = 0;
+    setIsDraggingOver(false);
+
+    const dt = e.dataTransfer;
+    if (!dt) return;
+
+    const candidateFiles = [];
+    if (dt.files && dt.files.length > 0) {
+      for (let i = 0; i < dt.files.length; i++) {
+        candidateFiles.push(dt.files[i]);
+      }
+    } else if (dt.items && dt.items.length > 0) {
+      for (let i = 0; i < dt.items.length; i++) {
+        const item = dt.items[i];
+        if (item.kind === 'file') {
+          const file = item.getAsFile();
+          if (file) {
+            candidateFiles.push(file);
+          }
+        }
+      }
+    }
+
+    if (candidateFiles.length === 0) {
+      return;
+    }
+
+    // Strict Rule 1: One-attachment limit check for drop
+    if (attachments.length > 0) {
+      setAttachmentNotice(
+        'Only one attachment can be added per message. Remove the current attachment before adding another file.'
+      );
+      return;
+    }
+
+    // Strict Rule 2: Multi-file drop rejection
+    if (candidateFiles.length > 1) {
+      setAttachmentNotice(
+        'Only one attachment can be added per message. Please drop one file at a time.'
+      );
+      return;
+    }
+
+    processAttachment(candidateFiles[0], { isPaste: false, isDrop: true });
+  };
+
+  // Prevent browser default file open behavior when dragged or dropped anywhere on window
+  useEffect(() => {
+    const handleWindowDragOver = (e) => {
+      if (isFileDragEvent(e)) {
+        e.preventDefault();
+      }
+    };
+    const handleWindowDrop = (e) => {
+      if (isFileDragEvent(e)) {
+        e.preventDefault();
+      }
+    };
+    window.addEventListener('dragover', handleWindowDragOver);
+    window.addEventListener('drop', handleWindowDrop);
+    return () => {
+      window.removeEventListener('dragover', handleWindowDragOver);
+      window.removeEventListener('drop', handleWindowDrop);
+    };
+  }, []);
+
   const handleRemoveAttachment = (idToRemove) => {
+    setAttachmentNotice(null);
     setAttachments((prev) => {
       const removed = prev.find((att) => att.id === idToRemove);
       if (removed?.previewUrl) {
@@ -166,8 +529,11 @@ export default function ChatArea({
           URL.revokeObjectURL(removed.previewUrl);
         } catch (_) {}
       }
-      return prev.filter((att) => att.id !== idToRemove);
+      return [];
     });
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
   };
 
   // Floating scroll-to-bottom button visibility
@@ -185,6 +551,16 @@ export default function ChatArea({
   // AI Transcript Refinement (Phase 4) state
   const [isCleaningTranscript, setIsCleaningTranscript] = useState(false);
   const [suggestedRefinement, setSuggestedRefinement] = useState(null);
+
+  // Check if the most recent message ended with an invitation to continue a partitioned response
+  const lastMessage = messages.length > 0 ? messages[messages.length - 1] : null;
+  const canContinueLastMessage =
+    !isLoading &&
+    lastMessage &&
+    lastMessage.sender === 'assistant' &&
+    !lastMessage.isError &&
+    !lastMessage.isStopped &&
+    responseHasContinuationNotice(lastMessage.content);
 
   // Computes distance from bottom and updates floating button visibility
   const updateScrollButtonVisibility = () => {
@@ -494,7 +870,14 @@ Transcript:
     recordingState === 'finalizing';
 
   return (
-    <main className="chat-area-container" role="main">
+    <main
+      className={`chat-area-container ${isDraggingOver ? 'is-drag-over' : ''}`}
+      role="main"
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
       {/* Scrollable Viewport */}
       <div
         ref={scrollViewportRef}
@@ -552,6 +935,26 @@ Transcript:
             </div>
           )}
 
+          {/* Quick Continue Prompt Chip if previous response was partitioned */}
+          {canContinueLastMessage && (
+            <div className="continuation-prompt-chip-container">
+              <button
+                type="button"
+                className="continuation-prompt-chip"
+                onClick={() => {
+                  if (onSubmit && !isLoading) {
+                    onSubmit([], 'Continue');
+                  }
+                }}
+                title="Continue from where the previous response left off"
+                aria-label="Continue response"
+              >
+                <ArrowRight size={13} className="continuation-chip-icon" />
+                <span>Continue response</span>
+              </button>
+            </div>
+          )}
+
           {/* Voice Dictation Error Notification */}
           {dictationError && (
             <div className="composer-dictation-error" role="alert">
@@ -564,6 +967,24 @@ Transcript:
                 className="dictation-error-dismiss"
                 onClick={clearDictationError}
                 aria-label="Dismiss error notification"
+              >
+                <X size={13} />
+              </button>
+            </div>
+          )}
+
+          {/* One Attachment Maximum Validation / Error Notification */}
+          {attachmentNotice && (
+            <div className="composer-dictation-error composer-attachment-alert" role="alert">
+              <div className="dictation-error-content">
+                <AlertCircle size={14} className="dictation-error-icon" aria-hidden="true" />
+                <span>{attachmentNotice}</span>
+              </div>
+              <button
+                type="button"
+                className="dictation-error-dismiss"
+                onClick={() => setAttachmentNotice(null)}
+                aria-label="Dismiss attachment alert"
               >
                 <X size={13} />
               </button>
@@ -832,22 +1253,41 @@ Transcript:
             </div>
           )}
 
-          <form onSubmit={handleSubmit} className="composer-form" aria-label="Message composer">
-            {/* Native file input supporting documents and common image formats (JPG, JPEG, PNG, WEBP, GIF, BMP, HEIC, HEIF) */}
+          {/* Drag and Drop Visual Feedback Indicator */}
+          {isDraggingOver && (
+            <div className="composer-drop-banner" role="status" aria-live="polite">
+              <div className="composer-drop-content">
+                <Paperclip size={15} className="composer-drop-icon" aria-hidden="true" />
+                <span className="composer-drop-text">Drop file to attach</span>
+              </div>
+            </div>
+          )}
+
+          <form
+            onSubmit={handleSubmit}
+            onPaste={handlePaste}
+            className={`composer-form ${isDraggingOver ? 'is-drag-over' : ''}`}
+            aria-label="Message composer"
+          >
+            {/* Native file input strictly supporting one document or image at a time */}
             <input
               type="file"
               ref={fileInputRef}
               onChange={handleFileChange}
-              multiple
+              multiple={false}
               accept=".jpg,.jpeg,.png,.webp,.gif,.bmp,.heic,.heif,image/jpeg,image/png,image/webp,image/gif,image/bmp,image/heic,image/heif,image/*,.pdf,.docx,.doc,.txt,.md,.markdown,.ppt,.pptx,.csv,.tsv,.json,.xml,.xlsx,.xls,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/*,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/csv,application/json"
               className="composer-file-input"
               tabIndex={-1}
               aria-hidden="true"
             />
 
-            {/* Selected attachments preview strip */}
+            {/* Selected attachment preview strip with explicit "One attachment maximum per message" badge */}
             {attachments.length > 0 && (
-              <div className="composer-attachments-preview" role="region" aria-label="Attached files and images">
+              <div className="composer-attachments-preview" role="region" aria-label="Attached file or image">
+                <div className="attachment-limit-banner">
+                  <Paperclip size={12} className="attachment-limit-icon" aria-hidden="true" />
+                  <span className="attachment-limit-text">One attachment maximum per message</span>
+                </div>
                 {attachments.map((att) =>
                   att.isImage ? (
                     <div
@@ -926,9 +1366,13 @@ Transcript:
                 size="icon-round"
                 disabled={isLoading}
                 onClick={handleAttachClick}
-                title="Attach documents or images (PDF, DOCX, TXT, JPG, PNG, WEBP, etc.)"
-                ariaLabel="Attach documents or images"
-                className="composer-attach-btn"
+                title={
+                  attachments.length > 0
+                    ? 'Only one attachment can be added per message. Click to view notification.'
+                    : 'Attach document or image — One attachment maximum per message (PDF, DOCX, TXT, PPTX, JPG, PNG, etc.)'
+                }
+                ariaLabel="Attach document or image (One attachment maximum per message)"
+                className={`composer-attach-btn ${attachments.length > 0 ? 'has-attachment' : ''}`}
                 icon={<Paperclip size={18} />}
               />
 
@@ -956,6 +1400,7 @@ Transcript:
                 rows={1}
                 onChange={(e) => onInputChange && onInputChange(e.target.value)}
                 onKeyDown={handleKeyDown}
+                onPaste={handlePaste}
                 aria-label="Message input text"
               />
 

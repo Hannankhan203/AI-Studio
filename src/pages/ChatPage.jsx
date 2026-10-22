@@ -23,6 +23,11 @@ import { useAuth } from '../context/AuthContext.jsx';
 import { useSettings } from '../context/SettingsContext.jsx';
 import { useSpeech } from '../context/SpeechContext.jsx';
 import { saveAttachmentBlob } from '../services/attachmentStorageService.js';
+import {
+  isContinuationRequest,
+  resolveMultiPartContext,
+  responseHasContinuationNotice
+} from '../services/multiPartResponseService.js';
 import { AlertCircle, X, Check } from 'lucide-react';
 
 export default function ChatPage() {
@@ -668,7 +673,8 @@ export default function ChatPage() {
     targetChatId,
     assistantMessageId,
     overrideProvider = null,
-    currentAttachments = []
+    currentAttachments = [],
+    multiPartParams = {}
   ) => {
     const providerToUse = overrideProvider || selectedProvider;
     setIsLoading(true);
@@ -689,6 +695,9 @@ export default function ChatPage() {
 
     const abortController = new AbortController();
     activeAbortControllerRef.current = abortController;
+
+    const requestStartTime = performance.now();
+    let measuredResponseTimeMs = null;
 
     let targetText = '';
     let displayedText = '';
@@ -721,11 +730,16 @@ export default function ChatPage() {
       contentToSave,
       modelToUse,
       providerToFinalize,
-      isStopped = false
+      isStopped = false,
+      responseTime = null
     ) => {
       if (isCancelled || isFinalized) return;
 
       isFinalized = true;
+
+      const finalResponseTime = !isStopped
+        ? (responseTime ?? measuredResponseTimeMs)
+        : null;
 
       const completedMessage = {
         id: assistantMessageId,
@@ -739,6 +753,7 @@ export default function ChatPage() {
         content: contentToSave,
         isStreaming: false,
         isStopped: Boolean(isStopped),
+        responseTimeMs: typeof finalResponseTime === 'number' ? finalResponseTime : undefined,
         referencedAttachments:
           currentAttachments && currentAttachments.length > 0
             ? currentAttachments
@@ -859,6 +874,10 @@ export default function ChatPage() {
         signal: abortController.signal,
         conversationId: targetChatId,
         attachments: currentAttachments,
+        isContinuation: multiPartParams.isContinuation,
+        partNumber: multiPartParams.partNumber,
+        originalPrompt: multiPartParams.originalPrompt,
+        previousContentSummary: multiPartParams.previousContentSummary,
 
         onStart: ({ modelUsed, provider: reportedProvider } = {}) => {
           if (modelUsed) activeModel = modelUsed;
@@ -893,6 +912,9 @@ export default function ChatPage() {
         }
       });
 
+      // Stop timing when the AI response stream genuinely completes
+      measuredResponseTimeMs = Math.max(1, Math.round(performance.now() - requestStartTime));
+
       const resolvedText =
         typeof result?.text === 'string'
           ? result.text
@@ -921,6 +943,7 @@ export default function ChatPage() {
           }),
           content: resolvedText,
           isStreaming: false,
+          responseTimeMs: measuredResponseTimeMs,
           referencedAttachments:
             currentAttachments && currentAttachments.length > 0
               ? currentAttachments
@@ -958,6 +981,7 @@ export default function ChatPage() {
                   modelUsed: activeModel || message.modelUsed,
                   provider: finalProvider || message.provider,
                   isStreaming: false,
+                  responseTimeMs: measuredResponseTimeMs,
                   referencedAttachments:
                     currentAttachments && currentAttachments.length > 0
                       ? currentAttachments
@@ -970,7 +994,9 @@ export default function ChatPage() {
         await finalizeAssistantMessage(
           targetText,
           activeModel,
-          finalProvider
+          finalProvider,
+          false,
+          measuredResponseTimeMs
         );
       }
     } catch (error) {
@@ -1184,14 +1210,21 @@ export default function ChatPage() {
   };
 
   // Submit a new message.
-  const handleSubmit = async (attachments = []) => {
+  const handleSubmit = async (attachments = [], promptOverride = null) => {
     stopSpeech();
 
-    const trimmed = inputValue
+    const rawText = promptOverride !== null ? promptOverride : inputValue;
+    const trimmed = rawText
       .replace(/[\u200B-\u200D\uFEFF]/g, '')
       .trim();
 
     const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
+
+    // Strictly enforce maximum 1 attachment per user message
+    if (Array.isArray(attachments) && attachments.length > 1) {
+      setPersistenceError('Only one attachment can be added per message. Remove the current attachment first to select a different one.');
+      return false;
+    }
 
     if ((!trimmed && !hasAttachments) || isLoading || isSubmittingRef.current) return false;
 
@@ -1205,6 +1238,28 @@ export default function ChatPage() {
     if (hasAttachments) {
       const filesToUpload = attachments.filter((att) => att.file);
       if (filesToUpload.length > 0) {
+        // Enforce maximum single file size client-side before network transmission
+        const MAX_PER_FILE_BYTES = 25 * 1024 * 1024;
+        const oversized = filesToUpload.find((f) => f.file && f.file.size > MAX_PER_FILE_BYTES);
+        if (oversized) {
+          setPersistenceError(`File '${oversized.name}' exceeds the maximum allowed size of 25MB.`);
+          setIsLoading(false);
+          isSubmittingRef.current = false;
+          return false;
+        }
+
+        const uploadController = new AbortController();
+        const UPLOAD_TIMEOUT_MS = 60000;
+        let isTimeout = false;
+        const uploadTimeoutId = setTimeout(() => {
+          isTimeout = true;
+          try {
+            uploadController.abort(new DOMException('Upload timed out after 60 seconds.', 'TimeoutError'));
+          } catch (_) {
+            uploadController.abort();
+          }
+        }, UPLOAD_TIMEOUT_MS);
+
         try {
           const formData = new FormData();
           if (activeChatIdRef.current) {
@@ -1214,10 +1269,16 @@ export default function ChatPage() {
             formData.append('files', att.file, att.name);
           });
 
-          const uploadRes = await fetch('/api/upload', {
-            method: 'POST',
-            body: formData
-          });
+          let uploadRes;
+          try {
+            uploadRes = await fetch('/api/upload', {
+              method: 'POST',
+              body: formData,
+              signal: uploadController.signal
+            });
+          } finally {
+            clearTimeout(uploadTimeoutId);
+          }
 
           if (!uploadRes.ok) {
             let errorMsg = `Upload failed (${uploadRes.status})`;
@@ -1244,36 +1305,77 @@ export default function ChatPage() {
                   );
                 return {
                   ...proc,
+                  file: orig?.file,
+                  previewUrl: orig?.previewUrl || proc.dataUrl,
+                  dataUrl: proc.dataUrl,
+                  base64: proc.base64 || orig?.base64,
                   isImage: Boolean(proc.isImage || orig?.isImage)
                 };
               })
             : [];
 
           // Persist file blobs into IndexedDB for robust local preview/download across reloads
-          for (let i = 0; i < filesToUpload.length; i++) {
-            const attItem = filesToUpload[i];
-            const proc =
-              processedAttachments[i] ||
-              processedAttachments.find(
-                (p) => (p.originalName || p.name) === attItem.name
-              );
-            if (proc && proc.id && attItem.file) {
-              saveAttachmentBlob(proc.id, attItem.file, {
-                name: proc.name || attItem.name,
-                originalName: proc.originalName || attItem.name,
-                mimeType: proc.type || attItem.file.type,
-                size: proc.size || attItem.file.size,
-                formattedSize: proc.formattedSize || attItem.formattedSize,
-                extension: proc.extension || attItem.extension,
-                isImage: Boolean(attItem.isImage),
-                conversationId: activeChatIdRef.current || null
-              }).catch((e) => console.warn('Could not cache blob in IndexedDB:', e));
-            }
-          }
+          await Promise.all(
+            filesToUpload.map(async (attItem, i) => {
+              const proc =
+                processedAttachments[i] ||
+                processedAttachments.find(
+                  (p) => (p.originalName || p.name) === attItem.name
+                );
+              if (proc && proc.id && attItem.file) {
+                try {
+                  await saveAttachmentBlob(proc.id, attItem.file, {
+                    name: proc.name || attItem.name,
+                    originalName: proc.originalName || attItem.name,
+                    mimeType: proc.type || attItem.file.type,
+                    size: proc.size || attItem.file.size,
+                    formattedSize: proc.formattedSize || attItem.formattedSize,
+                    extension: proc.extension || attItem.extension,
+                    isImage: Boolean(attItem.isImage),
+                    conversationId: activeChatIdRef.current || null
+                  });
+                } catch (e) {
+                  console.warn('Could not cache blob in IndexedDB:', e);
+                }
+
+                // Attach base64 data for images under 3MB so stateless serverless environments have direct multimodal access
+                if (attItem.isImage && attItem.file.size <= 3 * 1024 * 1024 && !proc.base64) {
+                  try {
+                    const b64 = await new Promise((resolve) => {
+                      const reader = new FileReader();
+                      reader.onload = () => resolve(reader.result);
+                      reader.onerror = () => resolve(null);
+                      reader.readAsDataURL(attItem.file);
+                    });
+                    if (b64) {
+                      proc.base64 = b64;
+                      if (!proc.dataUrl) proc.dataUrl = b64;
+                      if (!proc.previewUrl) proc.previewUrl = b64;
+                    }
+                  } catch (_) {}
+                }
+              }
+            })
+          );
         } catch (uploadErr) {
           console.error('File upload network error:', uploadErr);
+          let userMsg = uploadErr?.message || 'Network request failed';
+          if (isTimeout || uploadErr?.name === 'TimeoutError') {
+            userMsg = 'Attachment upload timed out. The file may be too large or the server is busy. Please try uploading a smaller image or retry.';
+          } else if (uploadErr?.name === 'AbortError' || uploadController.signal.aborted) {
+            const reason = uploadController.signal.reason;
+            const reasonMsg = reason?.message || (typeof reason === 'string' ? reason : null);
+            if (reasonMsg && !reasonMsg.includes('without reason')) {
+              userMsg = reasonMsg;
+            } else {
+              userMsg = 'Attachment upload was cancelled or timed out. Please try again.';
+            }
+          } else if (userMsg.toLowerCase().includes('failed to fetch') || userMsg.toLowerCase().includes('networkerror')) {
+            userMsg = 'Network error while connecting to upload server. Please verify your internet connection.';
+          }
+
           setPersistenceError(
-            `Failed to upload attachments: ${uploadErr?.message || 'Network request failed'}`
+            `Failed to upload attachments: ${userMsg}`
           );
           setIsLoading(false);
           isSubmittingRef.current = false;
@@ -1382,10 +1484,18 @@ export default function ChatPage() {
         attachments: processedAttachments
       };
 
+      // Detect if user sent a continuation request (e.g., 'Continue', 'Send the rest', 'Next', 'Part 2')
+      const isContinuation = isContinuationRequest(trimmed);
+      const multiPartContext = isContinuation
+        ? resolveMultiPartContext(messages, trimmed)
+        : { isContinuation: false, partNumber: 1, originalPrompt: trimmed, previousContentSummary: '', referencedAttachments: [] };
+
       // Check if current message has attachments, or if we should carry forward attachments from the conversation
-      // so follow-up questions about the document maintain context and referenced attachments
+      // or from the multi-part sequence so follow-up questions and continuations maintain context
       let activeAttachments = processedAttachments;
-      if ((!activeAttachments || activeAttachments.length === 0) && messages.length > 0) {
+      if ((!activeAttachments || activeAttachments.length === 0) && isContinuation && Array.isArray(multiPartContext.referencedAttachments) && multiPartContext.referencedAttachments.length > 0) {
+        activeAttachments = multiPartContext.referencedAttachments;
+      } else if ((!activeAttachments || activeAttachments.length === 0) && messages.length > 0) {
         const found = [];
         const seenIds = new Set();
         for (let i = messages.length - 1; i >= 0; i--) {
@@ -1438,7 +1548,9 @@ export default function ChatPage() {
         initialAssistantMessage
       ]);
 
-      setInputValue('');
+      if (promptOverride === null) {
+        setInputValue('');
+      }
 
       if (currentChatId) {
         void persistMessageSafe(currentChatId, userMessage);
@@ -1456,7 +1568,8 @@ export default function ChatPage() {
         currentChatId,
         assistantMessageId,
         null,
-        activeAttachments
+        activeAttachments,
+        multiPartContext
       );
       return true;
     } catch (error) {
@@ -1534,9 +1647,10 @@ export default function ChatPage() {
       initialAssistantMessage
     ]);
 
-    const validHistory = updatedMessages.filter(
-      (message) => !message.isError && !message.isInterrupted
-    );
+    const isRetryContinuation = isContinuationRequest(failedMessage.failedPrompt);
+    const retryMultiPart = isRetryContinuation
+      ? resolveMultiPartContext(validHistory, failedMessage.failedPrompt)
+      : { isContinuation: false, partNumber: 1, originalPrompt: failedMessage.failedPrompt, previousContentSummary: '' };
 
     void executePrompt(
       failedMessage.failedPrompt,
@@ -1544,7 +1658,8 @@ export default function ChatPage() {
       currentChatId,
       assistantMessageId,
       providerToUse,
-      retryAttachments
+      retryAttachments,
+      retryMultiPart
     );
   };
 
@@ -1620,13 +1735,19 @@ export default function ChatPage() {
       (message) => !message.isError && !message.isInterrupted
     );
 
+    const isSwitchContinuation = isContinuationRequest(failedMessage.failedPrompt);
+    const switchMultiPart = isSwitchContinuation
+      ? resolveMultiPartContext(validHistory, failedMessage.failedPrompt)
+      : { isContinuation: false, partNumber: 1, originalPrompt: failedMessage.failedPrompt, previousContentSummary: '' };
+
     void executePrompt(
       failedMessage.failedPrompt,
       validHistory,
       currentChatId,
       assistantMessageId,
       newProviderId,
-      switchAttachments
+      switchAttachments,
+      switchMultiPart
     );
   };
 
@@ -1701,6 +1822,7 @@ export default function ChatPage() {
               content: '',
               modelUsed: null,
               provider: selectedProvider,
+              responseTimeMs: null,
               timestamp: new Date().toLocaleTimeString([], {
                 hour: '2-digit',
                 minute: '2-digit'

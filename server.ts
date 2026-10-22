@@ -3,8 +3,16 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import os from 'os';
 import crypto from 'crypto';
 import multer from 'multer';
+import dns from 'dns';
+
+// Ensure IPv4 is prioritized for outbound external API connections (Gemini, Groq, OpenRouter)
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch (_) {}
+
 import { GoogleGenAI } from '@google/genai';
 // @ts-ignore - Document extraction JavaScript service
 import { extractDocumentContent } from './src/services/documentExtractor.js';
@@ -17,6 +25,16 @@ import {
   adaptDocumentContextForProvider,
   formatOpenAIMessages
 } from './src/services/documentContextService.js';
+// @ts-ignore - Multi-part large response handling service
+import {
+  detectLargeResponseIntent,
+  isContinuationRequest,
+  resolveMultiPartContext,
+  buildMultiPartPromptAugmentation,
+  generateSimulatedMultiPartResponse,
+  responseHasContinuationNotice,
+  CONTINUATION_NOTICES
+} from './src/services/multiPartResponseService.js';
 
 export interface DocumentData {
   fileId?: string;
@@ -107,7 +125,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const portArgIndex = process.argv.indexOf('--port');
+const portFromArg = portArgIndex !== -1 ? process.argv[portArgIndex + 1] : undefined;
+const PORT = Number(portFromArg) || 3000;
 
 // Permissive CORS middleware for cross-origin and Vercel preview environments
 app.use((req, res, next) => {
@@ -316,13 +336,14 @@ export function parseGeminiError(err: any): {
   };
 }
 
-// Helper to format conversation history for Gemini with alternating roles
+// Helper to format conversation history for Gemini with alternating roles and optional image parts
 function formatGeminiHistory(
   messages: Array<{ sender?: string; content?: string }> = [],
   currentPrompt = '',
-  maxContext = 12
+  maxContext = 12,
+  imageParts: Array<{ mimeType: string; data: string }> = []
 ) {
-  const rawContents: Array<{ role: 'user' | 'model'; text: string }> = [];
+  const rawContents: Array<{ role: 'user' | 'model'; parts: any[] }> = [];
   const recent = messages.slice(-maxContext);
 
   for (const msg of recent) {
@@ -330,14 +351,28 @@ function formatGeminiHistory(
     const role = msg.sender === 'user' ? 'user' : 'model';
     rawContents.push({
       role,
-      text: msg.content.trim()
+      parts: [{ text: msg.content.trim() }]
     });
   }
 
   if (currentPrompt && currentPrompt.trim()) {
+    const userParts: any[] = [];
+    if (Array.isArray(imageParts) && imageParts.length > 0) {
+      for (const img of imageParts) {
+        if (img?.data && img?.mimeType) {
+          userParts.push({
+            inlineData: {
+              mimeType: img.mimeType,
+              data: img.data
+            }
+          });
+        }
+      }
+    }
+    userParts.push({ text: currentPrompt.trim() });
     rawContents.push({
       role: 'user',
-      text: currentPrompt.trim()
+      parts: userParts
     });
   }
 
@@ -347,19 +382,19 @@ function formatGeminiHistory(
   }
 
   if (rawContents.length === 0 && currentPrompt.trim()) {
-    rawContents.push({ role: 'user', text: currentPrompt.trim() });
+    rawContents.push({ role: 'user', parts: [{ text: currentPrompt.trim() }] });
   }
 
   // Merge consecutive turns of identical role so roles strictly alternate user -> model -> user
-  const mergedContents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> = [];
+  const mergedContents: Array<{ role: 'user' | 'model'; parts: any[] }> = [];
   for (const item of rawContents) {
     const last = mergedContents[mergedContents.length - 1];
     if (last && last.role === item.role) {
-      last.parts.push({ text: item.text });
+      last.parts.push(...item.parts);
     } else {
       mergedContents.push({
         role: item.role,
-        parts: [{ text: item.text }]
+        parts: [...item.parts]
       });
     }
   }
@@ -703,16 +738,80 @@ app.get(['/api/config', '/config'], (_req, res) => {
    Controlled Temporary File Upload & Storage Management Architecture
    ========================================================================== */
 
-const UPLOAD_DIR = path.resolve(__dirname, 'uploads', 'temp');
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+// Detect if running in a serverless cloud environment (e.g. Vercel, AWS Lambda)
+// where the application bundle root (/var/task) is strictly read-only (EROFS).
+export const isServerless = Boolean(
+  process.env.VERCEL ||
+  process.env.AWS_LAMBDA_FUNCTION_NAME ||
+  process.env.LAMBDA_TASK_ROOT ||
+  process.env.SERVERLESS ||
+  (typeof process !== 'undefined' && process.cwd && process.cwd().startsWith('/var/task')) ||
+  (typeof __dirname !== 'undefined' && __dirname.startsWith('/var/task'))
+);
+
+/**
+ * Resolves the upload directory according to runtime environment:
+ * - Vercel / AWS Lambda (serverless): Uses os.tmpdir() (/tmp), the only writable filesystem location.
+ * - Localhost development: Preserves project-local uploads/temp directory.
+ * - Graceful fallback: If local directory is un-writable or throws EROFS, falls back to os.tmpdir().
+ */
+export function resolveUploadDirectory(): string {
+  // 1. Explicit override via environment variable
+  if (process.env.UPLOAD_DIR) {
+    try {
+      const resolved = path.resolve(process.env.UPLOAD_DIR);
+      if (!fs.existsSync(resolved)) {
+        fs.mkdirSync(resolved, { recursive: true });
+      }
+      return resolved;
+    } catch (err) {
+      console.warn('[Storage] Configured UPLOAD_DIR is not writable, falling back to temp:', err);
+    }
+  }
+
+  // 2. Serverless / Vercel cloud environment:
+  // Root /var/task is strictly read-only; os.tmpdir() (/tmp) is the allocated writable directory.
+  if (isServerless) {
+    const serverlessTmp = path.join(os.tmpdir(), 'orvix_uploads');
+    try {
+      if (!fs.existsSync(serverlessTmp)) {
+        fs.mkdirSync(serverlessTmp, { recursive: true });
+      }
+      return serverlessTmp;
+    } catch (err) {
+      console.warn('[Storage] Error ensuring serverless tmp dir, falling back to os.tmpdir():', err);
+      return os.tmpdir();
+    }
+  }
+
+  // 3. Localhost development environment:
+  // Default to project-local uploads/temp directory
+  try {
+    const localDir = path.resolve(__dirname, 'uploads', 'temp');
+    if (!localDir.startsWith('/var/task') && !fs.existsSync(localDir)) {
+      fs.mkdirSync(localDir, { recursive: true });
+    }
+    return localDir;
+  } catch (err: any) {
+    // Defensive fallback: if local directory throws EROFS or EACCES, seamlessly fall back to os.tmpdir()
+    const fallbackTmp = path.join(os.tmpdir(), 'orvix_uploads');
+    try {
+      if (!fs.existsSync(fallbackTmp)) {
+        fs.mkdirSync(fallbackTmp, { recursive: true });
+      }
+      return fallbackTmp;
+    } catch (_) {
+      return os.tmpdir();
+    }
+  }
 }
+
+const UPLOAD_DIR = resolveUploadDirectory();
 
 // Configurable upload constraints and lifecycle bounds
 const MAX_FILE_SIZE_BYTES =
   parseInt(process.env.MAX_FILE_SIZE_BYTES || '', 10) || 25 * 1024 * 1024; // 25 MB default
-const MAX_ATTACHMENTS_PER_UPLOAD =
-  parseInt(process.env.MAX_ATTACHMENTS_PER_UPLOAD || '', 10) || 5; // Max 5 attachments per message
+const MAX_ATTACHMENTS_PER_UPLOAD = 1; // Strictly 1 attachment per user message
 const TEMP_FILE_TTL_MS =
   parseInt(process.env.TEMP_FILE_TTL_MS || '', 10) || 2 * 60 * 60 * 1000; // 2 hours retention TTL
 
@@ -835,23 +934,34 @@ function parseImageDimensions(
 /**
  * Validates binary file headers and content signatures (magic numbers)
  * to prevent executable binaries or corrupted files from being accepted under false extensions.
+ * Supports both direct in-memory Buffers and disk file paths.
  */
 async function verifyFileSignature(
-  filePath: string,
+  filePathOrBuffer: string | Buffer,
   ext: string
 ): Promise<{ valid: boolean; reason?: string; dimensions?: { width: number; height: number } }> {
   let fd: number | null = null;
   try {
-    const stats = await fs.promises.stat(filePath);
-    if (stats.size === 0) {
-      return { valid: false, reason: 'File is empty (0 bytes).' };
+    let buffer: Buffer;
+    let size = 0;
+
+    if (Buffer.isBuffer(filePathOrBuffer)) {
+      buffer = filePathOrBuffer;
+      size = buffer.length;
+    } else {
+      const stats = await fs.promises.stat(filePathOrBuffer);
+      size = stats.size;
+      const readBuf = Buffer.alloc(Math.min(4096, size));
+      fd = fs.openSync(filePathOrBuffer, 'r');
+      fs.readSync(fd, readBuf, 0, readBuf.length, 0);
+      fs.closeSync(fd);
+      fd = null;
+      buffer = readBuf;
     }
 
-    const buffer = Buffer.alloc(Math.min(4096, stats.size));
-    fd = fs.openSync(filePath, 'r');
-    fs.readSync(fd, buffer, 0, buffer.length, 0);
-    fs.closeSync(fd);
-    fd = null;
+    if (size === 0) {
+      return { valid: false, reason: 'File is empty (0 bytes).' };
+    }
 
     // Reject executable binary formats regardless of declared extension
     // Linux ELF binary
@@ -1026,18 +1136,9 @@ async function verifyFileSignature(
   }
 }
 
-// Multer storage engine writing to controlled uploads/temp directory with secure UUIDs
-const uploadStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    cb(null, UPLOAD_DIR);
-  },
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const fileId = crypto.randomUUID();
-    // Safe filename prevents path traversal
-    cb(null, `${fileId}${ext}`);
-  }
-});
+// Multer in-memory storage engine: eliminates ephemeral disk write failures on Vercel
+// Localhost asynchronous replication is performed in the upload handler if disk is writable
+const uploadStorage = multer.memoryStorage();
 
 // Multer pre-upload file filter
 const uploadFilter = (
@@ -1098,6 +1199,7 @@ interface UploadedFileRecord {
   isImage?: boolean;
   dimensions?: { width: number; height: number };
   extraction?: any;
+  buffer?: Buffer;
 }
 
 // In-memory registry tracking uploaded temporary files and their lifecycle
@@ -1142,7 +1244,7 @@ const CLEANUP_INTERVAL_MS = 15 * 60 * 1000;
 const cleanupTimer = setInterval(cleanupExpiredUploads, CLEANUP_INTERVAL_MS);
 if (cleanupTimer.unref) cleanupTimer.unref();
 
-// Upload Configuration Endpoint (returns limits and supported formats)
+// Upload Configuration Endpoint (returns limits, supported formats, and active storage strategy)
 app.get(['/api/upload/config', '/upload/config'], (_req, res) => {
   res.json({
     maxFileSizeBytes: MAX_FILE_SIZE_BYTES,
@@ -1151,7 +1253,9 @@ app.get(['/api/upload/config', '/upload/config'], (_req, res) => {
     allowedExtensions: Object.keys(ALLOWED_EXTENSIONS_MAP).map((e) =>
       e.replace('.', '').toUpperCase()
     ),
-    ttlMinutes: Math.round(TEMP_FILE_TTL_MS / (60 * 1000))
+    ttlMinutes: Math.round(TEMP_FILE_TTL_MS / (60 * 1000)),
+    storageMode: isServerless ? 'serverless-temp' : 'local-disk',
+    isServerless
   });
 });
 
@@ -1163,31 +1267,42 @@ app.get(['/api/upload/:id', '/upload/:id'], (req, res) => {
   }
 
   const record = fileRegistry.get(fileId);
-  if (!record) {
-    return res.status(404).json({ error: 'Attachment not found or has expired.' });
+  if (record) {
+    const ext = path.extname(record.diskFilename).toLowerCase();
+    const isImg =
+      ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif'].includes(ext) ||
+      record.mimeType.startsWith('image/');
+
+    return res.json({
+      id: record.id,
+      name: record.originalName,
+      originalName: record.originalName,
+      extension: record.extension,
+      mimeType: record.mimeType,
+      type: record.mimeType,
+      size: record.size,
+      formattedSize: record.formattedSize,
+      status: record.status,
+      isImage: isImg,
+      dimensions: record.dimensions,
+      uploadedAt: record.uploadedAt,
+      expiresAt: record.expiresAt,
+      extraction: record.extraction
+    });
   }
 
-  const ext = path.extname(record.diskFilename).toLowerCase();
-  const isImg =
-    ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif'].includes(ext) ||
-    record.mimeType.startsWith('image/');
+  // In serverless environments where state is ephemeral across instances, return valid status
+  // so the client application does not mark the attachment as expired or broken
+  if (isServerless) {
+    return res.json({
+      id: fileId,
+      status: 'ready',
+      serverless: true,
+      message: 'Attachment active in client session.'
+    });
+  }
 
-  return res.json({
-    id: record.id,
-    name: record.originalName,
-    originalName: record.originalName,
-    extension: record.extension,
-    mimeType: record.mimeType,
-    type: record.mimeType,
-    size: record.size,
-    formattedSize: record.formattedSize,
-    status: record.status,
-    isImage: isImg,
-    dimensions: record.dimensions,
-    uploadedAt: record.uploadedAt,
-    expiresAt: record.expiresAt,
-    extraction: record.extraction
-  });
+  return res.status(404).json({ error: 'Attachment not found or has expired.' });
 });
 
 // Dedicated Document Extraction Detail Endpoint
@@ -1198,43 +1313,58 @@ app.get(['/api/upload/:id/extraction', '/upload/:id/extraction'], async (req, re
   }
 
   const record = fileRegistry.get(fileId);
-  if (!record) {
-    return res.status(404).json({ error: 'Attachment not found or has expired.' });
-  }
-
-  if (record.extraction) {
+  if (record?.extraction) {
     return res.json(record.extraction);
   }
 
-  const ext = path.extname(record.diskFilename).toLowerCase();
-  const isImg =
-    ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif'].includes(ext) ||
-    record.mimeType.startsWith('image/');
+  if (record) {
+    const ext = path.extname(record.diskFilename).toLowerCase();
+    const isImg =
+      ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif'].includes(ext) ||
+      record.mimeType.startsWith('image/');
 
-  const filePath = path.join(UPLOAD_DIR, path.basename(record.diskFilename));
+    const filePath = path.join(UPLOAD_DIR, path.basename(record.diskFilename));
+    const inputSource = record.buffer || (fs.existsSync(filePath) ? filePath : null);
 
-  if (isImg) {
-    const imgExtraction = await extractImageText(
-      filePath,
-      record.originalName,
-      ext,
-      record.mimeType,
-      record.id,
-      record.dimensions
-    );
-    record.extraction = imgExtraction;
-    return res.json(imgExtraction);
+    if (inputSource) {
+      if (isImg) {
+        const imgExtraction = await extractImageText(
+          inputSource,
+          record.originalName,
+          ext,
+          record.mimeType,
+          record.id,
+          record.dimensions
+        );
+        record.extraction = imgExtraction;
+        return res.json(imgExtraction);
+      }
+
+      const extraction = (await extractDocumentContent(
+        inputSource,
+        record.originalName,
+        ext,
+        record.mimeType,
+        record.id
+      )) as DocumentExtractionResult;
+      record.extraction = extraction;
+      return res.json(extraction);
+    }
   }
 
-  const extraction = (await extractDocumentContent(
-    filePath,
-    record.originalName,
-    ext,
-    record.mimeType,
-    record.id
-  )) as DocumentExtractionResult;
-  record.extraction = extraction;
-  return res.json(extraction);
+  if (isServerless) {
+    return res.json({
+      id: fileId,
+      fileId,
+      status: 'ready',
+      success: true,
+      hasText: false,
+      text: '',
+      message: 'Extraction metadata stored in client session.'
+    });
+  }
+
+  return res.status(404).json({ error: 'Attachment not found or has expired.' });
 });
 
 // Dedicated Attachment File Serving & Download Endpoint (Requirements 4, 6, 8)
@@ -1251,6 +1381,26 @@ app.get(
     let originalName = record?.originalName || 'document';
     let mimeType = record?.mimeType || 'application/octet-stream';
 
+    const forceDownload = req.query.download === 'true' || req.path.includes('/download');
+    const isInline =
+      !forceDownload &&
+      (mimeType === 'application/pdf' ||
+        mimeType.startsWith('text/') ||
+        mimeType.startsWith('image/'));
+
+    const safeFilename = path.basename(originalName).replace(/[/\\?%*:|"<>]/g, '_');
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader(
+      'Content-Disposition',
+      `${isInline ? 'inline' : 'attachment'}; filename="${encodeURIComponent(safeFilename)}"; filename*=UTF-8''${encodeURIComponent(safeFilename)}`
+    );
+
+    // 1. Direct in-memory buffer serving (serverless-friendly, eliminates disk dependencies)
+    if (record?.buffer) {
+      return res.send(record.buffer);
+    }
+
+    // 2. Disk-based fallback (localhost persistent uploads)
     if (!diskFilename) {
       try {
         const files = await fs.promises.readdir(UPLOAD_DIR);
@@ -1259,6 +1409,7 @@ app.get(
           diskFilename = match;
           const ext = path.extname(match).toLowerCase();
           mimeType = (ALLOWED_EXTENSIONS_MAP[ext] && ALLOWED_EXTENSIONS_MAP[ext][0]) || 'application/octet-stream';
+          res.setHeader('Content-Type', mimeType);
         }
       } catch (_) {}
     }
@@ -1277,20 +1428,6 @@ app.get(
     if (!fs.existsSync(resolvedFilePath)) {
       return res.status(404).json({ error: 'Attachment file not found or has expired.' });
     }
-
-    const forceDownload = req.query.download === 'true' || req.path.includes('/download');
-    const isInline =
-      !forceDownload &&
-      (mimeType === 'application/pdf' ||
-        mimeType.startsWith('text/') ||
-        mimeType.startsWith('image/'));
-
-    const safeFilename = path.basename(originalName).replace(/[/\\?%*:|"<>]/g, '_');
-    res.setHeader('Content-Type', mimeType);
-    res.setHeader(
-      'Content-Disposition',
-      `${isInline ? 'inline' : 'attachment'}; filename="${encodeURIComponent(safeFilename)}"; filename*=UTF-8''${encodeURIComponent(safeFilename)}`
-    );
 
     return res.sendFile(resolvedFilePath);
   }
@@ -1337,7 +1474,7 @@ app.post(['/api/upload', '/upload'], (req, res) => {
         }
         if (err.code === 'LIMIT_FILE_COUNT') {
           return res.status(400).json({
-            error: `Maximum of ${MAX_ATTACHMENTS_PER_UPLOAD} attachments allowed per upload.`,
+            error: 'Only one attachment can be added per message.',
             code: 'TOO_MANY_FILES'
           });
         }
@@ -1362,6 +1499,13 @@ app.post(['/api/upload', '/upload'], (req, res) => {
       });
     }
 
+    if (files.length > 1) {
+      return res.status(400).json({
+        error: 'Only one attachment can be added per message.',
+        code: 'TOO_MANY_FILES'
+      });
+    }
+
     const conversationId = req.body?.conversationId ? String(req.body.conversationId).trim() : undefined;
     const uploadedResults: UploadedFileRecord[] = [];
     const validationErrors: string[] = [];
@@ -1377,20 +1521,17 @@ app.post(['/api/upload', '/upload'], (req, res) => {
         .trim()
         .slice(0, 150) || 'attachment';
 
-      if (file.size === 0) {
+      const fileBuffer = file.buffer;
+      const fileSize = fileBuffer ? fileBuffer.length : file.size;
+
+      if (!fileBuffer || fileSize === 0) {
         validationErrors.push(`File '${safeBaseName}' is empty (0 bytes).`);
-        try {
-          await fs.promises.unlink(file.path);
-        } catch (_) {}
         continue;
       }
 
-      const sigResult = await verifyFileSignature(file.path, ext);
+      const sigResult = await verifyFileSignature(fileBuffer, ext);
       if (!sigResult.valid) {
         validationErrors.push(`File '${safeBaseName}': ${sigResult.reason}`);
-        try {
-          await fs.promises.unlink(file.path);
-        } catch (_) {}
         continue;
       }
 
@@ -1398,22 +1539,31 @@ app.post(['/api/upload', '/upload'], (req, res) => {
         ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif'].includes(ext) ||
         (file.mimetype || '').toLowerCase().startsWith('image/');
 
-      const fileId = path.basename(file.filename, ext);
+      const fileId = crypto.randomUUID();
+      const diskFilename = `${fileId}${ext}`;
       const nowIso = new Date().toISOString();
+
+      // Persist to local disk asynchronously when writable without blocking or failing on read-only serverless filesystems
+      try {
+        const fullDiskPath = path.join(UPLOAD_DIR, diskFilename);
+        fs.writeFile(fullDiskPath, fileBuffer, () => {});
+      } catch (_) {}
+
       const record: UploadedFileRecord = {
         id: fileId,
         originalName: safeBaseName,
-        diskFilename: file.filename,
+        diskFilename,
         mimeType: file.mimetype || (isImg ? `image/${ext.replace('.', '')}` : 'application/octet-stream'),
         extension: ext.replace('.', '').toUpperCase(),
-        size: file.size,
-        formattedSize: formatBytes(file.size),
+        size: fileSize,
+        formattedSize: formatBytes(fileSize),
         status: isImg ? 'ready' : 'uploaded',
         uploadedAt: nowIso,
         expiresAt: Date.now() + TEMP_FILE_TTL_MS,
         conversationId,
         isImage: isImg,
-        dimensions: sigResult.dimensions
+        dimensions: sigResult.dimensions,
+        buffer: fileBuffer
       };
 
       fileRegistry.set(fileId, record);
@@ -1454,21 +1604,25 @@ app.post(['/api/upload', '/upload'], (req, res) => {
           ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif'].includes(ext) ||
           rec.mimeType.startsWith('image/');
 
+        const inputSource = rec.buffer || fullDiskPath;
+
         if (isImg) {
           rec.isImage = true;
+          const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || null;
           const imgExtraction = (await extractImageText(
-            fullDiskPath,
+            inputSource,
             rec.originalName,
             ext,
             rec.mimeType,
             rec.id,
-            rec.dimensions
+            rec.dimensions,
+            geminiKey
           )) as any;
           rec.extraction = imgExtraction;
           rec.status = 'ready';
         } else {
           const extraction = (await extractDocumentContent(
-            fullDiskPath,
+            inputSource,
             rec.originalName,
             ext,
             rec.mimeType,
@@ -1491,6 +1645,12 @@ app.post(['/api/upload', '/upload'], (req, res) => {
         const isImg =
           ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif'].includes(ext) ||
           r.mimeType.startsWith('image/');
+        const dataUrl = isImg && r.buffer && r.buffer.length <= 4 * 1024 * 1024
+          ? `data:${r.mimeType};base64,${r.buffer.toString('base64')}`
+          : undefined;
+        const base64 = isImg && r.buffer && r.buffer.length <= 4 * 1024 * 1024
+          ? r.buffer.toString('base64')
+          : undefined;
         return {
           id: r.id,
           originalName: r.originalName,
@@ -1503,6 +1663,9 @@ app.post(['/api/upload', '/upload'], (req, res) => {
           status: r.status,
           isImage: isImg,
           dimensions: r.dimensions,
+          dataUrl,
+          base64,
+          url: `/api/upload/${r.id}/file`,
           uploadedAt: r.uploadedAt,
           extraction: r.extraction
             ? {
@@ -1567,7 +1730,11 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
       preferences = null,
       stream = true,
       conversationId = null,
-      attachments = []
+      attachments = [],
+      isContinuation: clientIsContinuation,
+      partNumber: clientPartNumber,
+      originalPrompt: clientOriginalPrompt,
+      previousContentSummary: clientPreviousContentSummary
     } = req.body as {
       provider?: string;
       mode?: string;
@@ -1578,11 +1745,26 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
       stream?: boolean;
       conversationId?: string | null;
       attachments?: any[];
+      isContinuation?: boolean;
+      partNumber?: number;
+      originalPrompt?: string | null;
+      previousContentSummary?: string | null;
     };
 
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'Prompt is required.' });
     }
+
+    // Resolve multi-part response context (handles continuation phrases like 'Continue', 'Send the rest', 'Next', 'Part 2')
+    const multiPartCtx: any = resolveMultiPartContext(history, prompt);
+    const isContinuation =
+      typeof clientIsContinuation === 'boolean'
+        ? clientIsContinuation
+        : multiPartCtx.isContinuation;
+    const partNumber = clientPartNumber || multiPartCtx.partNumber || 1;
+    const originalPrompt = clientOriginalPrompt || multiPartCtx.originalPrompt || prompt;
+    const previousContentSummary =
+      clientPreviousContentSummary || multiPartCtx.previousContentSummary || '';
 
     // Accurately track client response disconnection (res.on('close')), NOT request stream upload end
     let isClientClosed = false;
@@ -1653,19 +1835,23 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
               ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif'].includes(ext) ||
               record.mimeType.startsWith('image/');
             const fullDiskPath = path.join(UPLOAD_DIR, record.diskFilename);
-            if (fs.existsSync(fullDiskPath)) {
+            const inputSource = record.buffer || (fs.existsSync(fullDiskPath) ? fullDiskPath : null);
+            if (inputSource) {
               if (isImg) {
+                const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || null;
                 record.extraction = (await extractImageText(
-                  fullDiskPath,
+                  inputSource,
                   record.originalName,
                   ext,
                   record.mimeType,
                   record.id,
-                  record.dimensions
+                  record.dimensions,
+                  geminiKey
                 )) as any;
+                record.status = 'ready';
               } else {
                 record.extraction = (await extractDocumentContent(
-                  fullDiskPath,
+                  inputSource,
                   record.originalName,
                   ext,
                   record.mimeType,
@@ -1721,10 +1907,44 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
       }
     }
 
-    // Prepare document context for the prompt
-    const prepDoc: PreparedDocumentContext = prepareDocumentContext(prompt, availableDocs) as PreparedDocumentContext;
+    // 4. Attachments referenced in the multi-part sequence (preserves attachment across Part 1 -> Continue -> Part 2)
+    if (isContinuation && Array.isArray(multiPartCtx.referencedAttachments)) {
+      for (const rAtt of multiPartCtx.referencedAttachments) {
+        if (!rAtt?.id) continue;
+        const record = fileRegistry.get(rAtt.id);
+        if (record?.extraction) {
+          addDocIfValid(record.extraction as DocumentData, record.conversationId || conversationId || undefined);
+        } else if (rAtt.extraction) {
+          addDocIfValid(rAtt.extraction as DocumentData, conversationId || undefined);
+        }
+      }
+    }
+
+    // Prepare document context for the prompt (using originalPrompt when continuing)
+    const effectiveDocPrompt = isContinuation && originalPrompt ? originalPrompt : prompt;
+    const prepDoc: PreparedDocumentContext = prepareDocumentContext(effectiveDocPrompt, availableDocs) as PreparedDocumentContext;
     const normalizedProvider = String(provider).toLowerCase();
     const shouldStream = stream !== false;
+
+    // Detect if this inquiry is likely to exceed safe response output size
+    const largeDetection = detectLargeResponseIntent({
+      prompt: effectiveDocPrompt,
+      docs: availableDocs,
+      preferences,
+      mode,
+      history
+    });
+    const isLikelyLarge = largeDetection.isLikelyLarge || isContinuation;
+
+    // Multi-part prompt augmentation
+    const multiPartAugmentation = buildMultiPartPromptAugmentation({
+      isLikelyLarge,
+      isContinuation,
+      partNumber,
+      originalPrompt: originalPrompt || prompt,
+      previousContentSummary,
+      provider: normalizedProvider
+    });
 
     // If an immediate direct answer is determined (e.g. unreadable scanned file, empty doc, page out of bounds)
     if (prepDoc.directAnswer) {
@@ -1749,12 +1969,15 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         : null;
 
     const baseSystemInstruction = buildSystemInstruction(cleanUsername, preferences, mode);
+    const fullSystemInstruction = multiPartAugmentation
+      ? `${baseSystemInstruction}\n\n${multiPartAugmentation}`
+      : baseSystemInstruction;
 
     // Shared Provider-Independent Document Context Adaptation (Requirements 2, 3, 5, 7, 8)
     const adapted: any = adaptDocumentContextForProvider({
       provider: normalizedProvider,
       prompt,
-      baseSystemInstruction,
+      baseSystemInstruction: fullSystemInstruction,
       preparedContext: prepDoc
     });
 
@@ -1767,7 +1990,18 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
       // If no API key is configured, return simulated response (with progressive reveal if streaming)
       if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-        const text = availableDocs.length > 0
+        const text = (isLikelyLarge || isContinuation)
+          ? generateSimulatedMultiPartResponse({
+              prompt,
+              docs: availableDocs,
+              username: cleanUsername,
+              preferences,
+              mode,
+              isContinuation,
+              partNumber,
+              originalPrompt
+            })
+          : availableDocs.length > 0
           ? generateSimulatedDocumentResponse(prompt, prepDoc)
           : generateSimulatedResponse(prompt, cleanUsername, preferences, mode);
         const demoModel = availableDocs.length > 0 ? 'Document Analyzer (demo)' : 'gemini-3.1-flash-lite (demo)';
@@ -1802,14 +2036,52 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         }
       });
 
-      const contents = formatGeminiHistory(history, effectivePrompt);
+      // Collect attached images for Gemini multimodal processing
+      const imageParts: Array<{ mimeType: string; data: string }> = [];
+      if (Array.isArray(attachments)) {
+        for (const att of attachments) {
+          if (!att?.id) continue;
+          const rec = fileRegistry.get(att.id);
+          const ext = path.extname(rec?.diskFilename || att.name || '').toLowerCase();
+          const isImg =
+            ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp'].includes(ext) ||
+            (rec?.mimeType || att.type || '').startsWith('image/');
+          if (isImg) {
+            let buf = rec?.buffer;
+            if (!buf && rec?.diskFilename) {
+              const fullDiskPath = path.join(UPLOAD_DIR, rec.diskFilename);
+              try {
+                if (fs.existsSync(fullDiskPath)) {
+                  buf = fs.readFileSync(fullDiskPath);
+                }
+              } catch (_) {}
+            }
+            // Allow client-provided base64 image data across stateless serverless invocations
+            if (!buf && (att?.base64 || att?.data || att?.dataUrl)) {
+              const rawB64 = String(att.base64 || att.data || att.dataUrl).replace(/^data:image\/[a-zA-Z+]+;base64,/, '');
+              try {
+                buf = Buffer.from(rawB64, 'base64');
+              } catch (_) {}
+            }
+            if (buf && buf.length <= 10 * 1024 * 1024) {
+              const mime = rec?.mimeType || att.type || `image/${ext.replace('.', '')}`;
+              imageParts.push({
+                mimeType: mime,
+                data: buf.toString('base64')
+              });
+            }
+          }
+        }
+      }
+
+      const contents = formatGeminiHistory(history, effectivePrompt, 12, imageParts);
       // Attempt sequence: max 3 attempts total (initial attempt + up to 2 retries)
-      // Attempt 1 tries gemini-3.8-flash (primary recommended model)
-      // Attempt 2 tries gemini-3-flash-preview (fast reliable fallback preview model)
+      // Attempt 1 tries gemini-flash-latest (fastest and highest availability in all tiers)
+      // Attempt 2 tries gemini-3.8-flash (primary recommended model)
       // Attempt 3 tries gemini-3.1-flash-lite (alternative lite model)
       const attemptPlan = [
-        { model: 'gemini-3.8-flash', attemptNum: 1 },
-        { model: 'gemini-3-flash-preview', attemptNum: 2 },
+        { model: 'gemini-flash-latest', attemptNum: 1 },
+        { model: 'gemini-3.8-flash', attemptNum: 2 },
         { model: 'gemini-3.1-flash-lite', attemptNum: 3 }
       ];
       const maxAttempts = attemptPlan.length;
@@ -1831,8 +2103,12 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
             });
 
             if (response && response.text) {
+              let finalText = response.text;
+              if (isLikelyLarge && !isContinuation && !responseHasContinuationNotice(finalText)) {
+                finalText += CONTINUATION_NOTICES.PART_1;
+              }
               return res.json({
-                text: response.text,
+                text: finalText,
                 modelUsed: model,
                 provider: 'gemini'
               });
@@ -1944,6 +2220,10 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
               }
 
               if (!res.writableEnded) {
+                if (isLikelyLarge && !isContinuation && !responseHasContinuationNotice(fullText)) {
+                  sendSSE(res, { type: 'chunk', text: CONTINUATION_NOTICES.PART_1 });
+                  fullText += CONTINUATION_NOTICES.PART_1;
+                }
                 sendSSE(res, { type: 'done', text: fullText, modelUsed: model, provider: 'gemini' });
                 res.end();
               }
@@ -2043,7 +2323,18 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
     if (normalizedProvider === 'groq') {
       const apiKey = process.env.GROQ_API_KEY || process.env.VITE_GROQ_API_KEY;
       if (!apiKey || apiKey === 'YOUR_GROQ_API_KEY') {
-        const text = availableDocs.length > 0
+        const text = (isLikelyLarge || isContinuation)
+          ? generateSimulatedMultiPartResponse({
+              prompt,
+              docs: availableDocs,
+              username: cleanUsername,
+              preferences,
+              mode,
+              isContinuation,
+              partNumber,
+              originalPrompt
+            })
+          : availableDocs.length > 0
           ? generateSimulatedDocumentResponse(prompt, prepDoc)
           : generateSimulatedResponse(prompt, cleanUsername, preferences, mode);
         const demoModel = availableDocs.length > 0 ? 'Document Analyzer (demo)' : 'Llama 3.3 70B (demo)';
@@ -2106,8 +2397,12 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         }
 
         const data = await groqRes.json();
+        let finalText = data?.choices?.[0]?.message?.content || '';
+        if (isLikelyLarge && !isContinuation && !responseHasContinuationNotice(finalText)) {
+          finalText += CONTINUATION_NOTICES.PART_1;
+        }
         return res.json({
-          text: data?.choices?.[0]?.message?.content || '',
+          text: finalText,
           modelUsed: data.model || 'openai/gpt-oss-120b',
           provider: 'groq'
         });
@@ -2178,6 +2473,10 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         }
 
         if (!res.writableEnded) {
+          if (isLikelyLarge && !isContinuation && !responseHasContinuationNotice(fullText)) {
+            sendSSE(res, { type: 'chunk', text: CONTINUATION_NOTICES.PART_1 });
+            fullText += CONTINUATION_NOTICES.PART_1;
+          }
           sendSSE(res, { type: 'done', text: fullText, modelUsed, provider: 'groq' });
           res.end();
         }
@@ -2189,7 +2488,18 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
     if (normalizedProvider === 'openrouter') {
       const apiKey = process.env.OPENROUTER_API_KEY || process.env.VITE_OPENROUTER_API_KEY;
       if (!apiKey || apiKey === 'YOUR_OPENROUTER_API_KEY') {
-        const text = availableDocs.length > 0
+        const text = (isLikelyLarge || isContinuation)
+          ? generateSimulatedMultiPartResponse({
+              prompt,
+              docs: availableDocs,
+              username: cleanUsername,
+              preferences,
+              mode,
+              isContinuation,
+              partNumber,
+              originalPrompt
+            })
+          : availableDocs.length > 0
           ? generateSimulatedDocumentResponse(prompt, prepDoc)
           : generateSimulatedResponse(prompt, cleanUsername, preferences, mode);
         const demoModel = availableDocs.length > 0 ? 'Document Analyzer (demo)' : 'openrouter/free (demo)';
@@ -2253,8 +2563,12 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         }
 
         const data = await orRes.json();
+        let finalText = data?.choices?.[0]?.message?.content || '';
+        if (isLikelyLarge && !isContinuation && !responseHasContinuationNotice(finalText)) {
+          finalText += CONTINUATION_NOTICES.PART_1;
+        }
         return res.json({
-          text: data?.choices?.[0]?.message?.content || '',
+          text: finalText,
           modelUsed: data.model || 'openrouter/free',
           provider: 'openrouter'
         });
@@ -2326,6 +2640,10 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         }
 
         if (!res.writableEnded) {
+          if (isLikelyLarge && !isContinuation && !responseHasContinuationNotice(fullText)) {
+            sendSSE(res, { type: 'chunk', text: CONTINUATION_NOTICES.PART_1 });
+            fullText += CONTINUATION_NOTICES.PART_1;
+          }
           sendSSE(res, { type: 'done', text: fullText, modelUsed, provider: 'openrouter' });
           res.end();
         }
@@ -2347,7 +2665,18 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         accountId === 'YOUR_CLOUDFLARE_ACCOUNT_ID' ||
         apiToken === 'YOUR_CLOUDFLARE_API_TOKEN'
       ) {
-        const text = availableDocs.length > 0
+        const text = (isLikelyLarge || isContinuation)
+          ? generateSimulatedMultiPartResponse({
+              prompt,
+              docs: availableDocs,
+              username: cleanUsername,
+              preferences,
+              mode,
+              isContinuation,
+              partNumber,
+              originalPrompt
+            })
+          : availableDocs.length > 0
           ? generateSimulatedDocumentResponse(prompt, prepDoc)
           : generateSimulatedResponse(prompt, cleanUsername, preferences, mode);
         const demoModel = availableDocs.length > 0 ? 'Document Analyzer (demo)' : 'Cloudflare Workers AI — Llama 3.1 8B (demo)';
@@ -2430,7 +2759,10 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         }
 
         const data = await cfRes.json();
-        const text = data?.result?.response || (typeof data?.result === 'string' ? data.result : '') || '';
+        let text = data?.result?.response || (typeof data?.result === 'string' ? data.result : '') || '';
+        if (isLikelyLarge && !isContinuation && !responseHasContinuationNotice(text)) {
+          text += CONTINUATION_NOTICES.PART_1;
+        }
         return res.json({
           text,
           modelUsed: displayModel,
@@ -2490,7 +2822,10 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         // If Cloudflare returns non-streaming JSON (or body is missing) despite stream: true, adapt it gracefully to SSE
         if (contentType.includes('application/json') || !cfRes.body) {
           const data = await cfRes.json();
-          const fullText = data?.result?.response || (typeof data?.result === 'string' ? data.result : '') || '';
+          let fullText = data?.result?.response || (typeof data?.result === 'string' ? data.result : '') || '';
+          if (isLikelyLarge && !isContinuation && !responseHasContinuationNotice(fullText)) {
+            fullText += CONTINUATION_NOTICES.PART_1;
+          }
           initSSE(res);
           sendSSE(res, { type: 'start', modelUsed: displayModel, provider: 'cloudflare' });
           if (fullText) {
@@ -2557,6 +2892,10 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         }
 
         if (!res.writableEnded) {
+          if (isLikelyLarge && !isContinuation && !responseHasContinuationNotice(fullText)) {
+            sendSSE(res, { type: 'chunk', text: CONTINUATION_NOTICES.PART_1 });
+            fullText += CONTINUATION_NOTICES.PART_1;
+          }
           sendSSE(res, { type: 'done', text: fullText, modelUsed: displayModel, provider: 'cloudflare' });
           res.end();
         }
@@ -2597,19 +2936,19 @@ async function startServer() {
   const publicPath = path.resolve(__dirname, 'public');
   app.use(express.static(publicPath));
 
-  if (process.env.NODE_ENV !== 'production') {
+  const distPath = path.resolve(__dirname, 'dist');
+  if (process.env.NODE_ENV === 'production' && fs.existsSync(distPath)) {
+    app.use(express.static(distPath));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.resolve(distPath, 'index.html'));
+    });
+  } else {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa'
     });
     app.use(vite.middlewares);
-  } else {
-    const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.resolve(distPath, 'index.html'));
-    });
   }
 
   app.listen(Number(PORT), '0.0.0.0', () => {
@@ -2617,7 +2956,7 @@ async function startServer() {
   });
 }
 
-if (!process.env.VERCEL) {
+if (!process.env.VERCEL && !process.env.TESTING) {
   startServer();
 }
 
