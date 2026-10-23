@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
+import { transcribeAudioBlob } from '../services/transcriptionService.js';
 
 /**
  * Supported Speech Recognition Languages with BCP 47 language tags.
@@ -19,11 +20,74 @@ export const SUPPORTED_LANGUAGES = [
 export const DEFAULT_LANGUAGE = 'en-US';
 
 /**
- * Audio Capture & Buffering Configuration (Phase 5.2)
+ * Audio Capture & Buffering Configuration (Phase 5.2 & 5.4)
  */
 export const MAX_RECORDED_BYTES = 25 * 1024 * 1024; // 25 MB safeguard against unbounded memory growth
 export const MAX_RECORDING_DURATION_MS = 15 * 60 * 1000; // 15 minutes continuous dictation limit
 export const CHUNK_TIMESLICE_MS = 250; // 250ms chunks for smooth real-time buffering
+
+/**
+ * Detects browser dictation capabilities and environment across desktop and mobile.
+ * Accurately recognizes Chrome, Edge, Safari (macOS & iOS), and Firefox (which does not
+ * enable native Web Speech by default, but supports direct audio capture & Whisper transcription).
+ *
+ * @returns {Object} Capabilities descriptor
+ */
+export function detectDictationCapabilities() {
+  if (typeof window === 'undefined') {
+    return {
+      hasSpeechRecognition: false,
+      hasGetUserMedia: false,
+      hasMediaRecorder: false,
+      isSupported: false,
+      engineMode: 'unsupported',
+      isFirefox: false,
+      isIOS: false,
+      isSafari: false
+    };
+  }
+
+  const hasSpeechRecognition = Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
+  const hasGetUserMedia = Boolean(
+    navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function'
+  );
+  const hasMediaRecorder = Boolean(window.MediaRecorder);
+
+  const userAgent = navigator.userAgent || '';
+  const isFirefox = /Firefox/i.test(userAgent);
+  const isIOS =
+    /iPad|iPhone|iPod/.test(userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const isSafari =
+    /Safari/i.test(userAgent) && !/Chrome|CriOS|Edg|OPR|Firefox/i.test(userAgent);
+
+  // Engine mode resolution:
+  // - 'hybrid': Chrome, Edge, desktop/iOS Safari (SpeechRecognition + MediaRecorder Whisper enhancement)
+  // - 'direct-audio': Firefox on Windows/macOS/Android (Direct MediaRecorder capture + Whisper transcription)
+  // - 'native-only': Browsers with SpeechRecognition but missing MediaRecorder
+  // - 'unsupported': Neither capability available
+  let engineMode = 'unsupported';
+  if (hasSpeechRecognition && hasGetUserMedia && hasMediaRecorder) {
+    engineMode = 'hybrid';
+  } else if (hasGetUserMedia && hasMediaRecorder) {
+    // Firefox fallback: SpeechRecognition is disabled by default in Firefox,
+    // but MediaRecorder + getUserMedia are fully supported!
+    engineMode = 'direct-audio';
+  } else if (hasSpeechRecognition) {
+    engineMode = 'native-only';
+  }
+
+  return {
+    hasSpeechRecognition,
+    hasGetUserMedia,
+    hasMediaRecorder,
+    isSupported: engineMode !== 'unsupported',
+    engineMode,
+    isFirefox,
+    isIOS,
+    isSafari
+  };
+}
 
 /**
  * Detects the most optimal audio MIME type supported by the user's browser.
@@ -46,7 +110,7 @@ export function getSupportedAudioMimeType() {
   ];
   for (const mime of candidateTypes) {
     try {
-      if (MediaRecorder.isTypeSupported(mime)) {
+      if (typeof MediaRecorder.isTypeSupported === 'function' && MediaRecorder.isTypeSupported(mime)) {
         return mime;
       }
     } catch (_) {}
@@ -251,15 +315,12 @@ function selectBestAlternative(result) {
  * @returns {Object} Dictation states, controls, and audio metrics
  */
 export function useVoiceDictation({ inputValue = '', onInputChange }) {
-  // Safe initial detection of browser SpeechRecognition support
-  const [isSupported, setIsSupported] = useState(() => {
-    if (typeof window !== 'undefined') {
-      return Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
-    }
-    return false;
-  });
+  // Safe capability detection across browsers (Chrome, Edge, Safari, Firefox, iOS, Android)
+  const [capabilities, setCapabilities] = useState(detectDictationCapabilities);
+  const [isSupported, setIsSupported] = useState(() => capabilities.isSupported);
+  const [engineMode, setEngineMode] = useState(() => capabilities.engineMode);
 
-  const [recordingState, setRecordingState] = useState('idle'); // 'idle' | 'requesting' | 'listening' | 'paused' | 'finalizing' | 'error'
+  const [recordingState, setRecordingState] = useState('idle'); // 'idle' | 'requesting' | 'listening' | 'paused' | 'finalizing' | 'transcribing' | 'error'
   const [dictationError, setDictationError] = useState(null);
   const [interimTranscript, setInterimTranscript] = useState('');
   const [lastSessionTranscript, setLastSessionTranscript] = useState('');
@@ -294,7 +355,9 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
 
   const restartTimeoutRef = useRef(null);
   const consecutiveErrorsRef = useRef(0);
+  const consecutiveSilenceRestartsRef = useRef(0);
   const isStartingRef = useRef(false);
+  const isTransitioningRef = useRef(false); // Concurrency guard against rapid multi-tapping
   const instanceCounterRef = useRef(0);
   const lastCommittedSegmentRef = useRef({ text: '', timestamp: 0 });
 
@@ -315,10 +378,28 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
   const activeMimeTypeRef = useRef('');
   const recordedAudioBlobRef = useRef(null);
 
+  // Phase 5.3: Whisper-based high-accuracy transcription state & refs
+  const [transcriptionMeta, setTranscriptionMeta] = useState(null);
+  const [transcriptionNotice, setTranscriptionNotice] = useState(null);
+
+  const transcriptionAbortCtrlRef = useRef(null);
+  const transcriptionSessionCounterRef = useRef(0);
+  const expectedEmittedBeforeTranscribeRef = useRef('');
+  const nativeSessionTranscriptRef = useRef('');
+  const sessionBaseTextRef = useRef('');
+
   // Synchronous state updater to avoid React re-render closure lag in event handlers
   const updateRecordingState = useCallback((newState) => {
     recordingStateRef.current = newState;
     setRecordingState(newState);
+  }, []);
+
+  // Sync capability detection on mount
+  useEffect(() => {
+    const caps = detectDictationCapabilities();
+    setCapabilities(caps);
+    setIsSupported(caps.isSupported);
+    setEngineMode(caps.engineMode);
   }, []);
 
   // Handle genuine manual typing, pasting, or editing during an active dictation session.
@@ -341,16 +422,7 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
     }
   }, [inputValue]);
 
-  // Check Web Speech API browser support on mount
-  useEffect(() => {
-    const SpeechRecognition =
-      typeof window !== 'undefined'
-        ? window.SpeechRecognition || window.webkitSpeechRecognition
-        : null;
-    setIsSupported(Boolean(SpeechRecognition));
-  }, []);
-
-  // Cleanup helper for all microphone, visualizer, and audio recorder resources (Phase 5.2)
+  // Cleanup helper for all microphone, visualizer, and audio recorder resources (Phase 5.2 & 5.4)
   const stopAudioResources = useCallback(() => {
     // 1. Cancel visualizer animation frame
     if (animFrameRef.current) {
@@ -389,9 +461,10 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
     setAudioFrequencies([0.15, 0.25, 0.35, 0.25, 0.15]);
   }, []);
 
-  // Safely acquires a single shared microphone MediaStream (Phase 5.2).
+  // Safely acquires a single shared microphone MediaStream (Phase 5.2 & 5.4).
   // Coordinates both the visualizer AnalyserNode and MediaRecorder on the same stream,
   // preventing multiple hardware capture streams and audio pipeline renegotiation.
+  // Handles track interruptions (incoming phone calls, headset disconnects).
   const acquireMicrophoneStream = useCallback(async () => {
     if (typeof window === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
       throw new Error('Microphone capture is not supported in this browser.');
@@ -417,9 +490,23 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
       audio: true
     });
 
+    // Mobile & hardware interruption handling (incoming phone calls, bluetooth disconnects)
+    stream.getAudioTracks().forEach((track) => {
+      track.onended = () => {
+        if (
+          recordingStateRef.current === 'listening' ||
+          recordingStateRef.current === 'requesting'
+        ) {
+          stopAudioResources();
+          setDictationError('Microphone was disconnected or interrupted by another application.');
+          updateRecordingState('error');
+        }
+      };
+    });
+
     mediaStreamRef.current = stream;
     return stream;
-  }, []);
+  }, [stopAudioResources, updateRecordingState]);
 
   // Connects Web Audio analyser to the shared MediaStream for non-blocking reactive visualizer
   const attachAudioAnalyser = useCallback((stream) => {
@@ -482,8 +569,8 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
     }
   }, []);
 
-  // Starts or continues audio buffering using MediaRecorder on the shared MediaStream (Phase 5.2).
-  // Preserves audio across native SpeechRecognition restarts without losing initial words or sentence ends.
+  // Starts or continues audio buffering using MediaRecorder on the shared MediaStream (Phase 5.2 & 5.4).
+  // Cross-browser resilience: falls back gracefully if preferred MIME type is rejected.
   const startMediaRecorder = useCallback((stream) => {
     if (typeof window === 'undefined' || !window.MediaRecorder || !stream) return;
 
@@ -494,17 +581,27 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
 
     try {
       const mimeType = getSupportedAudioMimeType();
-      activeMimeTypeRef.current = mimeType;
+      let recorder = null;
 
-      const options = mimeType ? { mimeType } : undefined;
-      const recorder = new MediaRecorder(stream, options);
+      if (mimeType) {
+        try {
+          recorder = new MediaRecorder(stream, { mimeType });
+        } catch (mimeErr) {
+          console.warn('Preferred MIME type rejected by MediaRecorder, falling back to default:', mimeErr);
+          recorder = new MediaRecorder(stream);
+        }
+      } else {
+        recorder = new MediaRecorder(stream);
+      }
+
+      activeMimeTypeRef.current = recorder.mimeType || mimeType || 'audio/webm';
 
       recorder.ondataavailable = (event) => {
         if (!event.data || event.data.size === 0) return;
 
         // Memory safeguard: prevent unbounded memory growth during long dictation sessions
         if (recordedBytesRef.current + event.data.size > MAX_RECORDED_BYTES) {
-          console.warn('Orvix dictation audio buffer reached maximum memory limit (25MB). Capping audio capture.');
+          console.warn('Orvix dictation audio buffer reached maximum memory limit (25MB). Capping capture.');
           return;
         }
 
@@ -577,14 +674,12 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
     async (isNewSession = true) => {
       clearTimeout(restartTimeoutRef.current);
 
-      const SpeechRecognition =
-        typeof window !== 'undefined'
-          ? window.SpeechRecognition || window.webkitSpeechRecognition
-          : null;
+      const caps = detectDictationCapabilities();
 
-      if (!SpeechRecognition) {
+      // Check if browser has no audio recording or dictation capabilities at all
+      if (!caps.isSupported) {
         setDictationError(
-          'Voice dictation is not supported in this browser. Please use Google Chrome, Microsoft Edge, or Safari.'
+          'Microphone recording is not supported in this browser. Please use Google Chrome, Microsoft Edge, Safari, or Firefox.'
         );
         hasFatalErrorRef.current = true;
         updateRecordingState('error');
@@ -613,6 +708,7 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
         isExplicitStopRef.current = false;
         hasFatalErrorRef.current = false;
         consecutiveErrorsRef.current = 0;
+        consecutiveSilenceRestartsRef.current = 0;
         lastCommittedSegmentRef.current = { text: '', timestamp: 0 };
 
         // Reset audio capture buffers for fresh session
@@ -622,6 +718,15 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
         recordedAudioBlobRef.current = null;
         setRecordedAudioBlob(null);
         setRecordedAudioDuration(0);
+
+        if (transcriptionAbortCtrlRef.current) {
+          try {
+            transcriptionAbortCtrlRef.current.abort();
+          } catch (_) {}
+          transcriptionAbortCtrlRef.current = null;
+        }
+        transcriptionSessionCounterRef.current += 1;
+        setTranscriptionNotice(null);
 
         updateRecordingState('requesting');
       } else {
@@ -634,6 +739,53 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
         }
         interimTranscriptRef.current = '';
         setInterimTranscript('');
+      }
+
+      // DIRECT-AUDIO MODE (Firefox & browsers without native SpeechRecognition):
+      // Captures audio directly via MediaRecorder and delivers high-accuracy Whisper transcription upon Done.
+      if (caps.engineMode === 'direct-audio') {
+        cleanupRecognitionInstance();
+        try {
+          const sharedStream = await acquireMicrophoneStream();
+          if (
+            isExplicitStopRef.current ||
+            (recordingStateRef.current !== 'listening' && recordingStateRef.current !== 'requesting')
+          ) {
+            stopAudioResources();
+            return;
+          }
+          attachAudioAnalyser(sharedStream);
+          startMediaRecorder(sharedStream);
+          updateRecordingState('listening');
+          setDictationError(null);
+        } catch (streamErr) {
+          hasFatalErrorRef.current = true;
+          stopAudioResources();
+          const errorMsg =
+            streamErr?.name === 'NotAllowedError' || streamErr?.name === 'PermissionDeniedError'
+              ? 'Microphone access was denied. Please allow microphone permissions in your browser address bar.'
+              : streamErr?.name === 'NotFoundError' || streamErr?.name === 'DevicesNotFoundError'
+              ? 'No microphone detected or microphone is currently busy in another application.'
+              : 'Unable to access microphone. Please check device permissions.';
+          setDictationError(errorMsg);
+          updateRecordingState('error');
+        }
+        return;
+      }
+
+      // HYBRID / NATIVE MODE (Chrome, Edge, Safari):
+      const SpeechRecognition =
+        typeof window !== 'undefined'
+          ? window.SpeechRecognition || window.webkitSpeechRecognition
+          : null;
+
+      if (!SpeechRecognition) {
+        setDictationError(
+          'Voice dictation is not supported in this browser. Please use Google Chrome, Microsoft Edge, Safari, or Firefox.'
+        );
+        hasFatalErrorRef.current = true;
+        updateRecordingState('error');
+        return;
       }
 
       // Clean up any existing recognition instance completely before instantiating a new one
@@ -864,18 +1016,40 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
           }
 
           // If speech recognizer ended naturally during active listening without explicit user stop
-          // (such as standard browser 60s silence timeout or mobile sentence cutoff), recover quickly.
-          // MediaRecorder and microphone stream remain active throughout this pause!
+          // (such as standard browser 60s silence timeout or mobile sentence cutoff), recover cleanly.
           if (
             !isExplicitStopRef.current &&
             recordingStateRef.current === 'listening'
           ) {
+            const isIOS =
+              /iPad|iPhone|iPod/.test(navigator.userAgent || '') ||
+              (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+            if (isIOS) {
+              // iOS Safari requires explicit user interaction to restart recognition.
+              // Gracefully transition to paused state so the user can easily tap Resume.
+              pauseListening();
+              setTranscriptionNotice({
+                type: 'fallback',
+                message: 'Dictation paused after silence. Tap Resume to continue speaking.'
+              });
+              return;
+            }
+
+            // Desktop / Android silence restart guard
+            consecutiveSilenceRestartsRef.current += 1;
+            if (consecutiveSilenceRestartsRef.current > 4) {
+              consecutiveSilenceRestartsRef.current = 0;
+              pauseListening();
+              return;
+            }
+
             clearTimeout(restartTimeoutRef.current);
             restartTimeoutRef.current = setTimeout(() => {
               if (recordingStateRef.current === 'listening' && !isExplicitStopRef.current) {
                 startRecognitionSession(false);
               }
-            }, 40);
+            }, 50);
             return;
           }
 
@@ -890,6 +1064,12 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
         recognition.start();
       } catch (initErr) {
         isStartingRef.current = false;
+        if (!isNewSession) {
+          // Auto-restart rejected by browser gesture restriction (expected on iOS Safari after silence)
+          console.warn('Auto-restart rejected by browser gesture restriction:', initErr);
+          pauseListening();
+          return;
+        }
         console.warn('SpeechRecognition initialization error:', initErr);
         hasFatalErrorRef.current = true;
         stopAudioResources();
@@ -984,8 +1164,8 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
     startRecognitionSession(false);
   }, [attachAudioAnalyser, startRecognitionSession]);
 
-  // Stop dictation and commit finalized transcript and audio buffer (Phase 5.2)
-  const stopListening = useCallback(() => {
+  // Stop dictation and commit finalized transcript and audio buffer (Phase 5.2 & 5.3)
+  const stopListening = useCallback(async () => {
     isExplicitStopRef.current = true;
     clearTimeout(restartTimeoutRef.current);
     updateRecordingState('finalizing');
@@ -993,20 +1173,38 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
     // Clean up recognition instance immediately to prevent trailing onresult events from double-committing
     cleanupRecognitionInstance();
 
-    // Finalize MediaRecorder audio chunks
+    // Finalize MediaRecorder audio chunks with clean event synchronization
+    let finalBlob = null;
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       try {
-        if (typeof mediaRecorderRef.current.requestData === 'function') {
-          mediaRecorderRef.current.requestData();
-        }
-        mediaRecorderRef.current.stop();
+        await new Promise((resolve) => {
+          const recorder = mediaRecorderRef.current;
+          if (!recorder || recorder.state === 'inactive') {
+            resolve();
+            return;
+          }
+          const handleStop = () => {
+            recorder.removeEventListener('stop', handleStop);
+            resolve();
+          };
+          recorder.addEventListener('stop', handleStop);
+          try {
+            if (typeof recorder.requestData === 'function') {
+              recorder.requestData();
+            }
+            recorder.stop();
+          } catch (_) {
+            resolve();
+          }
+          setTimeout(resolve, 350);
+        });
       } catch (_) {}
     }
 
-    // Assemble and store final audio blob for Phase 5.2 buffer access
+    // Assemble and store final audio blob for Phase 5.2/5.3 buffer access
     if (audioChunksRef.current.length > 0) {
       const type = activeMimeTypeRef.current || 'audio/webm';
-      const finalBlob = new Blob(audioChunksRef.current, { type });
+      finalBlob = new Blob(audioChunksRef.current, { type });
       recordedAudioBlobRef.current = finalBlob;
       setRecordedAudioBlob(finalBlob);
 
@@ -1033,12 +1231,12 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
       }
     }
 
-    const finalCombined = combineComposerText(baseTextRef.current, allFinalSpeech);
-    lastEmittedValueRef.current = finalCombined;
-    recentEmissionsRef.current.add(finalCombined);
+    const finalNativeCombined = combineComposerText(baseTextRef.current, allFinalSpeech);
+    lastEmittedValueRef.current = finalNativeCombined;
+    recentEmissionsRef.current.add(finalNativeCombined);
 
     if (onInputChangeRef.current) {
-      onInputChangeRef.current(finalCombined);
+      onInputChangeRef.current(finalNativeCombined);
     }
 
     interimTranscriptRef.current = '';
@@ -1049,7 +1247,105 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
     }
 
     committedSegmentsRef.current = [];
-    updateRecordingState('idle');
+
+    // Phase 5.3: Whisper-based High-Accuracy Final Transcription Pipeline
+    const currentBaseText = baseTextRef.current;
+    const currentNativeSpeech = allFinalSpeech;
+    const preTranscribeValue = finalNativeCombined;
+
+    sessionBaseTextRef.current = currentBaseText;
+    nativeSessionTranscriptRef.current = currentNativeSpeech;
+    expectedEmittedBeforeTranscribeRef.current = preTranscribeValue;
+
+    // Only submit to Whisper endpoint if non-trivial audio was recorded (>= 300 bytes)
+    if (finalBlob && finalBlob.size >= 300) {
+      transcriptionSessionCounterRef.current += 1;
+      const currentSessionId = transcriptionSessionCounterRef.current;
+
+      updateRecordingState('transcribing');
+
+      if (transcriptionAbortCtrlRef.current) {
+        try {
+          transcriptionAbortCtrlRef.current.abort();
+        } catch (_) {}
+      }
+      const abortCtrl = new AbortController();
+      transcriptionAbortCtrlRef.current = abortCtrl;
+
+      try {
+        const result = await transcribeAudioBlob({
+          audioBlob: finalBlob,
+          language: selectedLanguageRef.current,
+          prompt: 'Orvix, AI conversation assistant. Technical vocabulary: JavaScript, TypeScript, React',
+          signal: abortCtrl.signal
+        });
+
+        // Stale response safeguard: Ignore result if a newer dictation session was started or cancelled
+        if (transcriptionSessionCounterRef.current !== currentSessionId) {
+          return;
+        }
+
+        const rawWhisper = (result.text || '').trim();
+        if (rawWhisper) {
+          const formattedWhisper = formatSpeechTranscript(
+            rawWhisper,
+            selectedLanguageRef.current,
+            currentBaseText
+          );
+
+          const currentVal = inputValueRef.current || '';
+          let reconciled = '';
+
+          // Non-destructive reconciliation policy:
+          // 1. If composer content has not been manually edited since dictation stopped, replace cleanly
+          if (currentVal === preTranscribeValue) {
+            reconciled = combineComposerText(currentBaseText, formattedWhisper);
+          } else if (currentNativeSpeech && currentVal.includes(currentNativeSpeech)) {
+            // 2. User made edits around the speech: substitute only the speech portion
+            reconciled = currentVal.replace(currentNativeSpeech, formattedWhisper);
+          } else {
+            // 3. User significantly edited: combine cleanly without destructive overwrite
+            reconciled = combineComposerText(currentVal, formattedWhisper);
+          }
+
+          if (onInputChangeRef.current && reconciled !== currentVal) {
+            lastEmittedValueRef.current = reconciled;
+            recentEmissionsRef.current.add(reconciled);
+            onInputChangeRef.current(reconciled);
+          }
+
+          setLastSessionTranscript(formattedWhisper);
+          setTranscriptionMeta({
+            provider: result.provider === 'groq' ? 'Groq Whisper' : 'Gemini AI',
+            model: result.model,
+            highAccuracy: true,
+            timestamp: Date.now()
+          });
+          setTranscriptionNotice({
+            type: 'success',
+            message: `Enhanced with ${result.model === 'whisper-large-v3-turbo' ? 'Whisper Large v3' : result.model}`
+          });
+        }
+      } catch (err) {
+        if (transcriptionSessionCounterRef.current !== currentSessionId) return;
+        if (err?.name === 'AbortError') return;
+
+        console.warn('[Transcription] Whisper transcription error:', err?.message || err);
+        setTranscriptionNotice({
+          type: 'fallback',
+          message: err?.isTimeout
+            ? 'Whisper request timed out — live speech transcript retained.'
+            : 'Whisper service unavailable — live speech transcript retained.',
+          canRetry: true
+        });
+      } finally {
+        if (transcriptionSessionCounterRef.current === currentSessionId) {
+          updateRecordingState('idle');
+        }
+      }
+    } else {
+      updateRecordingState('idle');
+    }
   }, [cleanupRecognitionInstance, stopAudioResources, updateRecordingState]);
 
   // Cancel dictation: Discards speech from this session and restores original composer text
@@ -1057,6 +1353,15 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
     isExplicitStopRef.current = true;
     clearTimeout(restartTimeoutRef.current);
     cleanupRecognitionInstance();
+
+    // Abort any in-flight Whisper transcription request
+    if (transcriptionAbortCtrlRef.current) {
+      try {
+        transcriptionAbortCtrlRef.current.abort();
+      } catch (_) {}
+      transcriptionAbortCtrlRef.current = null;
+    }
+    transcriptionSessionCounterRef.current += 1;
 
     // Stop MediaRecorder and discard recorded audio chunks completely
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
@@ -1082,21 +1387,120 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
     committedSegmentsRef.current = [];
     interimTranscriptRef.current = '';
     setInterimTranscript('');
+    setTranscriptionNotice(null);
     updateRecordingState('idle');
   }, [cleanupRecognitionInstance, stopAudioResources, updateRecordingState]);
 
-  // Master toggle button
-  const toggleListening = useCallback(() => {
-    if (recordingStateRef.current === 'listening') {
-      stopListening();
-    } else if (recordingStateRef.current === 'paused') {
-      resumeListening();
-    } else if (recordingStateRef.current === 'requesting') {
-      cancelListening();
-    } else if (recordingStateRef.current === 'finalizing') {
-      return;
-    } else {
-      startListening();
+  // Safe retry for Whisper transcription on the captured audio buffer
+  const retryTranscription = useCallback(async () => {
+    const audioBlob = recordedAudioBlobRef.current;
+    if (!audioBlob || audioBlob.size < 300) return;
+    if (recordingStateRef.current === 'transcribing' || recordingStateRef.current === 'listening') return;
+
+    transcriptionSessionCounterRef.current += 1;
+    const currentSessionId = transcriptionSessionCounterRef.current;
+    updateRecordingState('transcribing');
+    setTranscriptionNotice(null);
+
+    if (transcriptionAbortCtrlRef.current) {
+      try {
+        transcriptionAbortCtrlRef.current.abort();
+      } catch (_) {}
+    }
+    const abortCtrl = new AbortController();
+    transcriptionAbortCtrlRef.current = abortCtrl;
+
+    const currentVal = inputValueRef.current || '';
+    const targetNative = lastSessionTranscript || '';
+
+    try {
+      const result = await transcribeAudioBlob({
+        audioBlob,
+        language: selectedLanguageRef.current,
+        prompt: 'Orvix, AI conversation assistant. Technical vocabulary: JavaScript, TypeScript, React',
+        signal: abortCtrl.signal
+      });
+
+      if (transcriptionSessionCounterRef.current !== currentSessionId) return;
+
+      const rawWhisper = (result.text || '').trim();
+      if (rawWhisper) {
+        const formattedWhisper = formatSpeechTranscript(
+          rawWhisper,
+          selectedLanguageRef.current,
+          ''
+        );
+
+        let reconciled = currentVal;
+        if (targetNative && currentVal.includes(targetNative)) {
+          reconciled = currentVal.replace(targetNative, formattedWhisper);
+        } else {
+          reconciled = combineComposerText(currentVal, formattedWhisper);
+        }
+
+        if (onInputChangeRef.current && reconciled !== currentVal) {
+          lastEmittedValueRef.current = reconciled;
+          recentEmissionsRef.current.add(reconciled);
+          onInputChangeRef.current(reconciled);
+        }
+
+        setLastSessionTranscript(formattedWhisper);
+        setTranscriptionMeta({
+          provider: result.provider === 'groq' ? 'Groq Whisper' : 'Gemini AI',
+          model: result.model,
+          highAccuracy: true,
+          timestamp: Date.now()
+        });
+        setTranscriptionNotice({
+          type: 'success',
+          message: `Enhanced with ${result.model === 'whisper-large-v3-turbo' ? 'Whisper Large v3' : result.model}`
+        });
+      }
+    } catch (err) {
+      if (transcriptionSessionCounterRef.current !== currentSessionId) return;
+      if (err?.name === 'AbortError') return;
+
+      console.warn('[Transcription] Retry failed:', err);
+      setTranscriptionNotice({
+        type: 'fallback',
+        message: 'Whisper retry unsuccessful — existing transcript retained.',
+        canRetry: true
+      });
+    } finally {
+      if (transcriptionSessionCounterRef.current === currentSessionId) {
+        updateRecordingState('idle');
+      }
+    }
+  }, [lastSessionTranscript, updateRecordingState]);
+
+  const clearTranscriptionNotice = useCallback(() => {
+    setTranscriptionNotice(null);
+  }, []);
+
+  // Master toggle button with concurrency guard against rapid multi-tapping (Phase 5.4)
+  const toggleListening = useCallback(async () => {
+    if (isTransitioningRef.current) return;
+    isTransitioningRef.current = true;
+
+    try {
+      if (recordingStateRef.current === 'listening') {
+        await stopListening();
+      } else if (recordingStateRef.current === 'paused') {
+        resumeListening();
+      } else if (recordingStateRef.current === 'requesting') {
+        cancelListening();
+      } else if (
+        recordingStateRef.current === 'finalizing' ||
+        recordingStateRef.current === 'transcribing'
+      ) {
+        // Safe no-op while finalization is actively in-flight
+      } else {
+        await startListening();
+      }
+    } finally {
+      setTimeout(() => {
+        isTransitioningRef.current = false;
+      }, 150);
     }
   }, [startListening, stopListening, resumeListening, cancelListening]);
 
@@ -1118,13 +1522,14 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
     [startRecognitionSession]
   );
 
-  // PWA and Mobile Lifecycle: Gracefully pause dictation when app goes to background
+  // PWA and Mobile Lifecycle (Phase 5.4):
+  // Cleanly pause dictation when app goes to background (visibilitychange & pagehide),
+  // releasing microphone hardware tracks so the system green/orange indicator turns off.
   useEffect(() => {
-    if (typeof document === 'undefined') return;
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'hidden') {
-        // App went to background - pause or stop active recognition gracefully
         if (recordingStateRef.current === 'listening') {
           pauseListening();
         } else if (recordingStateRef.current === 'requesting') {
@@ -1133,16 +1538,31 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
       }
     };
 
+    const handlePageHide = () => {
+      if (recordingStateRef.current === 'listening') {
+        pauseListening();
+      } else if (recordingStateRef.current === 'requesting') {
+        cancelListening();
+      }
+    };
+
     document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', handlePageHide);
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', handlePageHide);
     };
   }, [pauseListening, cancelListening]);
 
-  // Component unmount cleanup (Phase 5.2)
+  // Component unmount cleanup (Phase 5.2, 5.3 & 5.4)
   useEffect(() => {
     return () => {
       clearTimeout(restartTimeoutRef.current);
+      if (transcriptionAbortCtrlRef.current) {
+        try {
+          transcriptionAbortCtrlRef.current.abort();
+        } catch (_) {}
+      }
       stopAudioResources();
       cleanupRecognitionInstance();
     };
@@ -1150,11 +1570,16 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
 
   return {
     recordingState,
+    engineMode,
     isListening: recordingState === 'listening',
     isPaused: recordingState === 'paused',
     isRequesting: recordingState === 'requesting',
     isFinalizing: recordingState === 'finalizing',
+    isTranscribing: recordingState === 'transcribing',
     isSupported,
+    isFirefox: capabilities.isFirefox,
+    isIOS: capabilities.isIOS,
+    isSafari: capabilities.isSafari,
     dictationError,
     interimTranscript,
     lastSessionTranscript,
@@ -1177,6 +1602,11 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
     hasRecordedAudio: Boolean(recordedAudioBlob),
     supportedAudioMimeType: activeMimeTypeRef.current || getSupportedAudioMimeType(),
     getAudioBlob,
-    clearRecordedAudio
+    clearRecordedAudio,
+    // Phase 5.3 Whisper High-Accuracy Transcription exports
+    transcriptionMeta,
+    transcriptionNotice,
+    clearTranscriptionNotice,
+    retryTranscription
   };
 }

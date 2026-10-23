@@ -699,14 +699,19 @@ export default function ChatArea({
     updateScrollButtonVisibility();
   }, [messages, messagesLoading, activeChatId]);
 
-  // Hook into upgraded speech recognition engine
+  // Hook into upgraded speech recognition engine (Phase 5.2 audio capture, Phase 5.3 Whisper transcription, Phase 5.4 cross-browser & mobile reliability)
   const {
     recordingState,
+    engineMode,
     isListening,
     isPaused,
     isRequesting,
     isFinalizing,
+    isTranscribing,
     isSupported,
+    isFirefox,
+    isIOS,
+    isSafari,
     dictationError,
     interimTranscript,
     lastSessionTranscript,
@@ -722,7 +727,12 @@ export default function ChatArea({
     cancelListening,
     toggleListening,
     clearDictationError,
-    clearLastSessionTranscript
+    clearLastSessionTranscript,
+    hasRecordedAudio,
+    transcriptionMeta,
+    transcriptionNotice,
+    clearTranscriptionNotice,
+    retryTranscription
   } = useVoiceDictation({
     inputValue,
     onInputChange
@@ -1006,12 +1016,13 @@ Transcript:
 
   const hasContent = inputValue.trim().length > 0 || attachments.length > 0;
   const hasMessages = messages.length > 0;
-  // Dictation dock is only active when actively requesting, listening, paused, or finalizing
+  // Dictation dock is active when actively requesting, listening, paused, finalizing, or transcribing
   const isRecordingActive =
     recordingState === 'listening' ||
     recordingState === 'paused' ||
     recordingState === 'requesting' ||
-    recordingState === 'finalizing';
+    recordingState === 'finalizing' ||
+    recordingState === 'transcribing';
 
   return (
     <main
@@ -1138,6 +1149,40 @@ Transcript:
             </div>
           )}
 
+          {/* Voice Dictation High-Accuracy / Fallback Notification (Phase 5.3) */}
+          {transcriptionNotice && !isRecordingActive && (
+            <div className={`composer-dictation-notice ${transcriptionNotice.type}`} role="status">
+              <div className="dictation-notice-content">
+                {transcriptionNotice.type === 'success' ? (
+                  <Sparkles size={13} className="notice-icon success" aria-hidden="true" />
+                ) : (
+                  <AlertCircle size={13} className="notice-icon fallback" aria-hidden="true" />
+                )}
+                <span>{transcriptionNotice.message}</span>
+              </div>
+              <div className="dictation-notice-actions">
+                {transcriptionNotice.canRetry && hasRecordedAudio && (
+                  <button
+                    type="button"
+                    className="notice-retry-btn"
+                    onClick={retryTranscription}
+                    title="Retry Whisper transcription on the captured audio recording"
+                  >
+                    Retry Whisper
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="notice-dismiss-btn"
+                  onClick={clearTranscriptionNotice}
+                  aria-label="Dismiss notice"
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Professional Active Dictation Strip */}
           {isRecordingActive && (
             <div
@@ -1148,7 +1193,7 @@ Transcript:
               <div className="listening-left-group">
                 <div className="listening-indicator-content">
                   <div className={`listening-mic-badge ${recordingState}`} aria-hidden="true">
-                    {recordingState === 'requesting' ? (
+                    {recordingState === 'requesting' || recordingState === 'transcribing' || recordingState === 'finalizing' ? (
                       <Loader2 size={13} className="spin-icon" />
                     ) : (
                       <Mic size={13} />
@@ -1175,6 +1220,8 @@ Transcript:
                       ? 'Connecting...'
                       : recordingState === 'paused'
                       ? 'Paused'
+                      : recordingState === 'transcribing'
+                      ? 'Whisper refining...'
                       : recordingState === 'finalizing'
                       ? 'Finishing...'
                       : 'Dictating...'}
@@ -1233,8 +1280,12 @@ Transcript:
                       ? 'Connecting to microphone...'
                       : recordingState === 'paused'
                       ? 'Speech paused'
+                      : recordingState === 'transcribing'
+                      ? 'Transcribing audio with Whisper Large v3...'
                       : recordingState === 'finalizing'
                       ? 'Finishing...'
+                      : engineMode === 'direct-audio'
+                      ? 'Recording audio (Direct Whisper mode)... Tap Done when finished'
                       : 'Speak to dictate...'}
                   </span>
                 )}
@@ -1242,51 +1293,66 @@ Transcript:
 
               {/* Action Buttons: Pause/Resume, Stop, Cancel (✕) */}
               <div className="listening-actions-group">
-                {recordingState === 'listening' ? (
+                {recordingState === 'transcribing' ? (
                   <button
                     type="button"
-                    className="dictation-strip-btn pause-btn"
-                    onClick={pauseListening}
-                    title="Pause dictation"
-                    aria-label="Pause dictation"
+                    className="dictation-strip-btn cancel-btn text-btn"
+                    onClick={cancelListening}
+                    title="Keep live transcript and cancel Whisper refinement"
+                    aria-label="Keep live transcript and cancel Whisper refinement"
                   >
-                    <Pause size={12} />
-                    <span className="btn-label">Pause</span>
+                    <span className="btn-label">Keep live</span>
+                    <X size={12} />
                   </button>
-                ) : recordingState === 'paused' ? (
-                  <button
-                    type="button"
-                    className="dictation-strip-btn resume-btn"
-                    onClick={resumeListening}
-                    title="Resume dictation"
-                    aria-label="Resume dictation"
-                  >
-                    <Play size={12} fill="currentColor" />
-                    <span className="btn-label">Resume</span>
-                  </button>
-                ) : null}
+                ) : (
+                  <>
+                    {recordingState === 'listening' ? (
+                      <button
+                        type="button"
+                        className="dictation-strip-btn pause-btn"
+                        onClick={pauseListening}
+                        title="Pause dictation"
+                        aria-label="Pause dictation"
+                      >
+                        <Pause size={12} />
+                        <span className="btn-label">Pause</span>
+                      </button>
+                    ) : recordingState === 'paused' ? (
+                      <button
+                        type="button"
+                        className="dictation-strip-btn resume-btn"
+                        onClick={resumeListening}
+                        title="Resume dictation"
+                        aria-label="Resume dictation"
+                      >
+                        <Play size={12} fill="currentColor" />
+                        <span className="btn-label">Resume</span>
+                      </button>
+                    ) : null}
 
-                <button
-                  type="button"
-                  className="dictation-strip-btn stop-btn"
-                  onClick={handleStopListening}
-                  title="Finish dictation and keep message"
-                  aria-label="Finish dictation and keep message"
-                >
-                  <Check size={14} strokeWidth={2.5} />
-                  <span className="btn-label">Done</span>
-                </button>
+                    <button
+                      type="button"
+                      className="dictation-strip-btn stop-btn"
+                      onClick={handleStopListening}
+                      title="Finish dictation and refine with Whisper"
+                      aria-label="Finish dictation and refine with Whisper"
+                    >
+                      <Check size={14} strokeWidth={2.5} />
+                      <span className="btn-label">Done</span>
+                    </button>
 
-                <button
-                  type="button"
-                  className="dictation-strip-btn cancel-btn"
-                  onClick={handleCancelListening}
-                  title="Cancel dictation (discard session)"
-                  aria-label="Cancel dictation"
-                >
-                  <X size={14} />
-                  <span className="btn-label-sr">Cancel</span>
-                </button>
+                    <button
+                      type="button"
+                      className="dictation-strip-btn cancel-btn"
+                      onClick={handleCancelListening}
+                      title="Cancel dictation (discard session)"
+                      aria-label="Cancel dictation"
+                    >
+                      <X size={14} />
+                      <span className="btn-label-sr">Cancel</span>
+                    </button>
+                  </>
+                )}
               </div>
             </div>
           )}
@@ -1607,37 +1673,47 @@ Transcript:
                 {/* Voice Dictation Microphone Button */}
                 <Button
                   type="button"
-                  variant={isListening ? 'primary' : isRequesting ? 'outline' : 'ghost'}
+                  variant={isListening ? 'primary' : (isRequesting || isTranscribing) ? 'outline' : 'ghost'}
                   size="icon-round"
-                  disabled={isLoading}
+                  disabled={isLoading || isTranscribing}
                   onClick={handleToggleListening}
                   title={
                     !isSupported
-                      ? 'Voice dictation is not supported in this browser. Please use Chrome, Edge, or Safari.'
+                      ? 'Microphone recording is not supported in this browser environment.'
+                      : isTranscribing
+                      ? 'Enhancing transcript with Whisper Large v3...'
                       : isListening
-                      ? 'Finish dictation (Keep text in composer)'
+                      ? engineMode === 'direct-audio'
+                        ? 'Finish audio recording and transcribe with Whisper'
+                        : 'Finish dictation and refine with Whisper'
                       : isRequesting
                       ? 'Connecting microphone... Click to cancel'
                       : isPaused
                       ? 'Resume listening (Voice dictation paused)'
+                      : engineMode === 'direct-audio'
+                      ? `Record voice message (${activeLang.label}) — Transcribed by Whisper`
                       : `Dictate message (${activeLang.label})`
                   }
                   ariaLabel={
                     !isSupported
                       ? 'Voice dictation not supported'
+                      : isTranscribing
+                      ? 'Enhancing transcript with Whisper'
                       : isListening
                       ? 'Finish voice dictation'
                       : isRequesting
                       ? 'Connecting microphone'
                       : isPaused
                       ? 'Resume dictation'
+                      : engineMode === 'direct-audio'
+                      ? 'Start voice recording for Whisper transcription'
                       : 'Start voice dictation'
                   }
-                  className={`composer-mic-btn ${isListening ? 'listening' : isPaused ? 'paused' : isRequesting ? 'requesting' : ''}`}
+                  className={`composer-mic-btn ${isListening ? 'listening' : isPaused ? 'paused' : isRequesting ? 'requesting' : isTranscribing ? 'transcribing' : ''}`}
                   icon={
                     isListening ? (
                       <Square size={13} fill="currentColor" />
-                    ) : isRequesting ? (
+                    ) : (isRequesting || isTranscribing) ? (
                       <Loader2 size={16} className="spin-icon" />
                     ) : isPaused ? (
                       <Play size={13} fill="currentColor" />
@@ -1683,6 +1759,9 @@ Transcript:
               : selectedProvider === 'cloudflare'
               ? 'Orvix is powered by Cloudflare Workers AI (Llama 3.1 8B). Serverless inference — verify important facts independently.'
               : 'Orvix is powered by Google Gemini (Gemini 3.1 Flash Lite). Client integration — verify important facts independently.'}
+            {engineMode === 'direct-audio'
+              ? ' • Dictation powered by direct audio capture with Whisper Large v3 server transcription.'
+              : ' • Dictation combines live browser speech with Whisper Large v3 refinement via server API.'}
           </p>
         </div>
       </div>
