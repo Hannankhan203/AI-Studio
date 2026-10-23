@@ -36,7 +36,7 @@ import { isImageAttachment } from '../../services/documentContextService.js';
 import { useSpeech } from '../../context/SpeechContext.jsx';
 import { PROVIDER_OPTIONS } from '../../services/aiRouter.js';
 import { formatResponseTime } from '../../utils/formatResponseTime.js';
-import { getAlternativeMetrics } from '../../services/alternativeResponseService.js';
+import { getAlternativeMetrics, getActiveAlternative } from '../../services/alternativeResponseService.js';
 
 /**
  * Recursively extracts plain text from React nodes or arrays of tokens
@@ -432,16 +432,38 @@ function createMarkdownComponents(isStreaming = false, effectiveMode = 'general'
  * Lightweight, self-contained live timer that updates every 100ms while AI generation is actively running.
  * Only re-renders this tiny badge component, completely avoiding chat re-renders.
  */
-function formatLiveElapsed(startTime) {
-  if (typeof startTime !== 'number' || startTime <= 0) return '0.0s';
-  const elapsedMs = Math.max(0, performance.now() - startTime);
-  if (elapsedMs <= 0) return '0.0s';
-  if (elapsedMs < 60000) {
-    const sec = elapsedMs / 1000;
-    const rounded = Math.round(sec * 10) / 10;
-    return `${rounded.toFixed(1)}s`;
+/**
+ * Formats live elapsed generation duration in mm:ss (or hh:mm:ss if >= 1 hour).
+ * Ensures smooth, continuous counting beyond 01:00 without any ceiling, hard limit, or cancellation trigger.
+ *
+ * @param {number} startTime - performance.now() or Date.now() timestamp when generation began
+ * @param {number} [now] - Optional current timestamp override for deterministic testing
+ * @returns {string} Formatted elapsed time (e.g., '00:00', '00:50', '00:59', '01:00', '01:01', '02:30', '05:00')
+ */
+export function formatLiveElapsed(startTime, now) {
+  if (typeof startTime !== 'number' || startTime <= 0) return '00:00';
+  const currentTime =
+    typeof now === 'number'
+      ? now
+      : typeof performance !== 'undefined' && performance.now
+      ? performance.now()
+      : Date.now();
+  const elapsedMs = Math.max(0, currentTime - startTime);
+  const totalSeconds = Math.floor(elapsedMs / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  const mm = String(minutes).padStart(2, '0');
+  const ss = String(seconds).padStart(2, '0');
+
+  if (minutes < 60) {
+    return `${mm}:${ss}`;
   }
-  return formatResponseTime(elapsedMs) || `${(elapsedMs / 1000).toFixed(1)}s`;
+  const hours = Math.floor(minutes / 60);
+  const remMinutes = minutes % 60;
+  const hh = String(hours).padStart(2, '0');
+  const remMm = String(remMinutes).padStart(2, '0');
+  return `${hh}:${remMm}:${ss}`;
 }
 
 function LiveResponseTimer({ startTime }) {
@@ -589,11 +611,7 @@ export default function ChatMessage({
 
   const activeAlt = useMemo(() => {
     if (!message) return null;
-    const activeId = message.activeAlternativeId;
-    if (Array.isArray(message.alternatives)) {
-      return message.alternatives.find((a) => a.id === activeId) || message.alternatives[0] || null;
-    }
-    return null;
+    return getActiveAlternative(message);
   }, [message]);
 
   const currentProviderId = message.failedProvider || activeAlt?.provider || message.provider || selectedProvider;

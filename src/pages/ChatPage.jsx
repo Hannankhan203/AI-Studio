@@ -34,7 +34,8 @@ import {
   switchActiveAlternativeInMessage,
   updateActiveAlternativeInMessage,
   ensureConversationAlternatives,
-  createAlternativeRecord
+  createAlternativeRecord,
+  getActiveAlternative
 } from '../services/alternativeResponseService.js';
 import { AlertCircle, X, Check } from 'lucide-react';
 
@@ -1299,12 +1300,12 @@ export default function ChatPage() {
         }
 
         const uploadController = new AbortController();
-        const UPLOAD_TIMEOUT_MS = 60000;
+        const UPLOAD_TIMEOUT_MS = 300000;
         let isTimeout = false;
         const uploadTimeoutId = setTimeout(() => {
           isTimeout = true;
           try {
-            uploadController.abort(new DOMException('Upload timed out after 60 seconds.', 'TimeoutError'));
+            uploadController.abort(new DOMException('Upload timed out after 5 minutes.', 'TimeoutError'));
           } catch (_) {
             uploadController.abort();
           }
@@ -1707,6 +1708,10 @@ export default function ChatPage() {
       ...updatedMessages,
       initialAssistantMessage
     ]);
+
+    const validHistory = updatedMessages.filter(
+      (message) => !message.isError && !message.isInterrupted
+    );
 
     const isRetryContinuation = isContinuationRequest(failedMessage.failedPrompt);
     const retryMultiPart = isRetryContinuation

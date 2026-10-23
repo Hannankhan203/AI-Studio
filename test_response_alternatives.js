@@ -14,7 +14,8 @@ import {
   updateActiveAlternativeInMessage,
   updateAlternativeByIdInMessage,
   ensureConversationAlternatives,
-  getAlternativeMetrics
+  getAlternativeMetrics,
+  getActiveAlternative
 } from './src/services/alternativeResponseService.js';
 
 let passed = 0;
@@ -161,6 +162,18 @@ assert(switchedToGroq.activeAlternativeId === with3Alts.alternatives[1].id, 'Act
 assert(switchedToGroq.content === groqAlternativeData.content, 'Root content switched to Groq');
 assert(switchedToGroq.provider === 'groq', 'Root provider switched to Groq');
 assert(switchedToGroq.responseTimeMs === 145, 'Root response time switched to Groq');
+
+// Verify getActiveAlternative helper
+const activeOnGemini = getActiveAlternative(switchedToGemini);
+assert(activeOnGemini !== null && activeOnGemini.provider === 'gemini', 'getActiveAlternative returns Gemini when active');
+assert(activeOnGemini.content === legacyAssistantMsg.content, 'getActiveAlternative returns Gemini content');
+
+const activeOnGroq = getActiveAlternative(switchedToGroq);
+assert(activeOnGroq !== null && activeOnGroq.provider === 'groq', 'getActiveAlternative returns Groq when active');
+assert(activeOnGroq.modelUsed === 'Llama 3.3 70B', 'getActiveAlternative returns Groq model tag');
+
+assert(getActiveAlternative(null) === null, 'getActiveAlternative safely returns null on null input');
+assert(getActiveAlternative(normalized) !== null && getActiveAlternative(normalized).provider === 'gemini', 'getActiveAlternative returns single alternative on normalized legacy message');
 
 // ----------------------------------------------------------------------------
 // Test 7: Alternative Navigation Metrics
