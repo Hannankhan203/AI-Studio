@@ -76,48 +76,89 @@ function getErrorTitle(content = '') {
 const CalloutContext = React.createContext(false);
 
 /**
- * Detects educational callout structures (Important, Note, Warning, Tip, Key takeaway, Definition, Example)
- * Supports both GFM alert tags and standard conversational prefixes.
+ * Detects educational callout structures (Important, Note, Warning, Tip, Key takeaway, Definition, Example, Comparison)
+ * Supports GFM alert tags, emoji prefixes, and conversational bold/italic headers with optional qualifiers.
  */
 function detectCalloutType(text = '') {
   if (!text || typeof text !== 'string') return null;
   const trimmed = text.trim();
 
-  // 1. GFM Alert tags: [!NOTE], [!TIP], [!IMPORTANT], [!WARNING], [!CAUTION]
-  if (/^\[!(NOTE|INFO)\]/i.test(trimmed)) {
+  // Strip leading blockquote angle brackets and optional leading emojis / variation selectors
+  const cleanText = trimmed.replace(
+    /^(?:>+\s*)?[\u{1F300}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}]*\s*/u,
+    ''
+  );
+
+  // 1. GFM Alert tags: [!NOTE], [!TIP], [!IMPORTANT], [!WARNING], [!CAUTION], [!INFO]
+  if (/^\[!(NOTE|INFO)\]/i.test(cleanText)) {
     return { type: 'note', label: 'Note', icon: Info };
   }
-  if (/^\[!TIP\]/i.test(trimmed)) {
+  if (/^\[!TIP\]/i.test(cleanText)) {
     return { type: 'tip', label: 'Tip', icon: Lightbulb };
   }
-  if (/^\[!(IMPORTANT|ATTENTION)\]/i.test(trimmed)) {
+  if (/^\[!(IMPORTANT|ATTENTION)\]/i.test(cleanText)) {
     return { type: 'important', label: 'Important', icon: AlertCircle };
   }
-  if (/^\[!(WARNING|CAUTION)\]/i.test(trimmed)) {
+  if (/^\[!(WARNING|CAUTION)\]/i.test(cleanText)) {
     return { type: 'warning', label: 'Warning', icon: AlertTriangle };
   }
 
-  // 2. Prefixes with or without markdown bold/italics
-  if (/^(?:[\*\_]{1,3})?(?:Important|Caution|Notice|Crucial)(?:[\*\_]{1,3})?\s*:/i.test(trimmed)) {
-    return { type: 'important', label: 'Important', icon: AlertCircle };
-  }
-  if (/^(?:[\*\_]{1,3})?(?:Notes?|Quick Notes?|FYI|Please Note)(?:[\*\_]{1,3})?\s*:/i.test(trimmed)) {
-    return { type: 'note', label: 'Note', icon: Info };
-  }
-  if (/^(?:[\*\_]{1,3})?(?:Warnings?|Common Pitfalls?|Pitfalls?|Watch Out|Common Mistakes?)(?:[\*\_]{1,3})?\s*:/i.test(trimmed)) {
-    return { type: 'warning', label: 'Warning', icon: AlertTriangle };
-  }
-  if (/^(?:[\*\_]{1,3})?(?:Tips?|Study Tips?|Pro Tips?|Helpful Tips?)(?:[\*\_]{1,3})?\s*:/i.test(trimmed)) {
-    return { type: 'tip', label: 'Tip', icon: Lightbulb };
-  }
-  if (/^(?:[\*\_]{1,3})?(?:Key Takeaways?|Takeaways?|Key Points?|Core Concepts?|Summary|In Summary)(?:[\*\_]{1,3})?\s*:/i.test(trimmed)) {
-    return { type: 'takeaway', label: 'Key Takeaway', icon: CheckCircle2 };
-  }
-  if (/^(?:[\*\_]{1,3})?(?:Definitions?|Terminology|Key Terms?|Concept Definitions?)(?:[\*\_]{1,3})?\s*:/i.test(trimmed)) {
-    return { type: 'definition', label: 'Definition', icon: BookOpen };
-  }
-  if (/^(?:[\*\_]{1,3})?(?:Examples?|Real-World Examples?|Practical Examples?|Analog(?:y|ies)|Everyday Analog(?:y|ies)|Illustrative Examples?)(?:[\*\_]{1,3})?\s*:/i.test(trimmed)) {
-    return { type: 'example', label: 'Example', icon: Bookmark };
+  // 2. Structured educational prefixes with optional numbering, parentheticals, and colon placement
+  const calloutPatterns = [
+    {
+      type: 'important',
+      label: 'Important',
+      icon: AlertCircle,
+      pattern: /^(?:[\*\_]{1,3})?(?:Important|Caution|Notice|Crucial|Critical)(?:\s*(?:\([^\)]+\)|#?\d+|[A-Z]))?\s*(?::\s*(?:[\*\_]{1,3})?|(?:[\*\_]{1,3})?\s*:)/i
+    },
+    {
+      type: 'warning',
+      label: 'Warning',
+      icon: AlertTriangle,
+      pattern: /^(?:[\*\_]{1,3})?(?:Warnings?|Common Pitfalls?|Pitfalls?|Watch Out|Common Mistakes?)(?:\s*(?:\([^\)]+\)|#?\d+|[A-Z]))?\s*(?::\s*(?:[\*\_]{1,3})?|(?:[\*\_]{1,3})?\s*:)/i
+    },
+    {
+      type: 'note',
+      label: 'Note',
+      icon: Info,
+      pattern: /^(?:[\*\_]{1,3})?(?:Notes?|Quick Notes?|FYI|Please Note|Info|Information)(?:\s*(?:\([^\)]+\)|#?\d+|[A-Z]))?\s*(?::\s*(?:[\*\_]{1,3})?|(?:[\*\_]{1,3})?\s*:)/i
+    },
+    {
+      type: 'tip',
+      label: 'Tip',
+      icon: Lightbulb,
+      pattern: /^(?:[\*\_]{1,3})?(?:Tips?|Study Tips?|Pro Tips?|Helpful Tips?)(?:\s*(?:\([^\)]+\)|#?\d+|[A-Z]))?\s*(?::\s*(?:[\*\_]{1,3})?|(?:[\*\_]{1,3})?\s*:)/i
+    },
+    {
+      type: 'takeaway',
+      label: 'Key Takeaway',
+      icon: CheckCircle2,
+      pattern: /^(?:[\*\_]{1,3})?(?:Key Takeaways?|Takeaways?|Key Points?|Core Concepts?|Summary|In Summary)(?:\s*(?:\([^\)]+\)|#?\d+|[A-Z]))?\s*(?::\s*(?:[\*\_]{1,3})?|(?:[\*\_]{1,3})?\s*:)/i
+    },
+    {
+      type: 'definition',
+      label: 'Definition',
+      icon: BookOpen,
+      pattern: /^(?:[\*\_]{1,3})?(?:Definitions?|Terminology|Key Terms?|Concept Definitions?)(?:\s*(?:\([^\)]+\)|#?\d+|[A-Z]))?\s*(?::\s*(?:[\*\_]{1,3})?|(?:[\*\_]{1,3})?\s*:)/i
+    },
+    {
+      type: 'example',
+      label: 'Example',
+      icon: Bookmark,
+      pattern: /^(?:[\*\_]{1,3})?(?:Examples?|Real-World Examples?|Practical Examples?|Analog(?:y|ies)|Everyday Analog(?:y|ies)|Illustrative Examples?|Worked Examples?)(?:\s*(?:\([^\)]+\)|#?\d+|[A-Z]))?\s*(?::\s*(?:[\*\_]{1,3})?|(?:[\*\_]{1,3})?\s*:)/i
+    },
+    {
+      type: 'comparison',
+      label: 'Comparison',
+      icon: Sparkles,
+      pattern: /^(?:[\*\_]{1,3})?(?:Comparisons?|Comparison Matrix|Contrast|Side-by-Side)(?:\s*(?:\([^\)]+\)|#?\d+|[A-Z]))?\s*(?::\s*(?:[\*\_]{1,3})?|(?:[\*\_]{1,3})?\s*:)/i
+    }
+  ];
+
+  for (const item of calloutPatterns) {
+    if (item.pattern.test(cleanText)) {
+      return { type: item.type, label: item.label, icon: item.icon };
+    }
   }
 
   return null;
@@ -150,12 +191,13 @@ function createMarkdownComponents(isStreaming = false, effectiveMode = 'general'
             code={codeString}
             language={language}
             isStreaming={isStreaming}
+            mode={effectiveMode}
           />
         );
       }
 
       return (
-        <code className="inline-code" {...props}>
+        <code className={`inline-code ${effectiveMode === 'coding' ? 'coding-inline-code' : ''}`} {...props}>
           {children}
         </code>
       );
@@ -180,8 +222,8 @@ function createMarkdownComponents(isStreaming = false, effectiveMode = 'general'
 
     // Responsive scrollable tables
     table: ({ children, ...props }) => (
-      <div className="table-responsive-wrapper">
-        <table className="markdown-table" {...props}>
+      <div className={`table-responsive-wrapper ${effectiveMode === 'writing' ? 'writing-table-wrapper' : ''} ${effectiveMode === 'coding' ? 'coding-table-wrapper' : ''}`}>
+        <table className={`markdown-table ${effectiveMode === 'writing' ? 'writing-table' : ''} ${effectiveMode === 'coding' ? 'coding-table' : ''}`} {...props}>
           {children}
         </table>
       </div>
@@ -192,18 +234,76 @@ function createMarkdownComponents(isStreaming = false, effectiveMode = 'general'
     th: ({ children, ...props }) => <th className="markdown-th" {...props}>{children}</th>,
     td: ({ children, ...props }) => <td className="markdown-td" {...props}>{children}</td>,
 
-    // Semantic headings
-    h1: ({ children, ...props }) => <h1 className="markdown-h1" {...props}>{children}</h1>,
-    h2: ({ children, ...props }) => <h2 className="markdown-h2" {...props}>{children}</h2>,
-    h3: ({ children, ...props }) => <h3 className="markdown-h3" {...props}>{children}</h3>,
-    h4: ({ children, ...props }) => <h4 className="markdown-h4" {...props}>{children}</h4>,
-    h5: ({ children, ...props }) => <h5 className="markdown-h5" {...props}>{children}</h5>,
-    h6: ({ children, ...props }) => <h6 className="markdown-h6" {...props}>{children}</h6>,
+    // Semantic headings establishing visual hierarchy
+    h1: ({ children, ...props }) => (
+      <h1
+        className={`markdown-h1 ${effectiveMode === 'learning' ? 'educational-topic-heading' : ''} ${effectiveMode === 'writing' ? 'writing-h1' : ''} ${effectiveMode === 'coding' ? 'coding-h1' : ''}`}
+        {...props}
+      >
+        {children}
+      </h1>
+    ),
+    h2: ({ children, ...props }) => (
+      <h2
+        className={`markdown-h2 ${effectiveMode === 'learning' ? 'educational-concept-heading' : ''} ${effectiveMode === 'writing' ? 'writing-h2' : ''} ${effectiveMode === 'coding' ? 'coding-h2' : ''}`}
+        {...props}
+      >
+        {children}
+      </h2>
+    ),
+    h3: ({ children, ...props }) => (
+      <h3
+        className={`markdown-h3 ${effectiveMode === 'learning' ? 'educational-subconcept-heading' : ''} ${effectiveMode === 'writing' ? 'writing-h3' : ''} ${effectiveMode === 'coding' ? 'coding-h3' : ''}`}
+        {...props}
+      >
+        {children}
+      </h3>
+    ),
+    h4: ({ children, ...props }) => (
+      <h4
+        className={`markdown-h4 ${effectiveMode === 'learning' ? 'educational-step-heading' : ''} ${effectiveMode === 'writing' ? 'writing-h4' : ''} ${effectiveMode === 'coding' ? 'coding-h4' : ''}`}
+        {...props}
+      >
+        {children}
+      </h4>
+    ),
+    h5: ({ children, ...props }) => (
+      <h5 className={`markdown-h5 ${effectiveMode === 'writing' ? 'writing-h5' : ''} ${effectiveMode === 'coding' ? 'coding-h5' : ''}`} {...props}>
+        {children}
+      </h5>
+    ),
+    h6: ({ children, ...props }) => (
+      <h6 className={`markdown-h6 ${effectiveMode === 'writing' ? 'writing-h6' : ''} ${effectiveMode === 'coding' ? 'coding-h6' : ''}`} {...props}>
+        {children}
+      </h6>
+    ),
 
     // Text formatting with Learning Mode Educational Callout recognition
     p: ({ children, ...props }) => {
       const isInsideCallout = React.useContext(CalloutContext);
-      if (effectiveMode === 'learning' && !isInsideCallout) {
+
+      if (effectiveMode === 'learning') {
+        // If already inside a blockquote callout, strip any raw alert tag like [!NOTE] so it isn't shown redundantly
+        if (isInsideCallout) {
+          if (typeof children === 'string' && /^\[!(NOTE|INFO|TIP|IMPORTANT|WARNING|CAUTION|ATTENTION)\]/i.test(children.trim())) {
+            const stripped = children.replace(/^\[!(NOTE|INFO|TIP|IMPORTANT|WARNING|CAUTION|ATTENTION)\]\s*/i, '');
+            if (!stripped) return null;
+            return <p className="markdown-p educational-callout-text" {...props}>{stripped}</p>;
+          }
+          if (Array.isArray(children) && typeof children[0] === 'string' && /^\[!(NOTE|INFO|TIP|IMPORTANT|WARNING|CAUTION|ATTENTION)\]/i.test(children[0].trim())) {
+            const firstStripped = children[0].replace(/^\[!(NOTE|INFO|TIP|IMPORTANT|WARNING|CAUTION|ATTENTION)\]\s*/i, '');
+            const rest = children.slice(1);
+            return (
+              <p className="markdown-p educational-callout-text" {...props}>
+                {firstStripped}
+                {rest}
+              </p>
+            );
+          }
+          return <p className="markdown-p educational-callout-text" {...props}>{children}</p>;
+        }
+
+        // If not already inside a callout, detect callout trigger
         const textContent = extractNodeText(children);
         const callout = detectCalloutType(textContent);
         if (callout) {
@@ -223,6 +323,20 @@ function createMarkdownComponents(isStreaming = false, effectiveMode = 'general'
           );
         }
       }
+
+      if (effectiveMode === 'writing') {
+        const textContent = extractNodeText(children).trim();
+        // Detect memo / formal email header lines (e.g., **Subject:**, **To:**, **From:**, **Date:**)
+        const isMemoHeader =
+          /^(?:\*{1,2}|_{1,2})?(?:Subject|To|From|Date|Cc|Bcc|Regarding|Re)\s*:/i.test(textContent);
+
+        return (
+          <p className={`markdown-p writing-p ${isMemoHeader ? 'writing-memo-field' : ''}`} {...props}>
+            {children}
+          </p>
+        );
+      }
+
       return <p className="markdown-p" {...props}>{children}</p>;
     },
     strong: ({ children, ...props }) => <strong className="markdown-strong" {...props}>{children}</strong>,
@@ -239,7 +353,7 @@ function createMarkdownComponents(isStreaming = false, effectiveMode = 'general'
           const IconComponent = callout.icon;
           return (
             <CalloutContext.Provider value={true}>
-              <blockquote className={`markdown-blockquote educational-callout callout-${callout.type}`} {...props}>
+              <blockquote className={`markdown-blockquote educational-callout callout-${callout.type}`} role="note" {...props}>
                 <div className="educational-callout-header">
                   <IconComponent size={14} className="educational-callout-icon" aria-hidden="true" />
                   <span className="educational-callout-label">{callout.label}</span>
@@ -253,14 +367,21 @@ function createMarkdownComponents(isStreaming = false, effectiveMode = 'general'
         }
       }
       return (
-        <blockquote className="markdown-blockquote" {...props}>
+        <blockquote
+          className={`markdown-blockquote ${effectiveMode === 'writing' ? 'writing-blockquote' : ''}`}
+          {...props}
+        >
           {children}
         </blockquote>
       );
     },
-    ul: ({ children, ...props }) => <ul className="markdown-ul" {...props}>{children}</ul>,
+    ul: ({ children, ...props }) => (
+      <ul className={`markdown-ul ${effectiveMode === 'writing' ? 'writing-ul' : ''}`} {...props}>
+        {children}
+      </ul>
+    ),
     ol: ({ children, start, ...props }) => (
-      <ol className="markdown-ol" start={start} {...props}>
+      <ol className={`markdown-ol ${effectiveMode === 'writing' ? 'writing-ol' : ''}`} start={start} {...props}>
         {children}
       </ol>
     ),
@@ -286,7 +407,9 @@ function createMarkdownComponents(isStreaming = false, effectiveMode = 'general'
         </li>
       );
     },
-    hr: (props) => <hr className="markdown-divider" {...props} />
+    hr: (props) => (
+      <hr className={`markdown-divider ${effectiveMode === 'writing' ? 'writing-divider' : ''}`} {...props} />
+    )
   };
 }
 

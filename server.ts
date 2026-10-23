@@ -127,7 +127,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const portArgIndex = process.argv.indexOf('--port');
 const portFromArg = portArgIndex !== -1 ? process.argv[portArgIndex + 1] : undefined;
-const PORT = Number(portFromArg) || 3000;
+const PORT = Number(portFromArg) || Number(process.env.PORT) || 3000;
 
 // Permissive CORS middleware for cross-origin and Vercel preview environments
 app.use((req, res, next) => {
@@ -2076,13 +2076,13 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
       const contents = formatGeminiHistory(history, effectivePrompt, 12, imageParts);
       // Attempt sequence: max 3 attempts total (initial attempt + up to 2 retries)
-      // Attempt 1 tries gemini-flash-latest (fastest and highest availability in all tiers)
-      // Attempt 2 tries gemini-3.8-flash (primary recommended model)
-      // Attempt 3 tries gemini-3.1-flash-lite (alternative lite model)
+      // Attempt 1 tries gemini-3.1-flash-lite (fastest with minimal latency and high availability)
+      // Attempt 2 tries gemini-3.5-flash-lite (fast multi-turn model)
+      // Attempt 3 tries gemini-3.8-flash (standard text model fallback)
       const attemptPlan = [
-        { model: 'gemini-flash-latest', attemptNum: 1 },
-        { model: 'gemini-3.8-flash', attemptNum: 2 },
-        { model: 'gemini-3.1-flash-lite', attemptNum: 3 }
+        { model: 'gemini-3.1-flash-lite', attemptNum: 1 },
+        { model: 'gemini-3.5-flash-lite', attemptNum: 2 },
+        { model: 'gemini-3.8-flash', attemptNum: 3 }
       ];
       const maxAttempts = attemptPlan.length;
 
