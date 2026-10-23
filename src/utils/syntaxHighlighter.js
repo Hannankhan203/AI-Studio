@@ -57,7 +57,8 @@ const GRAMMARS = {
     },
     { type: TOKEN_TYPES.CONSTANT, regex: /\b[A-Z_][A-Z0-9_]{2,}\b/y },
     { type: TOKEN_TYPES.NUMBER, regex: /\b0x[0-9a-fA-F]+\b|\b0b[01]+\b|\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b/y },
-    { type: TOKEN_TYPES.TAG, regex: /<\/?(?:[a-zA-Z_$][a-zA-Z0-9_$-]*|\s*>)\/?>/y },
+    { type: TOKEN_TYPES.TAG, regex: /<\/?(?:[a-zA-Z_$][a-zA-Z0-9_$-]*)(?=[>\s\/]|$)|<\s*\/>|<\s*>/y },
+    { type: TOKEN_TYPES.ATTR_NAME, regex: /\b[a-zA-Z0-9_-]+(?=\s*=)/y },
     { type: TOKEN_TYPES.FUNCTION, regex: /\b[a-zA-Z_$][a-zA-Z0-9_$]*(?=\s*\()/y },
     { type: TOKEN_TYPES.PROPERTY, regex: /\b[a-zA-Z_$][a-zA-Z0-9_$]*(?=\s*:)/y },
     { type: TOKEN_TYPES.OPERATOR, regex: /=>|===|!==|==|!=|<=|>=|\+\+|--|&&|\|\||\?\?|\?\.|\+=|-=|\*=|\/=|%=|[+\-*/%&|^~!=<>?:.]/y },
@@ -121,7 +122,7 @@ const GRAMMARS = {
   markup: [
     { type: TOKEN_TYPES.COMMENT, regex: /<!--[\s\S]*?(?:-->|$)/y },
     { type: TOKEN_TYPES.DIRECTIVE, regex: /<!DOCTYPE[^>]*>/iy },
-    { type: TOKEN_TYPES.TAG, regex: /<\/?(?:[a-zA-Z0-9:-]+|\s*>)\/?>/y },
+    { type: TOKEN_TYPES.TAG, regex: /<\/?(?:[a-zA-Z0-9:-]+)(?=[>\s\/]|$)|<\s*\/>|<\s*>/iy },
     { type: TOKEN_TYPES.ATTR_NAME, regex: /\b[a-zA-Z0-9:-]+(?=\s*=)/y },
     { type: TOKEN_TYPES.STRING, regex: /"[^"]*(?:"|$)|'[^']*(?:'|$)/y },
     { type: TOKEN_TYPES.CONSTANT, regex: /&[a-zA-Z0-9#]+;/y },
@@ -146,7 +147,37 @@ const GRAMMARS = {
 
   bash: [
     { type: TOKEN_TYPES.COMMENT, regex: /#[^\n]*/y },
-    { type: TOKEN_TYPES.STRING, regex: /"(?:\\.|[^"\\])*(?:"|$)|'[^']*(?:'|$)/y },
+    {
+      type: TOKEN_TYPES.STRING,
+      regex: /"(?:\\.|[^"\\])*(?:"|$)/y,
+      tokenize: (str) => {
+        const varRegex = /\$[a-zA-Z_0-9]+|\$\{[^}]+\}|\$\d+|\$\?|\$\*|\$@/g;
+        const subTokens = [];
+        let lastIndex = 0;
+        let match;
+        while ((match = varRegex.exec(str)) !== null) {
+          if (match.index > lastIndex) {
+            subTokens.push({
+              type: TOKEN_TYPES.STRING,
+              content: str.slice(lastIndex, match.index)
+            });
+          }
+          subTokens.push({
+            type: TOKEN_TYPES.VARIABLE,
+            content: match[0]
+          });
+          lastIndex = match.index + match[0].length;
+        }
+        if (lastIndex < str.length) {
+          subTokens.push({
+            type: TOKEN_TYPES.STRING,
+            content: str.slice(lastIndex)
+          });
+        }
+        return subTokens.length ? subTokens : [{ type: TOKEN_TYPES.STRING, content: str }];
+      }
+    },
+    { type: TOKEN_TYPES.STRING, regex: /'[^']*(?:'|$)/y },
     { type: TOKEN_TYPES.VARIABLE, regex: /\$[a-zA-Z_0-9]+|\$\{[^}]+\}|\$\d+|\$\?|\$\*|\$@/y },
     {
       type: TOKEN_TYPES.KEYWORD,
@@ -357,10 +388,15 @@ export function tokenizeCode(code = '', language = '') {
       const match = regex.exec(code);
 
       if (match && match.index === index) {
-        tokens.push({
-          type,
-          content: match[0]
-        });
+        if (typeof rules[r].tokenize === 'function') {
+          const sub = rules[r].tokenize(match[0]);
+          tokens.push(...sub);
+        } else {
+          tokens.push({
+            type,
+            content: match[0]
+          });
+        }
         index += match[0].length;
         matched = true;
         break;

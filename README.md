@@ -105,7 +105,7 @@
 
 Orvix integrates four selectable AI providers:
 - **Google Gemini** (`gemini-3.8-flash` primary, with automatic failover to `gemini-3.1-flash-lite`) via the modern `@google/genai` TypeScript SDK.
-- **Groq** (`llama-3.3-70b-versatile` / `openai/gpt-oss-120b`) via high-speed OpenAI-compatible REST completions.
+- **Groq** (`openai/gpt-oss-120b`) via high-speed OpenAI-compatible REST completions.
 - **OpenRouter** (`openrouter/free`) routing across high-capacity free community models.
 - **Cloudflare Workers AI** (`@cf/meta/llama-3.1-8b-instruct`) providing serverless inference on Cloudflare's global edge network.
 
@@ -153,7 +153,7 @@ After any assistant message finishes generating, users are no longer constrained
    - Reuses the canonical project-wide `PROVIDER_OPTIONS` configuration from `src/services/aiRouter.js` instead of maintaining an isolated or hardcoded list.
    - Includes all four active Orvix providers:
      - **Google Gemini** (`gemini-3.8-flash` / `gemini-3.1-flash-lite`)
-     - **Groq Cloud** (`llama-3.3-70b-versatile` / `openai/gpt-oss-120b`)
+     - **Groq Cloud** (`openai/gpt-oss-120b`)
      - **OpenRouter** (`openrouter/free`)
      - **Cloudflare Workers AI** (`@cf/meta/llama-3.1-8b-instruct`)
 3. **Smart Model Status Indicators**:
@@ -465,7 +465,7 @@ Orvix features an intelligent multi-provider architecture connecting to four dis
 | Provider | Model Identifier | Architecture / Hosting | Primary Use Case |
 | :--- | :--- | :--- | :--- |
 | **Google Gemini** | `gemini-3.8-flash` *(Failover: `gemini-3.1-flash-lite`)* | Google AI Studio REST / SDK | Lightning-fast inference, high context window, default model |
-| **Groq Cloud** | `llama-3.3-70b-versatile` *(Alt: `openai/gpt-oss-120b`)* | Groq LPU™ Inference Engine | Near-instantaneous response streaming, coding & structured text |
+| **Groq Cloud** | `openai/gpt-oss-120b` | Groq LPU™ Inference Engine | Near-instantaneous response streaming, coding & structured text |
 | **OpenRouter** | `openrouter/free` | Decentralized open-access pool | Broad multi-model ecosystem with automatic free-tier routing |
 | **Cloudflare Workers AI** | `@cf/meta/llama-3.1-8b-instruct` | Cloudflare Global Edge Network | Low-latency edge computing across 300+ global cities |
 
@@ -938,7 +938,7 @@ service cloud.firestore {
 - **Clean Markdown & Plain Text Export**: Conversation export (`src/utils/exportConversation.js`) automatically exports the currently active alternative while retaining full metadata and response time metrics.
 
 **Fixed**
-- **Provider Selector Completeness**: Fixed model-selection menu in "Regenerate with Another AI Model" which previously only displayed Gemini and OpenAI; now correctly displays all supported and configured Orvix providers/models, including **GROQ** (`llama-3.3-70b-versatile` / `openai/gpt-oss-120b`) and **Cloudflare Workers AI** (`@cf/meta/llama-3.1-8b-instruct`).
+- **Provider Selector Completeness**: Fixed model-selection menu in "Regenerate with Another AI Model" which previously only displayed Gemini and OpenAI; now correctly displays all supported and configured Orvix providers/models, including **GROQ** (`openai/gpt-oss-120b`) and **Cloudflare Workers AI** (`@cf/meta/llama-3.1-8b-instruct`).
 - **Provider/Model Routing Alignment**: Ensured selected provider/model parameters (`selectedModel`, `selectedProvider`) are properly mapped and passed to `/api/chat` and `aiRouter.js` without dropping model IDs.
 
 ### v0.7.1 — Automatic Chat-Input Focus & Pixel-Perfect Code-Block Line Alignment (October 22, 2026)
