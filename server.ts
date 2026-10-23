@@ -1964,7 +1964,7 @@ function mapBcp47ToIso639(bcp47Tag?: string | null): string | undefined {
 
 // Default Whisper Context Prompt (Section 4: Technical vocabulary conditioning without hardcoded word replacements)
 const DEFAULT_WHISPER_CONTEXT_PROMPT =
-  'Orvix, AI conversation assistant. Technical vocabulary: JavaScript, TypeScript, React, Node.js, Python, CSS, HTML, API, JSON, programming terminology, code.';
+  'Orvix, AI conversation assistant. Technical vocabulary: JavaScript, TypeScript, React, Node.js, Python, palindrome, algorithms, data structures, async await, promises, functions, objects, arrays, CSS, HTML, API, JSON, programming terminology, code.';
 
 app.post(['/api/transcribe', '/transcribe'], (req, res) => {
   transcribeUploadMiddleware.any()(req as any, res as any, async (err: any) => {
@@ -2137,12 +2137,12 @@ app.post(['/api/transcribe', '/transcribe'], (req, res) => {
 
         const geminiPrompt = `You are a high-accuracy speech transcription engine.
 Transcribe the speech in this audio recording verbatim.
-Preserve exact words, technical terminology (e.g. Orvix, JavaScript, TypeScript, React), and punctuation.
+Preserve exact words, technical terminology (e.g. Orvix, JavaScript, TypeScript, React, palindrome, algorithms, data structures, async await, promises, functions, objects, arrays, code), and punctuation.
 ${isoLang ? `The spoken language is: ${isoLang}.` : ''}
 Output ONLY the transcription text. Do not summarize, do not translate, do not add introductory commentary or timestamps.`;
 
         const geminiRes = await ai.models.generateContent({
-          model: 'gemini-2.5-flash',
+          model: 'gemini-3.8-flash',
           contents: [
             {
               role: 'user',
@@ -2165,7 +2165,7 @@ Output ONLY the transcription text. Do not summarize, do not translate, do not a
           text,
           language: isoLang || 'en',
           duration: 0,
-          model: 'gemini-2.5-flash',
+          model: 'gemini-3.8-flash',
           provider: 'gemini',
           highAccuracy: true
         });
@@ -2173,7 +2173,7 @@ Output ONLY the transcription text. Do not summarize, do not translate, do not a
         logAIDiagnostic({
           category: 'provider API error',
           provider: 'gemini',
-          model: 'gemini-2.5-flash',
+          model: 'gemini-3.8-flash',
           phase: 'dispatch',
           sanitizedMessage: geminiErr?.message || 'Gemini audio transcription failed'
         });

@@ -791,14 +791,17 @@ export default function ChatArea({
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [langMenuOpen]);
 
-  // Auto-resize textarea according to text length
+  // Auto-resize textarea according to text length and follow speech stream
   useEffect(() => {
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
       const newHeight = Math.min(textareaRef.current.scrollHeight, 180);
       textareaRef.current.style.height = `${Math.max(newHeight, 44)}px`;
+      if (recordingState === 'listening' || recordingState === 'paused') {
+        textareaRef.current.scrollTop = textareaRef.current.scrollHeight;
+      }
     }
-  }, [inputValue]);
+  }, [inputValue, recordingState]);
   // Keep refs to avoid stale closures in global keydown listener
   const inputValueRef = useRef(inputValue);
   useEffect(() => {
@@ -944,7 +947,11 @@ export default function ChatArea({
       e.preventDefault();
       let textToSend = inputValue;
       if (isListening || isPaused || isRequesting) {
-        if (interimTranscript && interimTranscript.trim()) {
+        if (
+          interimTranscript &&
+          interimTranscript.trim() &&
+          !inputValue.toLowerCase().includes(interimTranscript.trim().toLowerCase())
+        ) {
           textToSend = combineComposerText(inputValue, interimTranscript.trim());
         }
         stopListening();
@@ -963,7 +970,11 @@ export default function ChatArea({
     e.preventDefault();
     let textToSend = inputValue;
     if (isListening || isPaused || isRequesting) {
-      if (interimTranscript && interimTranscript.trim()) {
+      if (
+        interimTranscript &&
+        interimTranscript.trim() &&
+        !inputValue.toLowerCase().includes(interimTranscript.trim().toLowerCase())
+      ) {
         textToSend = combineComposerText(inputValue, interimTranscript.trim());
       }
       stopListening();
@@ -977,20 +988,39 @@ export default function ChatArea({
     }
   };
 
-  // Optional AI Transcript Refinement Handler (Phase 4)
+  // Optional AI Transcript Refinement Handler (Phase 4 & Phase 6.2)
   const handleImproveTranscript = async () => {
     if (!lastSessionTranscript || isCleaningTranscript) return;
     setIsCleaningTranscript(true);
 
     try {
-      const cleanPrompt = `You are a specialized speech-to-text transcript polisher.
-Improve punctuation, capitalization, and obvious speech recognition phonetic glitches in the provided spoken transcript.
+      const cleanPrompt = `You are a specialized, context-aware speech-to-text transcript polisher for AI conversation and programming.
 
-STRICT CONSTRAINTS:
-1. Preserve the speaker's exact meaning, words, names, and technical terms.
-2. DO NOT summarize, rewrite, or add any commentary.
-3. DO NOT translate (if Urdu, keep Urdu; if English, keep English).
-4. Return ONLY the refined transcript text and nothing else.
+TASK:
+Improve punctuation, capitalization, and phonetic speech recognition glitches in the provided spoken transcript while strictly preserving the speaker's original intent, task, and meaning.
+
+CONTEXT-AWARE TECHNICAL DISAMBIGUATION RULES:
+1. Sentence Context Governs Technical Corrections:
+   - Analyze surrounding sentence grammar, phrasing, and the programming domain to distinguish intended concepts.
+   - Example: In "code for pedrandom" or "palindrome checker", the speaker requests a classic programming problem ("palindrome"). Do NOT substitute "Math.random" or an unrelated API when the context clearly requests an algorithmic task.
+   - Example: In "using Math.random" or "generate random numbers with Math.random", the user genuinely wants the random API. Preserve "Math.random" as-is.
+   - Example: In "difference between a palindrome and Math.random", keep both terms distinct and accurately spelled.
+   - Example: In an asynchronous programming context alongside "promises" or "callbacks", "sync await" is an obvious phonetic glitch for "async await" (or "async/await").
+   - Example: In a list of declaration keywords like "var, constant, let", "constant" contextually refers to "const".
+
+2. Preserve Legitimate Technical Vocabulary:
+   - Valid technical terms, programming identifiers, and APIs (such as JavaScript, ECMAScript, palindrome, Math.random, var, const, let, functions, arrow functions, objects, arrays, callbacks, promises, async/await, hoisting, React, useState, useEffect, Node.js, Express, Firebase, TypeScript, etc.) must NEVER be replaced with an unrelated term simply because of surface phonetic similarities.
+
+3. Minimal & Conservative Edits:
+   - Fix punctuation (commas, periods, question marks, capitalization).
+   - Only correct obvious phonetic recognition slips that are strongly supported by the surrounding context.
+   - If a word's meaning cannot be confidently determined from the surrounding context, PRESERVE the original wording rather than making a speculative technical substitution.
+   - NEVER invent requirements, add unrequested libraries or APIs, or omit topics mentioned by the user.
+   - DO NOT summarize, rephrase, or restructure the sentence.
+   - DO NOT translate (preserve the speaker's language, e.g. English, Urdu, etc.).
+
+OUTPUT FORMAT:
+Return ONLY the polished transcript text with no explanations, no introductory phrases, no markdown fences, and no surrounding quotes.
 
 Transcript:
 "${lastSessionTranscript}"`;
@@ -1003,8 +1033,19 @@ Transcript:
       });
 
       if (res && res.text) {
-        const polished = res.text.replace(/^["']|["']$/g, '').trim();
-        setSuggestedRefinement(polished);
+        let polished = res.text.trim();
+        // Strip markdown code fences if present
+        if (polished.startsWith('```')) {
+          polished = polished.replace(/^```[a-zA-Z0-9_-]*\n?/i, '').replace(/\n?```$/i, '').trim();
+        }
+        // Strip common AI conversational prefixes if any leaked
+        polished = polished.replace(/^(?:here(?:'s| is) (?:the )?(?:polished|refined|corrected) transcript:?\s*)/i, '').trim();
+        // Strip wrapping quotes
+        polished = polished.replace(/^["'«»“](.*)["'«»”]$/s, '$1').trim();
+
+        if (polished) {
+          setSuggestedRefinement(polished);
+        }
       }
     } catch (err) {
       console.warn('Transcript refinement failed:', err);

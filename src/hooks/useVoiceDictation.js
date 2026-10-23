@@ -408,10 +408,13 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
   const recordEmission = useCallback((val) => {
     lastEmittedValueRef.current = val;
     inputValueRef.current = val;
-    recentEmissionsRef.current.add(val);
-    if (recentEmissionsRef.current.size > 30) {
-      const oldest = recentEmissionsRef.current.values().next().value;
-      recentEmissionsRef.current.delete(oldest);
+    if (val && typeof val === 'string' && val.trim()) {
+      recentEmissionsRef.current.add(val);
+      recentEmissionsRef.current.add(val.trim());
+      if (recentEmissionsRef.current.size > 200) {
+        const oldest = recentEmissionsRef.current.values().next().value;
+        recentEmissionsRef.current.delete(oldest);
+      }
     }
   }, []);
 
@@ -423,26 +426,67 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
     setEngineMode(caps.engineMode);
   }, []);
 
-  // Handle genuine manual typing, pasting, or editing during an active dictation session.
-  // Using recentEmissionsRef prevents React's asynchronous render cycle from falsely treating
-  // its own emitted dictation values as external user edits.
+  // Handle genuine manual typing, pasting, or clearing in the composer across all lifecycles.
+  // Manual clearing (empty input) unconditionally resets all base refs, invalidates in-flight
+  // transcriptions, and guarantees deleted text never resurrects or leaks into future sessions.
   useEffect(() => {
-    if (recentEmissionsRef.current.has(inputValue)) {
+    // 1. Explicit manual deletion / clearing (Ctrl+A, Backspace / clear input)
+    if (!inputValue || !inputValue.trim()) {
+      inputValueRef.current = '';
+      baseTextRef.current = '';
+      sessionBaseTextRef.current = '';
+      committedSegmentsRef.current = [];
+      interimTranscriptRef.current = '';
+      lastEmittedValueRef.current = '';
+      recentEmissionsRef.current.clear();
+      lastCommittedSegmentRef.current = { text: '', timestamp: 0 };
+      nativeSessionTranscriptRef.current = '';
+      expectedEmittedBeforeTranscribeRef.current = '';
+      setLastSessionTranscript('');
+      setInterimTranscript('');
+      setTranscriptionNotice(null);
+
+      // Invalidate any in-flight asynchronous transcription immediately
+      if (
+        recordingStateRef.current === 'transcribing' ||
+        recordingStateRef.current === 'finalizing'
+      ) {
+        if (transcriptionAbortCtrlRef.current) {
+          try {
+            transcriptionAbortCtrlRef.current.abort();
+          } catch (_) {}
+          transcriptionAbortCtrlRef.current = null;
+        }
+        transcriptionSessionCounterRef.current += 1;
+        updateRecordingState('idle');
+      }
       return;
     }
 
-    // Only recognize manual typing when actively listening or paused.
-    // Never during 'finalizing' or 'transcribing' when asynchronous finalization & reconciliation are executing.
+    // 2. Ignore dictation's own emissions to prevent React render cycles from treating them as manual user edits
     if (
-      (recordingStateRef.current === 'listening' || recordingStateRef.current === 'paused') &&
-      inputValue !== lastEmittedValueRef.current
+      recentEmissionsRef.current.has(inputValue) ||
+      recentEmissionsRef.current.has(inputValue.trim())
     ) {
+      return;
+    }
+
+    // 3. User manually typed, pasted, or edited text in the composer
+    if (inputValue !== lastEmittedValueRef.current) {
       baseTextRef.current = inputValue;
       sessionBaseTextRef.current = inputValue;
-      committedSegmentsRef.current = [];
       lastEmittedValueRef.current = inputValue;
+
+      // When actively listening or paused, reset committed segments so newly spoken speech
+      // appends cleanly to the user's manual modifications without repeating or reverting edits
+      if (
+        recordingStateRef.current === 'listening' ||
+        recordingStateRef.current === 'paused'
+      ) {
+        committedSegmentsRef.current = [];
+      }
     }
-  }, [inputValue]);
+  }, [inputValue, updateRecordingState]);
 
   // Cleanup helper for all microphone, visualizer, and audio recorder resources (Phase 5.2 & 5.4)
   const stopAudioResources = useCallback(() => {
@@ -751,7 +795,9 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
         committedSegmentsRef.current = [];
         interimTranscriptRef.current = '';
         recentEmissionsRef.current.clear();
-        recordEmission(baseTextRef.current);
+        if (baseTextRef.current && baseTextRef.current.trim()) {
+          recordEmission(baseTextRef.current);
+        }
         setInterimTranscript('');
         setLastSessionTranscript('');
         isExplicitStopRef.current = false;
@@ -759,6 +805,8 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
         consecutiveErrorsRef.current = 0;
         consecutiveSilenceRestartsRef.current = 0;
         lastCommittedSegmentRef.current = { text: '', timestamp: 0 };
+        nativeSessionTranscriptRef.current = '';
+        expectedEmittedBeforeTranscribeRef.current = '';
 
         // Reset audio capture buffers for fresh session
         audioChunksRef.current = [];
@@ -780,9 +828,19 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
         updateRecordingState('requesting');
       } else {
         // Continuing session after browser silence restart:
-        // Fold already finalized speech segments into baseTextRef so the new instance starts cleanly
-        if (committedSegmentsRef.current.length > 0) {
-          const committedSoFar = committedSegmentsRef.current.map((s) => s.text).join(' ').trim();
+        // Fold already finalized speech segments and any pending interim speech into baseTextRef so the new instance starts cleanly
+        let committedSoFar = committedSegmentsRef.current.map((s) => s.text).join(' ').trim();
+        if (interimTranscriptRef.current && interimTranscriptRef.current.trim()) {
+          const formattedInterim = formatSpeechTranscript(
+            interimTranscriptRef.current.trim(),
+            selectedLanguageRef.current,
+            combineComposerText(baseTextRef.current, committedSoFar)
+          );
+          if (formattedInterim) {
+            committedSoFar = combineComposerText(committedSoFar, formattedInterim);
+          }
+        }
+        if (committedSoFar) {
           baseTextRef.current = combineComposerText(baseTextRef.current, committedSoFar);
           committedSegmentsRef.current = [];
         }
@@ -978,14 +1036,27 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
           interimTranscriptRef.current = currentInterim;
           setInterimTranscript(currentInterim);
 
-          // 3. Assemble and emit combined text to composer
-          const allFinalSpeech = committedSegmentsRef.current.map((s) => s.text).join(' ').trim();
-          const combinedFinal = combineComposerText(baseTextRef.current, allFinalSpeech);
+          // 3. Assemble and emit combined text to composer in real time (both finalized and interim results)
+          let liveSpeech = committedSegmentsRef.current.map((s) => s.text).join(' ').trim();
 
-          if (combinedFinal !== inputValueRef.current) {
-            recordEmission(combinedFinal);
+          if (currentInterim && currentInterim.trim()) {
+            const precedingForInterim = combineComposerText(baseTextRef.current, liveSpeech);
+            const formattedInterim = formatSpeechTranscript(
+              currentInterim.trim(),
+              selectedLanguageRef.current,
+              precedingForInterim
+            );
+            if (formattedInterim) {
+              liveSpeech = combineComposerText(liveSpeech, formattedInterim);
+            }
+          }
+
+          const liveCombined = combineComposerText(baseTextRef.current, liveSpeech);
+
+          if (liveCombined !== inputValueRef.current) {
+            recordEmission(liveCombined);
             if (onInputChangeRef.current) {
-              onInputChangeRef.current(combinedFinal);
+              onInputChangeRef.current(liveCombined);
             }
           }
         };
@@ -1399,7 +1470,7 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
           const result = await transcribeAudioBlob({
             audioBlob: finalBlob,
             language: selectedLanguageRef.current,
-            prompt: 'Orvix, AI conversation assistant. Technical vocabulary: JavaScript, TypeScript, React',
+            prompt: 'Orvix, AI conversation assistant. Technical vocabulary: JavaScript, TypeScript, React, palindrome, algorithms, async await, promises, functions, objects, arrays, code',
             signal: abortCtrl.signal
           });
 
@@ -1419,9 +1490,9 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
 
             const currentVal = inputValueRef.current || '';
 
-            // Non-destructive reconciliation policy (Phase 5.4):
-            // 1. If user explicitly cleared the input while transcribing was running, do not re-populate!
-            if (!currentVal.trim() && preTranscribeValue.trim()) {
+            // Non-destructive reconciliation policy (Phase 5.4 & Rule A):
+            // 1. If composer is currently empty (manually cleared by user), NEVER repopulate!
+            if (!currentVal.trim()) {
               setLastSessionTranscript(formattedWhisper);
               return;
             }
@@ -1455,7 +1526,7 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
               // 4. Composer contains a partial live chunk of the speech (e.g. truncated live speech):
               // Replace the partial speech portion with the full Whisper transcript!
               reconciled = currentVal.replace(currentSpeechPortion, formattedWhisper);
-            } else if (!currentSpeechPortion || currentVal === initialBase) {
+            } else if (currentVal && initialBase && currentVal === initialBase) {
               // Only initial base text remains in composer
               reconciled = fullReconciled;
             } else {
@@ -1499,7 +1570,7 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
             : err?.code === 'RATE_LIMIT_EXCEEDED'
             ? 'Whisper rate limit reached — live speech transcript retained.'
             : err?.code === 'PROVIDER_NOT_CONFIGURED'
-            ? (caps.engineMode === 'direct-audio'
+            ? (engineMode === 'direct-audio'
                 ? 'Whisper transcription requires API key setup on server.'
                 : 'Whisper service not configured — live speech transcript retained.')
             : 'Whisper service unavailable — live speech transcript retained.';
@@ -1523,8 +1594,8 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
       }, 150);
     }
   }, [
-    caps.engineMode,
     cleanupRecognitionInstance,
+    engineMode,
     stopAudioResources,
     updateRecordingState
   ]);
@@ -1616,7 +1687,7 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
       const result = await transcribeAudioBlob({
         audioBlob,
         language: selectedLanguageRef.current,
-        prompt: 'Orvix, AI conversation assistant. Technical vocabulary: JavaScript, TypeScript, React',
+        prompt: 'Orvix, AI conversation assistant. Technical vocabulary: JavaScript, TypeScript, React, palindrome, algorithms, async await, promises, functions, objects, arrays, code',
         signal: abortCtrl.signal
       });
 
@@ -1634,11 +1705,15 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
         const fullReconciled = combineComposerText(initialBase, formattedWhisper);
         let reconciled = fullReconciled;
 
+        if (!currentVal.trim()) {
+          setLastSessionTranscript(formattedWhisper);
+          return;
+        }
+
         if (targetNative && currentVal.includes(targetNative)) {
           reconciled = currentVal.replace(targetNative, formattedWhisper);
         } else if (
           currentVal === targetNative ||
-          !currentVal.trim() ||
           currentVal === initialBase ||
           recentEmissionsRef.current.has(currentVal)
         ) {
