@@ -35,7 +35,8 @@ import ImageAttachmentCard from './ImageAttachmentCard.jsx';
 import { isImageAttachment } from '../../services/documentContextService.js';
 import { useSpeech } from '../../context/SpeechContext.jsx';
 import { PROVIDER_OPTIONS } from '../../services/aiRouter.js';
-import { formatResponseTime } from '../../utils/formatResponseTime.js';
+import { formatResponseTime, formatLiveElapsed } from '../../utils/formatResponseTime.js';
+export { formatLiveElapsed };
 import { getAlternativeMetrics, getActiveAlternative } from '../../services/alternativeResponseService.js';
 
 /**
@@ -432,39 +433,6 @@ function createMarkdownComponents(isStreaming = false, effectiveMode = 'general'
  * Lightweight, self-contained live timer that updates every 100ms while AI generation is actively running.
  * Only re-renders this tiny badge component, completely avoiding chat re-renders.
  */
-/**
- * Formats live elapsed generation duration in mm:ss (or hh:mm:ss if >= 1 hour).
- * Ensures smooth, continuous counting beyond 01:00 without any ceiling, hard limit, or cancellation trigger.
- *
- * @param {number} startTime - performance.now() or Date.now() timestamp when generation began
- * @param {number} [now] - Optional current timestamp override for deterministic testing
- * @returns {string} Formatted elapsed time (e.g., '00:00', '00:50', '00:59', '01:00', '01:01', '02:30', '05:00')
- */
-export function formatLiveElapsed(startTime, now) {
-  if (typeof startTime !== 'number' || startTime <= 0) return '00:00';
-  const currentTime =
-    typeof now === 'number'
-      ? now
-      : typeof performance !== 'undefined' && performance.now
-      ? performance.now()
-      : Date.now();
-  const elapsedMs = Math.max(0, currentTime - startTime);
-  const totalSeconds = Math.floor(elapsedMs / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-
-  const mm = String(minutes).padStart(2, '0');
-  const ss = String(seconds).padStart(2, '0');
-
-  if (minutes < 60) {
-    return `${mm}:${ss}`;
-  }
-  const hours = Math.floor(minutes / 60);
-  const remMinutes = minutes % 60;
-  const hh = String(hours).padStart(2, '0');
-  const remMm = String(remMinutes).padStart(2, '0');
-  return `${hh}:${remMm}:${ss}`;
-}
 
 function LiveResponseTimer({ startTime }) {
   const [elapsedText, setElapsedText] = useState(() => formatLiveElapsed(startTime));
