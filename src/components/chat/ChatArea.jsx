@@ -20,7 +20,7 @@ import {
 import WelcomeScreen from './WelcomeScreen.jsx';
 import MessageList from './MessageList.jsx';
 import Button from '../ui/Button.jsx';
-import { useVoiceDictation } from '../../hooks/useVoiceDictation.js';
+import { useVoiceDictation, combineComposerText } from '../../hooks/useVoiceDictation.js';
 import { sendAIMessage } from '../../services/aiRouter.js';
 import { responseHasContinuationNotice } from '../../services/multiPartResponseService.js';
 
@@ -725,6 +725,7 @@ export default function ChatArea({
     resumeListening,
     stopListening,
     cancelListening,
+    keepLiveTranscript,
     toggleListening,
     clearDictationError,
     clearLastSessionTranscript,
@@ -770,6 +771,9 @@ export default function ChatArea({
       resumeListening();
     } else if (recordingState === 'requesting') {
       handleCancelListening();
+    } else if (recordingState === 'finalizing' || recordingState === 'transcribing') {
+      // Safe guard: ignore multi-tap while actively finalizing or transcribing
+      return;
     } else {
       startListening();
     }
@@ -938,30 +942,38 @@ export default function ChatArea({
 
     if (shouldSend) {
       e.preventDefault();
+      let textToSend = inputValue;
       if (isListening || isPaused || isRequesting) {
+        if (interimTranscript && interimTranscript.trim()) {
+          textToSend = combineComposerText(inputValue, interimTranscript.trim());
+        }
         stopListening();
       }
       clearLastSessionTranscript();
       setSuggestedRefinement(null);
-      if (onSubmit && (inputValue.trim() || attachments.length > 0) && !isLoading) {
+      if (onSubmit && (textToSend.trim() || attachments.length > 0) && !isLoading) {
         const currentAttachments = [...attachments];
         setAttachments([]);
-        onSubmit(currentAttachments);
+        onSubmit(currentAttachments, textToSend !== inputValue ? textToSend : null);
       }
     }
   };
 
   const handleSubmit = (e) => {
     e.preventDefault();
+    let textToSend = inputValue;
     if (isListening || isPaused || isRequesting) {
+      if (interimTranscript && interimTranscript.trim()) {
+        textToSend = combineComposerText(inputValue, interimTranscript.trim());
+      }
       stopListening();
     }
     clearLastSessionTranscript();
     setSuggestedRefinement(null);
-    if (onSubmit && (inputValue.trim() || attachments.length > 0) && !isLoading) {
+    if (onSubmit && (textToSend.trim() || attachments.length > 0) && !isLoading) {
       const currentAttachments = [...attachments];
       setAttachments([]);
-      onSubmit(currentAttachments);
+      onSubmit(currentAttachments, textToSend !== inputValue ? textToSend : null);
     }
   };
 
@@ -1297,7 +1309,7 @@ Transcript:
                   <button
                     type="button"
                     className="dictation-strip-btn cancel-btn text-btn"
-                    onClick={cancelListening}
+                    onClick={keepLiveTranscript}
                     title="Keep live transcript and cancel Whisper refinement"
                     aria-label="Keep live transcript and cancel Whisper refinement"
                   >
@@ -1675,7 +1687,7 @@ Transcript:
                   type="button"
                   variant={isListening ? 'primary' : (isRequesting || isTranscribing) ? 'outline' : 'ghost'}
                   size="icon-round"
-                  disabled={isLoading || isTranscribing}
+                  disabled={isLoading || isTranscribing || isFinalizing}
                   onClick={handleToggleListening}
                   title={
                     !isSupported

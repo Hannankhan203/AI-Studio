@@ -6918,16 +6918,43 @@ body.theme-light .listening-text,
   color: #ef4444;
 }
 
-.btn-label-sr {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  white-space: nowrap;
-  border-width: 0;
+.dictation-strip-btn:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
+.dictation-strip-btn.text-btn {
+  width: auto;
+  min-width: fit-content;
+  padding: 4px 10px;
+  background-color: rgba(37, 99, 235, 0.15);
+  border-color: rgba(59, 130, 246, 0.35);
+  color: #93c5fd;
+  gap: 5px;
+}
+
+.dictation-strip-btn.text-btn:hover {
+  background-color: rgba(37, 99, 235, 0.28);
+  border-color: rgba(59, 130, 246, 0.5);
+  color: #ffffff;
+}
+
+:root[data-theme="light"] .dictation-strip-btn.text-btn,
+html[data-theme="light"] .dictation-strip-btn.text-btn,
+body.theme-light .dictation-strip-btn.text-btn,
+[data-theme="light"] .dictation-strip-btn.text-btn {
+  background-color: rgba(37, 99, 235, 0.08);
+  border-color: rgba(37, 99, 235, 0.3);
+  color: #2563eb;
+}
+
+:root[data-theme="light"] .dictation-strip-btn.text-btn:hover,
+html[data-theme="light"] .dictation-strip-btn.text-btn:hover,
+body.theme-light .dictation-strip-btn.text-btn:hover,
+[data-theme="light"] .dictation-strip-btn.text-btn:hover {
+  background-color: rgba(37, 99, 235, 0.16);
+  border-color: rgba(37, 99, 235, 0.45);
+  color: #1d4ed8;
 }
 
 /* Responsive Behavior for Dictation Strip (Phase 5.4 Mobile & Cross-Browser Usability) */

@@ -67,13 +67,14 @@ export function detectDictationCapabilities() {
   // - 'native-only': Browsers with SpeechRecognition but missing MediaRecorder
   // - 'unsupported': Neither capability available
   let engineMode = 'unsupported';
-  if (hasSpeechRecognition && hasGetUserMedia && hasMediaRecorder) {
+  if (!isFirefox && hasSpeechRecognition && hasGetUserMedia && hasMediaRecorder) {
     engineMode = 'hybrid';
   } else if (hasGetUserMedia && hasMediaRecorder) {
-    // Firefox fallback: SpeechRecognition is disabled by default in Firefox,
-    // but MediaRecorder + getUserMedia are fully supported!
+    // Firefox fallback (or browsers without functional native SpeechRecognition):
+    // Native SpeechRecognition is not enabled/functional by default in Firefox,
+    // but MediaRecorder + getUserMedia are fully supported for direct Whisper transcription!
     engineMode = 'direct-audio';
-  } else if (hasSpeechRecognition) {
+  } else if (!isFirefox && hasSpeechRecognition) {
     engineMode = 'native-only';
   }
 
@@ -96,7 +97,11 @@ export function detectDictationCapabilities() {
  * @returns {string} Supported MIME type or empty string if browser default should be used
  */
 export function getSupportedAudioMimeType() {
-  if (typeof window === 'undefined' || !window.MediaRecorder) {
+  if (typeof window === 'undefined') {
+    return '';
+  }
+  const MR = window.MediaRecorder || (typeof MediaRecorder !== 'undefined' ? MediaRecorder : null);
+  if (!MR || typeof MR.isTypeSupported !== 'function') {
     return '';
   }
   const candidateTypes = [
@@ -110,7 +115,7 @@ export function getSupportedAudioMimeType() {
   ];
   for (const mime of candidateTypes) {
     try {
-      if (typeof MediaRecorder.isTypeSupported === 'function' && MediaRecorder.isTypeSupported(mime)) {
+      if (MR.isTypeSupported(mime)) {
         return mime;
       }
     } catch (_) {}
@@ -158,11 +163,11 @@ const COMMON_TECH_ACRONYMS = [
   [/\breact\b/gi, 'React'],
   [/\bangular\b/gi, 'Angular'],
   [/\bhannan\b/gi, 'Hannan'],
-  [/\b(?:a\s*p\s*i)\b/gi, 'API'],
+  [/\b(?:a\s*p\s*i)s?\b/gi, (m) => (/s$/i.test(m) ? 'APIs' : 'API')],
   [/\b(?:j\s*s\s*o\s*n)\b/gi, 'JSON'],
   [/\b(?:h\s*t\s*m\s*l)\b/gi, 'HTML'],
   [/\b(?:c\s*s\s*s)\b/gi, 'CSS'],
-  [/\b(?:u\s*r\s*l)\b/gi, 'URL']
+  [/\b(?:u\s*r\s*l)s?\b/gi, (m) => (/s$/i.test(m) ? 'URLs' : 'URL')]
 ];
 
 /**
@@ -213,6 +218,9 @@ export function formatSpeechTranscript(rawText, langCode = 'en-US', precedingTex
     for (const [pattern, replacement] of COMMON_TECH_ACRONYMS) {
       text = text.replace(pattern, replacement);
     }
+
+    // Natural greeting punctuation: "Hello, Orvix"
+    text = text.replace(/\b(hello|hi|hey)\s+orvix\b/gi, (_, g) => `${g.charAt(0).toUpperCase() + g.slice(1).toLowerCase()}, Orvix`);
   }
 
   // Remove irregular spaces before punctuation
@@ -353,6 +361,8 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
   const selectedLanguageRef = useRef(selectedLanguage);
   selectedLanguageRef.current = selectedLanguage;
 
+  const pauseListeningRef = useRef(null);
+
   const restartTimeoutRef = useRef(null);
   const consecutiveErrorsRef = useRef(0);
   const consecutiveSilenceRestartsRef = useRef(0);
@@ -394,6 +404,17 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
     setRecordingState(newState);
   }, []);
 
+  // Helper to record an emitted dictation value, ensuring synchronous ref tracking and bounded history
+  const recordEmission = useCallback((val) => {
+    lastEmittedValueRef.current = val;
+    inputValueRef.current = val;
+    recentEmissionsRef.current.add(val);
+    if (recentEmissionsRef.current.size > 30) {
+      const oldest = recentEmissionsRef.current.values().next().value;
+      recentEmissionsRef.current.delete(oldest);
+    }
+  }, []);
+
   // Sync capability detection on mount
   useEffect(() => {
     const caps = detectDictationCapabilities();
@@ -407,16 +428,17 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
   // its own emitted dictation values as external user edits.
   useEffect(() => {
     if (recentEmissionsRef.current.has(inputValue)) {
-      recentEmissionsRef.current.delete(inputValue);
       return;
     }
 
-    // If inputValue changed externally while dictating, respect user's manual edits as new base
+    // Only recognize manual typing when actively listening or paused.
+    // Never during 'finalizing' or 'transcribing' when asynchronous finalization & reconciliation are executing.
     if (
-      recordingStateRef.current !== 'idle' &&
+      (recordingStateRef.current === 'listening' || recordingStateRef.current === 'paused') &&
       inputValue !== lastEmittedValueRef.current
     ) {
       baseTextRef.current = inputValue;
+      sessionBaseTextRef.current = inputValue;
       committedSegmentsRef.current = [];
       lastEmittedValueRef.current = inputValue;
     }
@@ -473,7 +495,7 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
     // Re-use active microphone stream across silence restarts so hardware doesn't drop words
     if (mediaStreamRef.current && mediaStreamRef.current.active) {
       const audioTracks = mediaStreamRef.current.getAudioTracks();
-      if (audioTracks.length > 0 && audioTracks[0].readyState === 'live') {
+      if (audioTracks.length > 0 && audioTracks[0].readyState === 'live' && !audioTracks[0].muted) {
         return mediaStreamRef.current;
       }
     }
@@ -486,9 +508,21 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
       mediaStreamRef.current = null;
     }
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: true
-    });
+    let stream = null;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+    } catch (_) {
+      // Fallback to minimal audio constraints if advanced constraints fail (older Android/iOS WebViews)
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: true
+      });
+    }
 
     // Mobile & hardware interruption handling (incoming phone calls, bluetooth disconnects)
     stream.getAudioTracks().forEach((track) => {
@@ -500,6 +534,20 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
           stopAudioResources();
           setDictationError('Microphone was disconnected or interrupted by another application.');
           updateRecordingState('error');
+        } else if (recordingStateRef.current === 'paused') {
+          // Hardware track ended while paused; clean up audio resources cleanly
+          stopAudioResources();
+        }
+      };
+
+      track.onmute = () => {
+        // Hardware microphone muted by OS (incoming call, headset unplugged)
+        if (recordingStateRef.current === 'listening') {
+          pauseListeningRef.current?.(true);
+          setTranscriptionNotice({
+            type: 'fallback',
+            message: 'Microphone was muted by another app or call. Tap Resume when ready.'
+          });
         }
       };
     });
@@ -699,10 +747,11 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
 
         // Snapshot existing composer content as the base prefix
         baseTextRef.current = inputValueRef.current || '';
+        sessionBaseTextRef.current = baseTextRef.current;
         committedSegmentsRef.current = [];
         interimTranscriptRef.current = '';
         recentEmissionsRef.current.clear();
-        lastEmittedValueRef.current = baseTextRef.current;
+        recordEmission(baseTextRef.current);
         setInterimTranscript('');
         setLastSessionTranscript('');
         isExplicitStopRef.current = false;
@@ -934,13 +983,7 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
           const combinedFinal = combineComposerText(baseTextRef.current, allFinalSpeech);
 
           if (combinedFinal !== inputValueRef.current) {
-            lastEmittedValueRef.current = combinedFinal;
-            recentEmissionsRef.current.add(combinedFinal);
-            // Keep set size bounded
-            if (recentEmissionsRef.current.size > 20) {
-              const first = recentEmissionsRef.current.values().next().value;
-              recentEmissionsRef.current.delete(first);
-            }
+            recordEmission(combinedFinal);
             if (onInputChangeRef.current) {
               onInputChangeRef.current(combinedFinal);
             }
@@ -1087,266 +1130,404 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
     ]
   );
 
-  // Start a fresh dictation session
-  const startListening = useCallback(() => {
-    isExplicitStopRef.current = false;
-    hasFatalErrorRef.current = false;
-    setDictationError(null);
-    startRecognitionSession(true);
+  // Start a fresh dictation session with concurrency guards
+  const startListening = useCallback(async () => {
+    if (isTransitioningRef.current) return;
+    if (
+      recordingStateRef.current === 'listening' ||
+      recordingStateRef.current === 'requesting' ||
+      recordingStateRef.current === 'finalizing' ||
+      recordingStateRef.current === 'transcribing'
+    ) {
+      return;
+    }
+    isTransitioningRef.current = true;
+
+    try {
+      isExplicitStopRef.current = false;
+      hasFatalErrorRef.current = false;
+      setDictationError(null);
+      await startRecognitionSession(true);
+    } finally {
+      setTimeout(() => {
+        isTransitioningRef.current = false;
+      }, 150);
+    }
   }, [startRecognitionSession]);
 
-  // Pause dictation temporarily
-  const pauseListening = useCallback(() => {
-    isExplicitStopRef.current = true;
-    clearTimeout(restartTimeoutRef.current);
-    cleanupRecognitionInstance();
+  // Pause dictation temporarily. If releaseHardware is true (e.g. app backgrounded or incoming phone call),
+  // actively stops hardware tracks so the system microphone indicator turns off immediately.
+  const pauseListening = useCallback(
+    (releaseHardware = false) => {
+      isExplicitStopRef.current = true;
+      clearTimeout(restartTimeoutRef.current);
+      cleanupRecognitionInstance();
 
-    // Pause MediaRecorder
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-      try {
-        mediaRecorderRef.current.pause();
-      } catch (_) {}
-    }
-
-    // Pause visualizer animation
-    if (animFrameRef.current) {
-      cancelAnimationFrame(animFrameRef.current);
-      animFrameRef.current = null;
-    }
-    setAudioLevel(0);
-    setAudioFrequencies([0.15, 0.25, 0.35, 0.25, 0.15]);
-
-    // Commit any interim transcript captured up to pause
-    let allFinalSpeech = committedSegmentsRef.current.map((s) => s.text).join(' ').trim();
-    if (interimTranscriptRef.current && interimTranscriptRef.current.trim()) {
-      const formattedInterim = formatSpeechTranscript(
-        interimTranscriptRef.current.trim(),
-        selectedLanguageRef.current,
-        combineComposerText(baseTextRef.current, allFinalSpeech)
-      );
-      if (formattedInterim) {
-        allFinalSpeech = combineComposerText(allFinalSpeech, formattedInterim);
+      // Pause MediaRecorder
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+        try {
+          mediaRecorderRef.current.pause();
+        } catch (_) {}
       }
+
+      // Pause visualizer animation
+      if (animFrameRef.current) {
+        cancelAnimationFrame(animFrameRef.current);
+        animFrameRef.current = null;
+      }
+      setAudioLevel(0);
+      setAudioFrequencies([0.15, 0.25, 0.35, 0.25, 0.15]);
+
+      // Release hardware audio tracks if backgrounded or interrupted by OS
+      if (releaseHardware && mediaStreamRef.current) {
+        try {
+          mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+        } catch (_) {}
+        mediaStreamRef.current = null;
+      }
+
+      // Commit any interim transcript captured up to pause
+      let allFinalSpeech = committedSegmentsRef.current.map((s) => s.text).join(' ').trim();
+      if (interimTranscriptRef.current && interimTranscriptRef.current.trim()) {
+        const formattedInterim = formatSpeechTranscript(
+          interimTranscriptRef.current.trim(),
+          selectedLanguageRef.current,
+          combineComposerText(baseTextRef.current, allFinalSpeech)
+        );
+        if (formattedInterim) {
+          allFinalSpeech = combineComposerText(allFinalSpeech, formattedInterim);
+        }
+      }
+      const finalCombined = combineComposerText(baseTextRef.current, allFinalSpeech);
+      baseTextRef.current = finalCombined;
+      committedSegmentsRef.current = [];
+      interimTranscriptRef.current = '';
+      setInterimTranscript('');
+
+      recordEmission(finalCombined);
+      if (onInputChangeRef.current) {
+        onInputChangeRef.current(finalCombined);
+      }
+
+      updateRecordingState('paused');
+    },
+    [cleanupRecognitionInstance, updateRecordingState]
+  );
+  pauseListeningRef.current = pauseListening;
+
+  // Resume paused dictation session with automatic hardware stream recovery
+  const resumeListening = useCallback(async () => {
+    if (isTransitioningRef.current) return;
+    if (recordingStateRef.current !== 'paused') return;
+    isTransitioningRef.current = true;
+
+    try {
+      isExplicitStopRef.current = false;
+      hasFatalErrorRef.current = false;
+      setDictationError(null);
+
+      // Verify if existing microphone stream is live and unmuted
+      let stream = mediaStreamRef.current;
+      const isStreamLive =
+        stream?.active &&
+        stream.getAudioTracks().some((t) => t.readyState === 'live' && !t.muted);
+
+      if (!isStreamLive) {
+        try {
+          stream = await acquireMicrophoneStream();
+        } catch (streamErr) {
+          stopAudioResources();
+          setDictationError('Unable to reactivate microphone. Please tap to start dictation again.');
+          updateRecordingState('error');
+          return;
+        }
+      }
+
+      // Resume or re-attach MediaRecorder
+      if (mediaRecorderRef.current) {
+        if (mediaRecorderRef.current.state === 'paused') {
+          try {
+            mediaRecorderRef.current.resume();
+          } catch (_) {
+            startMediaRecorder(stream);
+          }
+        } else if (mediaRecorderRef.current.state === 'inactive') {
+          startMediaRecorder(stream);
+        }
+      } else if (stream) {
+        startMediaRecorder(stream);
+      }
+
+      // Resume visualizer
+      if (stream) {
+        attachAudioAnalyser(stream);
+      }
+
+      await startRecognitionSession(false);
+    } finally {
+      setTimeout(() => {
+        isTransitioningRef.current = false;
+      }, 150);
     }
-    const finalCombined = combineComposerText(baseTextRef.current, allFinalSpeech);
-    baseTextRef.current = finalCombined;
-    committedSegmentsRef.current = [];
-    interimTranscriptRef.current = '';
-    setInterimTranscript('');
+  }, [
+    acquireMicrophoneStream,
+    attachAudioAnalyser,
+    startMediaRecorder,
+    startRecognitionSession,
+    stopAudioResources,
+    updateRecordingState
+  ]);
 
-    if (onInputChangeRef.current) {
-      onInputChangeRef.current(finalCombined);
-    }
-    lastEmittedValueRef.current = finalCombined;
-    recentEmissionsRef.current.add(finalCombined);
-
-    updateRecordingState('paused');
-  }, [cleanupRecognitionInstance, updateRecordingState]);
-
-  // Resume paused dictation session
-  const resumeListening = useCallback(() => {
-    isExplicitStopRef.current = false;
-    hasFatalErrorRef.current = false;
-    setDictationError(null);
-
-    // Resume MediaRecorder
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'paused') {
-      try {
-        mediaRecorderRef.current.resume();
-      } catch (_) {}
-    }
-
-    // Resume visualizer
-    if (mediaStreamRef.current && mediaStreamRef.current.active) {
-      attachAudioAnalyser(mediaStreamRef.current);
-    }
-
-    startRecognitionSession(false);
-  }, [attachAudioAnalyser, startRecognitionSession]);
-
-  // Stop dictation and commit finalized transcript and audio buffer (Phase 5.2 & 5.3)
+  // Stop dictation and commit finalized transcript and audio buffer (Phase 5.2, 5.3 & 5.4)
   const stopListening = useCallback(async () => {
+    if (isTransitioningRef.current) return;
+    if (
+      recordingStateRef.current === 'idle' ||
+      recordingStateRef.current === 'finalizing' ||
+      recordingStateRef.current === 'transcribing' ||
+      recordingStateRef.current === 'error'
+    ) {
+      return;
+    }
+    isTransitioningRef.current = true;
     isExplicitStopRef.current = true;
     clearTimeout(restartTimeoutRef.current);
     updateRecordingState('finalizing');
 
-    // Clean up recognition instance immediately to prevent trailing onresult events from double-committing
-    cleanupRecognitionInstance();
+    try {
+      // Clean up recognition instance immediately to prevent trailing onresult events from double-committing
+      cleanupRecognitionInstance();
 
-    // Finalize MediaRecorder audio chunks with clean event synchronization
-    let finalBlob = null;
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      try {
-        await new Promise((resolve) => {
-          const recorder = mediaRecorderRef.current;
-          if (!recorder || recorder.state === 'inactive') {
-            resolve();
-            return;
-          }
-          const handleStop = () => {
-            recorder.removeEventListener('stop', handleStop);
-            resolve();
-          };
-          recorder.addEventListener('stop', handleStop);
-          try {
-            if (typeof recorder.requestData === 'function') {
-              recorder.requestData();
-            }
-            recorder.stop();
-          } catch (_) {
-            resolve();
-          }
-          setTimeout(resolve, 350);
-        });
-      } catch (_) {}
-    }
-
-    // Assemble and store final audio blob for Phase 5.2/5.3 buffer access
-    if (audioChunksRef.current.length > 0) {
-      const type = activeMimeTypeRef.current || 'audio/webm';
-      finalBlob = new Blob(audioChunksRef.current, { type });
-      recordedAudioBlobRef.current = finalBlob;
-      setRecordedAudioBlob(finalBlob);
-
-      const duration = recordingStartTimeRef.current > 0
-        ? Math.round((Date.now() - recordingStartTimeRef.current) / 1000)
-        : 0;
-      setRecordedAudioDuration(duration);
-    }
-
-    // Release microphone tracks and visualizer resources
-    stopAudioResources();
-
-    // Assemble final committed speech including any pending interim transcript
-    let allFinalSpeech = committedSegmentsRef.current.map((s) => s.text).join(' ').trim();
-
-    if (interimTranscriptRef.current && interimTranscriptRef.current.trim()) {
-      const formattedInterim = formatSpeechTranscript(
-        interimTranscriptRef.current.trim(),
-        selectedLanguageRef.current,
-        combineComposerText(baseTextRef.current, allFinalSpeech)
-      );
-      if (formattedInterim) {
-        allFinalSpeech = combineComposerText(allFinalSpeech, formattedInterim);
-      }
-    }
-
-    const finalNativeCombined = combineComposerText(baseTextRef.current, allFinalSpeech);
-    lastEmittedValueRef.current = finalNativeCombined;
-    recentEmissionsRef.current.add(finalNativeCombined);
-
-    if (onInputChangeRef.current) {
-      onInputChangeRef.current(finalNativeCombined);
-    }
-
-    interimTranscriptRef.current = '';
-    setInterimTranscript('');
-
-    if (allFinalSpeech) {
-      setLastSessionTranscript(allFinalSpeech);
-    }
-
-    committedSegmentsRef.current = [];
-
-    // Phase 5.3: Whisper-based High-Accuracy Final Transcription Pipeline
-    const currentBaseText = baseTextRef.current;
-    const currentNativeSpeech = allFinalSpeech;
-    const preTranscribeValue = finalNativeCombined;
-
-    sessionBaseTextRef.current = currentBaseText;
-    nativeSessionTranscriptRef.current = currentNativeSpeech;
-    expectedEmittedBeforeTranscribeRef.current = preTranscribeValue;
-
-    // Only submit to Whisper endpoint if non-trivial audio was recorded (>= 300 bytes)
-    if (finalBlob && finalBlob.size >= 300) {
-      transcriptionSessionCounterRef.current += 1;
-      const currentSessionId = transcriptionSessionCounterRef.current;
-
-      updateRecordingState('transcribing');
-
-      if (transcriptionAbortCtrlRef.current) {
+      // Finalize MediaRecorder audio chunks with clean event synchronization
+      let finalBlob = null;
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
         try {
-          transcriptionAbortCtrlRef.current.abort();
+          await new Promise((resolve) => {
+            const recorder = mediaRecorderRef.current;
+            if (!recorder || recorder.state === 'inactive') {
+              resolve();
+              return;
+            }
+            const handleStop = () => {
+              recorder.removeEventListener('stop', handleStop);
+              resolve();
+            };
+            recorder.addEventListener('stop', handleStop);
+            try {
+              if (typeof recorder.requestData === 'function') {
+                recorder.requestData();
+              }
+              recorder.stop();
+            } catch (_) {
+              resolve();
+            }
+            setTimeout(resolve, 350);
+          });
         } catch (_) {}
       }
-      const abortCtrl = new AbortController();
-      transcriptionAbortCtrlRef.current = abortCtrl;
 
-      try {
-        const result = await transcribeAudioBlob({
-          audioBlob: finalBlob,
-          language: selectedLanguageRef.current,
-          prompt: 'Orvix, AI conversation assistant. Technical vocabulary: JavaScript, TypeScript, React',
-          signal: abortCtrl.signal
-        });
+      // Assemble and store final audio blob for Phase 5.2/5.3 buffer access
+      if (audioChunksRef.current.length > 0) {
+        const type = activeMimeTypeRef.current || 'audio/webm';
+        finalBlob = new Blob(audioChunksRef.current, { type });
+        recordedAudioBlobRef.current = finalBlob;
+        setRecordedAudioBlob(finalBlob);
 
-        // Stale response safeguard: Ignore result if a newer dictation session was started or cancelled
-        if (transcriptionSessionCounterRef.current !== currentSessionId) {
-          return;
-        }
+        const duration = recordingStartTimeRef.current > 0
+          ? Math.round((Date.now() - recordingStartTimeRef.current) / 1000)
+          : 0;
+        setRecordedAudioDuration(duration);
+      }
 
-        const rawWhisper = (result.text || '').trim();
-        if (rawWhisper) {
-          const formattedWhisper = formatSpeechTranscript(
-            rawWhisper,
-            selectedLanguageRef.current,
-            currentBaseText
-          );
+      // Release microphone tracks and visualizer resources
+      stopAudioResources();
 
-          const currentVal = inputValueRef.current || '';
-          let reconciled = '';
+      // Assemble final committed speech including any pending interim transcript
+      let allFinalSpeech = committedSegmentsRef.current.map((s) => s.text).join(' ').trim();
 
-          // Non-destructive reconciliation policy:
-          // 1. If composer content has not been manually edited since dictation stopped, replace cleanly
-          if (currentVal === preTranscribeValue) {
-            reconciled = combineComposerText(currentBaseText, formattedWhisper);
-          } else if (currentNativeSpeech && currentVal.includes(currentNativeSpeech)) {
-            // 2. User made edits around the speech: substitute only the speech portion
-            reconciled = currentVal.replace(currentNativeSpeech, formattedWhisper);
-          } else {
-            // 3. User significantly edited: combine cleanly without destructive overwrite
-            reconciled = combineComposerText(currentVal, formattedWhisper);
-          }
-
-          if (onInputChangeRef.current && reconciled !== currentVal) {
-            lastEmittedValueRef.current = reconciled;
-            recentEmissionsRef.current.add(reconciled);
-            onInputChangeRef.current(reconciled);
-          }
-
-          setLastSessionTranscript(formattedWhisper);
-          setTranscriptionMeta({
-            provider: result.provider === 'groq' ? 'Groq Whisper' : 'Gemini AI',
-            model: result.model,
-            highAccuracy: true,
-            timestamp: Date.now()
-          });
-          setTranscriptionNotice({
-            type: 'success',
-            message: `Enhanced with ${result.model === 'whisper-large-v3-turbo' ? 'Whisper Large v3' : result.model}`
-          });
-        }
-      } catch (err) {
-        if (transcriptionSessionCounterRef.current !== currentSessionId) return;
-        if (err?.name === 'AbortError') return;
-
-        console.warn('[Transcription] Whisper transcription error:', err?.message || err);
-        setTranscriptionNotice({
-          type: 'fallback',
-          message: err?.isTimeout
-            ? 'Whisper request timed out — live speech transcript retained.'
-            : 'Whisper service unavailable — live speech transcript retained.',
-          canRetry: true
-        });
-      } finally {
-        if (transcriptionSessionCounterRef.current === currentSessionId) {
-          updateRecordingState('idle');
+      if (interimTranscriptRef.current && interimTranscriptRef.current.trim()) {
+        const formattedInterim = formatSpeechTranscript(
+          interimTranscriptRef.current.trim(),
+          selectedLanguageRef.current,
+          combineComposerText(baseTextRef.current, allFinalSpeech)
+        );
+        if (formattedInterim) {
+          allFinalSpeech = combineComposerText(allFinalSpeech, formattedInterim);
         }
       }
-    } else {
-      updateRecordingState('idle');
+
+      const finalNativeCombined = combineComposerText(baseTextRef.current, allFinalSpeech);
+      recordEmission(finalNativeCombined);
+
+      if (onInputChangeRef.current) {
+        onInputChangeRef.current(finalNativeCombined);
+      }
+
+      interimTranscriptRef.current = '';
+      setInterimTranscript('');
+
+      if (allFinalSpeech) {
+        setLastSessionTranscript(allFinalSpeech);
+      }
+
+      committedSegmentsRef.current = [];
+
+      // Phase 5.3: Whisper-based High-Accuracy Final Transcription Pipeline
+      const initialSessionBaseText = sessionBaseTextRef.current || '';
+      const currentNativeSpeech = allFinalSpeech;
+      const preTranscribeValue = finalNativeCombined;
+
+      nativeSessionTranscriptRef.current = currentNativeSpeech;
+      expectedEmittedBeforeTranscribeRef.current = preTranscribeValue;
+
+      // Only submit to Whisper endpoint if non-trivial audio was recorded (>= 300 bytes)
+      if (finalBlob && finalBlob.size >= 300) {
+        transcriptionSessionCounterRef.current += 1;
+        const currentSessionId = transcriptionSessionCounterRef.current;
+
+        updateRecordingState('transcribing');
+
+        if (transcriptionAbortCtrlRef.current) {
+          try {
+            transcriptionAbortCtrlRef.current.abort();
+          } catch (_) {}
+        }
+        const abortCtrl = new AbortController();
+        transcriptionAbortCtrlRef.current = abortCtrl;
+
+        try {
+          const result = await transcribeAudioBlob({
+            audioBlob: finalBlob,
+            language: selectedLanguageRef.current,
+            prompt: 'Orvix, AI conversation assistant. Technical vocabulary: JavaScript, TypeScript, React',
+            signal: abortCtrl.signal
+          });
+
+          // Stale response safeguard: Ignore result if a newer dictation session was started or cancelled
+          if (transcriptionSessionCounterRef.current !== currentSessionId) {
+            return;
+          }
+
+          const rawWhisper = (result.text || '').trim();
+          if (rawWhisper) {
+            const initialBase = sessionBaseTextRef.current || '';
+            const formattedWhisper = formatSpeechTranscript(
+              rawWhisper,
+              selectedLanguageRef.current,
+              initialBase
+            );
+
+            const currentVal = inputValueRef.current || '';
+
+            // Non-destructive reconciliation policy (Phase 5.4):
+            // 1. If user explicitly cleared the input while transcribing was running, do not re-populate!
+            if (!currentVal.trim() && preTranscribeValue.trim()) {
+              setLastSessionTranscript(formattedWhisper);
+              return;
+            }
+
+            const fullReconciled = combineComposerText(initialBase, formattedWhisper);
+            let reconciled = fullReconciled;
+
+            const isExactPreTranscribe = currentVal === preTranscribeValue;
+            const isRecentEmission =
+              recentEmissionsRef.current.has(currentVal) ||
+              recentEmissionsRef.current.has(currentVal.trim());
+            const isLastEmitted = currentVal === lastEmittedValueRef.current;
+
+            let currentSpeechPortion = currentVal;
+            if (initialBase && currentVal.startsWith(initialBase)) {
+              currentSpeechPortion = currentVal.slice(initialBase.length).trim();
+            }
+
+            if (isExactPreTranscribe || isRecentEmission || isLastEmitted) {
+              // 2. Composer was untouched since stop, or contains a dictation emission: apply complete Whisper transcript
+              reconciled = fullReconciled;
+            } else if (currentNativeSpeech && currentVal.includes(currentNativeSpeech)) {
+              // 3. User made edits around the speech: substitute the speech portion
+              reconciled = currentVal.replace(currentNativeSpeech, formattedWhisper);
+            } else if (
+              currentSpeechPortion &&
+              (currentNativeSpeech.includes(currentSpeechPortion) ||
+                formattedWhisper.toLowerCase().includes(currentSpeechPortion.toLowerCase()) ||
+                recentEmissionsRef.current.has(currentSpeechPortion))
+            ) {
+              // 4. Composer contains a partial live chunk of the speech (e.g. truncated live speech):
+              // Replace the partial speech portion with the full Whisper transcript!
+              reconciled = currentVal.replace(currentSpeechPortion, formattedWhisper);
+            } else if (!currentSpeechPortion || currentVal === initialBase) {
+              // Only initial base text remains in composer
+              reconciled = fullReconciled;
+            } else {
+              // 5. User typed new/different text with no overlap with this dictation session: do NOT overwrite their typing!
+              setLastSessionTranscript(formattedWhisper);
+              setTranscriptionNotice({
+                type: 'success',
+                message: `Enhanced transcript ready in review helper: "${formattedWhisper.length > 35 ? formattedWhisper.slice(0, 35) + '...' : formattedWhisper}"`
+              });
+              return;
+            }
+
+            recordEmission(reconciled);
+
+            if (onInputChangeRef.current && reconciled !== currentVal) {
+              onInputChangeRef.current(reconciled);
+            }
+
+            setLastSessionTranscript(formattedWhisper);
+            setTranscriptionMeta({
+              provider: result.provider === 'groq' ? 'Groq Whisper' : 'Gemini AI',
+              model: result.model,
+              highAccuracy: true,
+              timestamp: Date.now()
+            });
+            setTranscriptionNotice({
+              type: 'success',
+              message: `Enhanced with ${result.model === 'whisper-large-v3-turbo' ? 'Whisper Large v3' : result.model}`
+            });
+          }
+        } catch (err) {
+          if (transcriptionSessionCounterRef.current !== currentSessionId) return;
+          if (err?.name === 'AbortError') return;
+
+          console.warn('[Transcription] Whisper transcription error:', err?.message || err);
+          const isOffline = typeof navigator !== 'undefined' && !navigator.onLine;
+          const msg = isOffline
+            ? 'Network disconnected during transcription — live speech transcript retained.'
+            : err?.isTimeout
+            ? 'Whisper request timed out — live speech transcript retained.'
+            : err?.code === 'RATE_LIMIT_EXCEEDED'
+            ? 'Whisper rate limit reached — live speech transcript retained.'
+            : err?.code === 'PROVIDER_NOT_CONFIGURED'
+            ? (caps.engineMode === 'direct-audio'
+                ? 'Whisper transcription requires API key setup on server.'
+                : 'Whisper service not configured — live speech transcript retained.')
+            : 'Whisper service unavailable — live speech transcript retained.';
+
+          setTranscriptionNotice({
+            type: 'fallback',
+            message: msg,
+            canRetry: true
+          });
+        } finally {
+          if (transcriptionSessionCounterRef.current === currentSessionId) {
+            updateRecordingState('idle');
+          }
+        }
+      } else {
+        updateRecordingState('idle');
+      }
+    } finally {
+      setTimeout(() => {
+        isTransitioningRef.current = false;
+      }, 150);
     }
-  }, [cleanupRecognitionInstance, stopAudioResources, updateRecordingState]);
+  }, [
+    caps.engineMode,
+    cleanupRecognitionInstance,
+    stopAudioResources,
+    updateRecordingState
+  ]);
 
   // Cancel dictation: Discards speech from this session and restores original composer text
   const cancelListening = useCallback(() => {
@@ -1380,8 +1561,10 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
     stopAudioResources();
 
     // Revert to original composer content prior to this session
+    const originalBase = sessionBaseTextRef.current ?? baseTextRef.current;
+    recordEmission(originalBase);
     if (onInputChangeRef.current) {
-      onInputChangeRef.current(baseTextRef.current);
+      onInputChangeRef.current(originalBase);
     }
 
     committedSegmentsRef.current = [];
@@ -1390,6 +1573,22 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
     setTranscriptionNotice(null);
     updateRecordingState('idle');
   }, [cleanupRecognitionInstance, stopAudioResources, updateRecordingState]);
+
+  // Keep live transcript and cancel in-flight Whisper request without reverting composer (Phase 5.4)
+  const keepLiveTranscript = useCallback(() => {
+    if (transcriptionAbortCtrlRef.current) {
+      try {
+        transcriptionAbortCtrlRef.current.abort();
+      } catch (_) {}
+      transcriptionAbortCtrlRef.current = null;
+    }
+    transcriptionSessionCounterRef.current += 1;
+    updateRecordingState('idle');
+    setTranscriptionNotice({
+      type: 'fallback',
+      message: 'Whisper refinement skipped — live speech transcript retained.'
+    });
+  }, [updateRecordingState]);
 
   // Safe retry for Whisper transcription on the captured audio buffer
   const retryTranscription = useCallback(async () => {
@@ -1425,22 +1624,31 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
 
       const rawWhisper = (result.text || '').trim();
       if (rawWhisper) {
+        const initialBase = sessionBaseTextRef.current || '';
         const formattedWhisper = formatSpeechTranscript(
           rawWhisper,
           selectedLanguageRef.current,
-          ''
+          initialBase
         );
 
-        let reconciled = currentVal;
+        const fullReconciled = combineComposerText(initialBase, formattedWhisper);
+        let reconciled = fullReconciled;
+
         if (targetNative && currentVal.includes(targetNative)) {
           reconciled = currentVal.replace(targetNative, formattedWhisper);
+        } else if (
+          currentVal === targetNative ||
+          !currentVal.trim() ||
+          currentVal === initialBase ||
+          recentEmissionsRef.current.has(currentVal)
+        ) {
+          reconciled = fullReconciled;
         } else {
           reconciled = combineComposerText(currentVal, formattedWhisper);
         }
 
+        recordEmission(reconciled);
         if (onInputChangeRef.current && reconciled !== currentVal) {
-          lastEmittedValueRef.current = reconciled;
-          recentEmissionsRef.current.add(reconciled);
           onInputChangeRef.current(reconciled);
         }
 
@@ -1461,9 +1669,12 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
       if (err?.name === 'AbortError') return;
 
       console.warn('[Transcription] Retry failed:', err);
+      const isOffline = typeof navigator !== 'undefined' && !navigator.onLine;
       setTranscriptionNotice({
         type: 'fallback',
-        message: 'Whisper retry unsuccessful — existing transcript retained.',
+        message: isOffline
+          ? 'Network disconnected — existing transcript retained.'
+          : 'Whisper retry unsuccessful — existing transcript retained.',
         canRetry: true
       });
     } finally {
@@ -1480,27 +1691,21 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
   // Master toggle button with concurrency guard against rapid multi-tapping (Phase 5.4)
   const toggleListening = useCallback(async () => {
     if (isTransitioningRef.current) return;
-    isTransitioningRef.current = true;
 
-    try {
-      if (recordingStateRef.current === 'listening') {
-        await stopListening();
-      } else if (recordingStateRef.current === 'paused') {
-        resumeListening();
-      } else if (recordingStateRef.current === 'requesting') {
-        cancelListening();
-      } else if (
-        recordingStateRef.current === 'finalizing' ||
-        recordingStateRef.current === 'transcribing'
-      ) {
-        // Safe no-op while finalization is actively in-flight
-      } else {
-        await startListening();
-      }
-    } finally {
-      setTimeout(() => {
-        isTransitioningRef.current = false;
-      }, 150);
+    if (recordingStateRef.current === 'listening') {
+      await stopListening();
+    } else if (recordingStateRef.current === 'paused') {
+      await resumeListening();
+    } else if (recordingStateRef.current === 'requesting') {
+      cancelListening();
+    } else if (
+      recordingStateRef.current === 'finalizing' ||
+      recordingStateRef.current === 'transcribing'
+    ) {
+      // Safe no-op while finalization is actively in-flight
+      return;
+    } else {
+      await startListening();
     }
   }, [startListening, stopListening, resumeListening, cancelListening]);
 
@@ -1523,15 +1728,15 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
   );
 
   // PWA and Mobile Lifecycle (Phase 5.4):
-  // Cleanly pause dictation when app goes to background (visibilitychange & pagehide),
-  // releasing microphone hardware tracks so the system green/orange indicator turns off.
+  // Cleanly pause dictation and stop hardware tracks when app goes to background (visibilitychange & pagehide),
+  // releasing microphone hardware so the OS green/orange indicator turns off immediately.
   useEffect(() => {
     if (typeof window === 'undefined' || typeof document === 'undefined') return;
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'hidden') {
         if (recordingStateRef.current === 'listening') {
-          pauseListening();
+          pauseListening(true);
         } else if (recordingStateRef.current === 'requesting') {
           cancelListening();
         }
@@ -1540,7 +1745,7 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
 
     const handlePageHide = () => {
       if (recordingStateRef.current === 'listening') {
-        pauseListening();
+        pauseListening(true);
       } else if (recordingStateRef.current === 'requesting') {
         cancelListening();
       }
@@ -1593,6 +1798,7 @@ export function useVoiceDictation({ inputValue = '', onInputChange }) {
     resumeListening,
     stopListening,
     cancelListening,
+    keepLiveTranscript,
     toggleListening,
     clearDictationError,
     clearLastSessionTranscript,
