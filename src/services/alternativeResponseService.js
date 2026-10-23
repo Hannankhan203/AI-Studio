@@ -264,6 +264,20 @@ export function updateActiveAlternativeInMessage(assistantMessage, updates = {})
 }
 
 /**
+ * Resolves the currently active alternative record from an assistant message.
+ * @param {Object} assistantMessage
+ * @returns {Object|null}
+ */
+export function getActiveAlternative(assistantMessage) {
+  if (!assistantMessage) return null;
+  const normalized = normalizeAssistantMessage(assistantMessage);
+  const alts = Array.isArray(normalized.alternatives) ? normalized.alternatives : [];
+  if (alts.length === 0) return null;
+  const activeId = normalized.activeAlternativeId;
+  return alts.find((a) => a.id === activeId) || alts[0] || null;
+}
+
+/**
  * Updates a specific alternative by ID inside an assistant message.
  * If the updated alternative is currently active, root projected properties are synchronized.
  *

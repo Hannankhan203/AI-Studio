@@ -1206,31 +1206,67 @@ export default function ChatPage() {
             await persistMessageSafe(targetChatId, partialMessage);
           }
         } else {
-          const errorMessage = {
-            id: `error-${Date.now()}`,
-            sender: 'assistant',
-            isError: true,
-            failedPrompt: promptText,
-            failedProvider: finalProvider || providerToUse,
-            canSwitchProvider: true,
-            timestamp: new Date().toLocaleTimeString([], {
-              hour: '2-digit',
-              minute: '2-digit'
-            }),
-            content: friendlyMsg,
-            referencedAttachments:
-              currentAttachments && currentAttachments.length > 0
-                ? currentAttachments
-                : undefined
-          };
+          // Empty failure before any content could stream
+          let preservedExistingAlternative = false;
 
           setMessages((previous) =>
-            previous.map((message) =>
-              message.id === assistantMessageId
-                ? errorMessage
-                : message
-            )
+            previous.map((message) => {
+              if (message.id !== assistantMessageId) return message;
+              const normalized = normalizeAssistantMessage(message);
+              const altList = Array.isArray(normalized.alternatives) ? normalized.alternatives : [];
+
+              // If there are multiple alternatives (e.g. newly requested alternative failed),
+              // remove the empty failed alternative and safely restore the previous successful response
+              if (altList.length > 1) {
+                preservedExistingAlternative = true;
+                const remainingAlts = altList.filter(
+                  (a) => a.id !== normalized.activeAlternativeId || (a.content && a.content.trim().length > 0)
+                );
+                const restoredAlts = remainingAlts.length > 0 ? remainingAlts : altList;
+                const activeAlt = restoredAlts[restoredAlts.length - 1];
+                return {
+                  ...normalized,
+                  alternatives: restoredAlts,
+                  activeAlternativeId: activeAlt?.id || normalized.activeAlternativeId,
+                  content: activeAlt?.content || normalized.content,
+                  provider: activeAlt?.provider || normalized.provider,
+                  modelUsed: activeAlt?.modelUsed || normalized.modelUsed,
+                  isStreaming: false,
+                  isError: false
+                };
+              }
+
+              // If single alternative that already had content (e.g. regenerating in place failed)
+              if (normalized.content && normalized.content.trim().length > 0) {
+                preservedExistingAlternative = true;
+                return {
+                  ...normalized,
+                  isStreaming: false
+                };
+              }
+
+              const errorMessage = {
+                id: `error-${Date.now()}`,
+                sender: 'assistant',
+                isError: true,
+                failedPrompt: promptText,
+                failedProvider: finalProvider || providerToUse,
+                canSwitchProvider: true,
+                timestamp: new Date().toLocaleTimeString([], {
+                  hour: '2-digit',
+                  minute: '2-digit'
+                }),
+                content: friendlyMsg,
+                referencedAttachments:
+                  currentAttachments && currentAttachments.length > 0
+                    ? currentAttachments
+                    : undefined
+              };
+              return errorMessage;
+            })
           );
+
+          setPersistenceError(friendlyMsg);
         }
       } else if (targetChatId && targetText.trim().length > 0) {
         const partialMessage = {
@@ -1582,6 +1618,7 @@ export default function ChatPage() {
           parentMessageId: userMessage.id,
           provider: selectedProvider,
           modelUsed: null,
+          mode: activeMode || 'general',
           timestamp: new Date().toLocaleTimeString([], {
             hour: '2-digit',
             minute: '2-digit'
@@ -1830,7 +1867,7 @@ export default function ChatPage() {
     );
   };
 
-  // Regenerate an assistant response in-place using current model & preserved conversation context
+  // Regenerate an assistant response in-place using the model of the response currently being viewed
   const handleRegenerate = async (assistantMessage) => {
     stopSpeech();
 
@@ -1841,18 +1878,27 @@ export default function ChatPage() {
     if (msgIndex === -1) return;
 
     // Find the user prompt preceding this assistant message
-    const precedingUserMessage = [...messages.slice(0, msgIndex)]
-      .reverse()
-      .find((m) => m.sender === 'user');
+    const precedingUserMessage = assistantMessage.parentMessageId
+      ? messages.find((m) => m.id === assistantMessage.parentMessageId)
+      : [...messages.slice(0, msgIndex)].reverse().find((m) => m.sender === 'user');
 
-    if (!precedingUserMessage || !precedingUserMessage.content) {
+    if (!precedingUserMessage || (!precedingUserMessage.content && (!precedingUserMessage.attachments || precedingUserMessage.attachments.length === 0))) {
       console.warn('Cannot regenerate: preceding user prompt not found.');
       return;
     }
 
-    const userPromptText = precedingUserMessage.content;
+    const userPromptText =
+      precedingUserMessage.content ||
+      (Array.isArray(precedingUserMessage.attachments) && precedingUserMessage.attachments.length > 0
+        ? `[User attached ${precedingUserMessage.attachments.length} file: ${precedingUserMessage.attachments.map((a) => a.name || a.originalName).join(', ')}]`
+        : '');
     const userMsgIndex = messages.findIndex((m) => m.id === precedingUserMessage.id);
     const validHistory = messages.slice(0, userMsgIndex).filter((m) => !m.isError);
+
+    // Identify the provider/model of the response currently being viewed
+    const normalizedTarget = normalizeAssistantMessage(assistantMessage, precedingUserMessage);
+    const activeAlt = getActiveAlternative(normalizedTarget);
+    const providerToUse = activeAlt?.provider || assistantMessage.provider || selectedProvider;
 
     const requestStartTime = performance.now();
 
@@ -1883,7 +1929,7 @@ export default function ChatPage() {
       }
     }
 
-    // Update active alternative in-place to streaming state without creating duplicate messages
+    // Update active alternative in-place to streaming state using its own provider without replacing other alternatives
     setMessages((previous) =>
       previous.map((m) => {
         if (m.id !== targetAssistantId) return m;
@@ -1891,7 +1937,7 @@ export default function ChatPage() {
         const updated = updateActiveAlternativeInMessage(normalized, {
           content: '',
           modelUsed: null,
-          provider: selectedProvider,
+          provider: providerToUse,
           responseTimeMs: null,
           timestamp: new Date().toLocaleTimeString([], {
             hour: '2-digit',
@@ -1917,7 +1963,7 @@ export default function ChatPage() {
       validHistory,
       currentChatId,
       targetAssistantId,
-      null,
+      providerToUse,
       precedingAttachments,
       {},
       requestStartTime
@@ -1928,7 +1974,7 @@ export default function ChatPage() {
   const handleGenerateAlternative = async (assistantMessage, targetProvider) => {
     stopSpeech();
 
-    if (isLoading || isSubmittingRef.current || !assistantMessage?.id) return;
+    if (isLoading || isSubmittingRef.current || !assistantMessage?.id || !targetProvider) return;
 
     const currentChatId = activeChatIdRef.current;
     const msgIndex = messages.findIndex((m) => m.id === assistantMessage.id);
@@ -1938,16 +1984,20 @@ export default function ChatPage() {
       ? messages.find((m) => m.id === assistantMessage.parentMessageId)
       : [...messages.slice(0, msgIndex)].reverse().find((m) => m.sender === 'user');
 
-    if (!precedingUserMessage || !precedingUserMessage.content) {
+    if (!precedingUserMessage || (!precedingUserMessage.content && (!precedingUserMessage.attachments || precedingUserMessage.attachments.length === 0))) {
       console.warn('Cannot generate alternative: preceding user prompt not found.');
       return;
     }
 
-    const userPromptText = precedingUserMessage.content;
+    const userPromptText =
+      precedingUserMessage.content ||
+      (Array.isArray(precedingUserMessage.attachments) && precedingUserMessage.attachments.length > 0
+        ? `[User attached ${precedingUserMessage.attachments.length} file: ${precedingUserMessage.attachments.map((a) => a.name || a.originalName).join(', ')}]`
+        : '');
     const userMsgIndex = messages.findIndex((m) => m.id === precedingUserMessage.id);
     const validHistory = messages.slice(0, userMsgIndex).filter((m) => !m.isError);
 
-    const chosenProvider = targetProvider || selectedProvider;
+    const chosenProvider = targetProvider;
     const targetAssistantId = assistantMessage.id;
     const requestStartTime = performance.now();
 

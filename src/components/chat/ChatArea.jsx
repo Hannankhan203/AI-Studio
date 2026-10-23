@@ -1024,6 +1024,7 @@ Transcript:
               onCancelEdit={onCancelEdit}
               showTimestamps={showTimestamps}
               selectedProvider={selectedProvider}
+              activeMode={activeMode}
             />
           )}
         </div>

@@ -19,7 +19,13 @@ import {
   ChevronLeft,
   ChevronRight,
   ChevronDown,
-  Sparkles
+  Sparkles,
+  BookOpen,
+  Lightbulb,
+  AlertTriangle,
+  CheckCircle2,
+  Bookmark,
+  Info
 } from 'lucide-react';
 import Button from '../ui/Button.jsx';
 import OrvixLogo from '../ui/OrvixLogo.jsx';
@@ -67,11 +73,61 @@ function getErrorTitle(content = '') {
   return 'Request Failed';
 }
 
+const CalloutContext = React.createContext(false);
+
+/**
+ * Detects educational callout structures (Important, Note, Warning, Tip, Key takeaway, Definition, Example)
+ * Supports both GFM alert tags and standard conversational prefixes.
+ */
+function detectCalloutType(text = '') {
+  if (!text || typeof text !== 'string') return null;
+  const trimmed = text.trim();
+
+  // 1. GFM Alert tags: [!NOTE], [!TIP], [!IMPORTANT], [!WARNING], [!CAUTION]
+  if (/^\[!(NOTE|INFO)\]/i.test(trimmed)) {
+    return { type: 'note', label: 'Note', icon: Info };
+  }
+  if (/^\[!TIP\]/i.test(trimmed)) {
+    return { type: 'tip', label: 'Tip', icon: Lightbulb };
+  }
+  if (/^\[!(IMPORTANT|ATTENTION)\]/i.test(trimmed)) {
+    return { type: 'important', label: 'Important', icon: AlertCircle };
+  }
+  if (/^\[!(WARNING|CAUTION)\]/i.test(trimmed)) {
+    return { type: 'warning', label: 'Warning', icon: AlertTriangle };
+  }
+
+  // 2. Prefixes with or without markdown bold/italics
+  if (/^(?:[\*\_]{1,3})?(?:Important|Caution|Notice|Crucial)(?:[\*\_]{1,3})?\s*:/i.test(trimmed)) {
+    return { type: 'important', label: 'Important', icon: AlertCircle };
+  }
+  if (/^(?:[\*\_]{1,3})?(?:Notes?|Quick Notes?|FYI|Please Note)(?:[\*\_]{1,3})?\s*:/i.test(trimmed)) {
+    return { type: 'note', label: 'Note', icon: Info };
+  }
+  if (/^(?:[\*\_]{1,3})?(?:Warnings?|Common Pitfalls?|Pitfalls?|Watch Out|Common Mistakes?)(?:[\*\_]{1,3})?\s*:/i.test(trimmed)) {
+    return { type: 'warning', label: 'Warning', icon: AlertTriangle };
+  }
+  if (/^(?:[\*\_]{1,3})?(?:Tips?|Study Tips?|Pro Tips?|Helpful Tips?)(?:[\*\_]{1,3})?\s*:/i.test(trimmed)) {
+    return { type: 'tip', label: 'Tip', icon: Lightbulb };
+  }
+  if (/^(?:[\*\_]{1,3})?(?:Key Takeaways?|Takeaways?|Key Points?|Core Concepts?|Summary|In Summary)(?:[\*\_]{1,3})?\s*:/i.test(trimmed)) {
+    return { type: 'takeaway', label: 'Key Takeaway', icon: CheckCircle2 };
+  }
+  if (/^(?:[\*\_]{1,3})?(?:Definitions?|Terminology|Key Terms?|Concept Definitions?)(?:[\*\_]{1,3})?\s*:/i.test(trimmed)) {
+    return { type: 'definition', label: 'Definition', icon: BookOpen };
+  }
+  if (/^(?:[\*\_]{1,3})?(?:Examples?|Real-World Examples?|Practical Examples?|Analog(?:y|ies)|Everyday Analog(?:y|ies)|Illustrative Examples?)(?:[\*\_]{1,3})?\s*:/i.test(trimmed)) {
+    return { type: 'example', label: 'Example', icon: Bookmark };
+  }
+
+  return null;
+}
+
 /**
  * Creates custom components configuration for ReactMarkdown
  * Enforces sanitization, accessible tables, and developer-friendly code highlighting
  */
-function createMarkdownComponents(isStreaming = false) {
+function createMarkdownComponents(isStreaming = false, effectiveMode = 'general') {
   return {
     // Pass-through wrapper for pre so inner code block receives isBlock flag
     pre: ({ children, ...props }) => {
@@ -141,17 +197,95 @@ function createMarkdownComponents(isStreaming = false) {
     h2: ({ children, ...props }) => <h2 className="markdown-h2" {...props}>{children}</h2>,
     h3: ({ children, ...props }) => <h3 className="markdown-h3" {...props}>{children}</h3>,
     h4: ({ children, ...props }) => <h4 className="markdown-h4" {...props}>{children}</h4>,
+    h5: ({ children, ...props }) => <h5 className="markdown-h5" {...props}>{children}</h5>,
+    h6: ({ children, ...props }) => <h6 className="markdown-h6" {...props}>{children}</h6>,
 
-    // Text formatting
-    p: ({ children, ...props }) => <p className="markdown-p" {...props}>{children}</p>,
-    blockquote: ({ children, ...props }) => (
-      <blockquote className="markdown-blockquote" {...props}>
-        {children}
-      </blockquote>
-    ),
+    // Text formatting with Learning Mode Educational Callout recognition
+    p: ({ children, ...props }) => {
+      const isInsideCallout = React.useContext(CalloutContext);
+      if (effectiveMode === 'learning' && !isInsideCallout) {
+        const textContent = extractNodeText(children);
+        const callout = detectCalloutType(textContent);
+        if (callout) {
+          const IconComponent = callout.icon;
+          return (
+            <CalloutContext.Provider value={true}>
+              <div className={`educational-callout-block callout-${callout.type}`} role="note">
+                <div className="educational-callout-header">
+                  <IconComponent size={14} className="educational-callout-icon" aria-hidden="true" />
+                  <span className="educational-callout-label">{callout.label}</span>
+                </div>
+                <p className="markdown-p educational-callout-text" {...props}>
+                  {children}
+                </p>
+              </div>
+            </CalloutContext.Provider>
+          );
+        }
+      }
+      return <p className="markdown-p" {...props}>{children}</p>;
+    },
+    strong: ({ children, ...props }) => <strong className="markdown-strong" {...props}>{children}</strong>,
+    b: ({ children, ...props }) => <b className="markdown-strong" {...props}>{children}</b>,
+    em: ({ children, ...props }) => <em className="markdown-em" {...props}>{children}</em>,
+    i: ({ children, ...props }) => <i className="markdown-em" {...props}>{children}</i>,
+    del: ({ children, ...props }) => <del className="markdown-del" {...props}>{children}</del>,
+    s: ({ children, ...props }) => <s className="markdown-del" {...props}>{children}</s>,
+    blockquote: ({ children, ...props }) => {
+      if (effectiveMode === 'learning') {
+        const textContent = extractNodeText(children);
+        const callout = detectCalloutType(textContent);
+        if (callout) {
+          const IconComponent = callout.icon;
+          return (
+            <CalloutContext.Provider value={true}>
+              <blockquote className={`markdown-blockquote educational-callout callout-${callout.type}`} {...props}>
+                <div className="educational-callout-header">
+                  <IconComponent size={14} className="educational-callout-icon" aria-hidden="true" />
+                  <span className="educational-callout-label">{callout.label}</span>
+                </div>
+                <div className="educational-callout-body">
+                  {children}
+                </div>
+              </blockquote>
+            </CalloutContext.Provider>
+          );
+        }
+      }
+      return (
+        <blockquote className="markdown-blockquote" {...props}>
+          {children}
+        </blockquote>
+      );
+    },
     ul: ({ children, ...props }) => <ul className="markdown-ul" {...props}>{children}</ul>,
-    ol: ({ children, ...props }) => <ol className="markdown-ol" {...props}>{children}</ol>,
-    li: ({ children, ...props }) => <li className="markdown-li" {...props}>{children}</li>,
+    ol: ({ children, start, ...props }) => (
+      <ol className="markdown-ol" start={start} {...props}>
+        {children}
+      </ol>
+    ),
+    li: ({ children, checked, ...props }) => {
+      if (typeof checked === 'boolean') {
+        return (
+          <li className="markdown-li markdown-task-item" {...props}>
+            <input
+              type="checkbox"
+              checked={checked}
+              readOnly
+              disabled
+              className="markdown-task-checkbox"
+              aria-label="Task item"
+            />
+            <span className="markdown-task-label">{children}</span>
+          </li>
+        );
+      }
+      return (
+        <li className="markdown-li" {...props}>
+          {children}
+        </li>
+      );
+    },
     hr: (props) => <hr className="markdown-divider" {...props} />
   };
 }
@@ -230,8 +364,10 @@ export default function ChatMessage({
   onCancelEdit,
   onEditResend,
   showTimestamps = true,
-  selectedProvider = 'gemini'
+  selectedProvider = 'gemini',
+  activeMode = 'general'
 }) {
+  const effectiveMode = message?.mode || activeMode || 'general';
   const isUser = message?.sender === 'user';
   const isError = Boolean(message?.isError);
   const isStreaming = Boolean(message?.isStreaming);
@@ -250,11 +386,18 @@ export default function ChatMessage({
         setShowAltMenu(false);
       }
     };
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        setShowAltMenu(false);
+      }
+    };
     document.addEventListener('mousedown', handleClickOutside);
     document.addEventListener('touchstart', handleClickOutside);
+    window.addEventListener('keydown', handleKeyDown);
     return () => {
       document.removeEventListener('mousedown', handleClickOutside);
       document.removeEventListener('touchstart', handleClickOutside);
+      window.removeEventListener('keydown', handleKeyDown);
     };
   }, [showAltMenu]);
 
@@ -338,10 +481,8 @@ export default function ChatMessage({
     };
   const fallbackProviders = PROVIDER_OPTIONS.filter((p) => p.id !== currentProviderId);
 
-  // Available models for "Regenerate with another AI Model" (derives from supported providers, excluding cloudflare which has no chat endpoint)
-  const availableAlternativeModels = useMemo(() => {
-    return PROVIDER_OPTIONS.filter((p) => p.id !== 'cloudflare');
-  }, []);
+  // Available models for "Regenerate with another AI Model" (reuses existing Orvix provider/model configuration)
+  const availableAlternativeModels = PROVIDER_OPTIONS;
 
   const activeAlternativeModelName = useMemo(() => {
     if (activeAlt?.modelUsed) return activeAlt.modelUsed;
@@ -349,14 +490,16 @@ export default function ChatMessage({
     return currentProviderObj?.name || 'AI Model';
   }, [activeAlt, message?.modelUsed, currentProviderObj]);
 
+  const selectableModels = availableAlternativeModels;
+
   const [copied, setCopied] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState('Copy');
   const [draftContent, setDraftContent] = useState(message?.content || '');
   const editInputRef = useRef(null);
 
   const markdownComponents = useMemo(
-    () => createMarkdownComponents(isStreaming),
-    [isStreaming]
+    () => createMarkdownComponents(isStreaming, effectiveMode),
+    [isStreaming, effectiveMode]
   );
 
   const formattedResponseTime = useMemo(
@@ -727,7 +870,7 @@ export default function ChatMessage({
             )
           ) : (
             /* Render AI messages as rich, safe Markdown with progressive streaming cursor */
-            <div className={`ai-markdown-container ${isStreaming ? 'is-streaming' : ''}`}>
+            <div className={`ai-markdown-container mode-${effectiveMode} ${isStreaming ? 'is-streaming' : ''}`}>
               {message.referencedAttachments && message.referencedAttachments.length > 0 && (
                 <div className="assistant-referenced-attachments" aria-label="Referenced files">
                   <div className="referenced-attachments-header">
@@ -1016,7 +1159,7 @@ export default function ChatMessage({
                   </Button>
                 )}
 
-                {/* Alternative Responses Navigation (< 1 / 3 >) */}
+                {/* Alternative Responses Navigation (< 1 of 3 >) */}
                 {altMetrics.total > 1 && (
                   <div className="alternative-nav-wrapper" role="group" aria-label="Response alternatives">
                     <button
@@ -1038,7 +1181,13 @@ export default function ChatMessage({
                       className="alternative-nav-counter"
                       title={`Alternative ${altMetrics.currentIndex + 1} of ${altMetrics.total}`}
                     >
-                      {altMetrics.currentIndex + 1} / {altMetrics.total}
+                      {altMetrics.currentIndex + 1} of {altMetrics.total}
+                    </span>
+                    <span
+                      className="alternative-nav-model-badge"
+                      title={`Currently viewing response generated by ${activeAlternativeModelName}`}
+                    >
+                      {activeAlternativeModelName}
                     </span>
                     <button
                       type="button"
@@ -1058,7 +1207,7 @@ export default function ChatMessage({
                   </div>
                 )}
 
-                {/* Generate Alternative with Another Model Menu */}
+                {/* Regenerate with another AI Model Action & Selection Menu */}
                 {onGenerateAlternative && (
                   <div className="alternative-generate-menu-wrapper" ref={altMenuRef}>
                     <Button
@@ -1067,46 +1216,65 @@ export default function ChatMessage({
                       onClick={() => setShowAltMenu((prev) => !prev)}
                       disabled={isLoading}
                       className={`message-action-btn alternative-trigger-btn ${showAltMenu ? 'active' : ''}`}
-                      title={isLoading ? 'Generation in progress...' : 'Generate alternative response with another AI model'}
-                      ariaLabel="Generate alternative response with another AI model"
-                      icon={<Sparkles size={12} />}
+                      title={isLoading ? 'Generation in progress...' : 'Regenerate with another AI Model'}
+                      ariaLabel="Regenerate with another AI Model"
+                      aria-haspopup="true"
+                      aria-expanded={showAltMenu}
+                      aria-controls={`alt-menu-${message?.id || 'dropdown'}`}
+                      icon={<Sparkles size={13} />}
                     >
-                      Alternative
+                      <span className="action-label-full">Regenerate with another AI Model</span>
+                      <span className="action-label-compact">Another Model</span>
                     </Button>
 
                     {showAltMenu && (
-                      <div className="alternative-provider-dropdown" role="menu" aria-label="Select AI model for alternative response">
+                      <div
+                        id={`alt-menu-${message?.id || 'dropdown'}`}
+                        className="alternative-provider-dropdown"
+                        role="menu"
+                        aria-label="Select AI model for alternative response"
+                      >
                         <div className="alternative-dropdown-header">
-                          <span>Generate alternative with:</span>
+                          <span>Regenerate with another model:</span>
                         </div>
                         <div className="alternative-provider-list">
-                          {PROVIDER_OPTIONS.map((provider) => {
-                            const isCurrent = (message.provider || selectedProvider) === provider.id;
-                            const hasExistingAlt = (message.alternatives || []).some((a) => a.provider === provider.id);
-                            return (
-                              <button
-                                key={provider.id}
-                                type="button"
-                                className={`alternative-provider-option ${isCurrent ? 'is-active-provider' : ''}`}
-                                onClick={() => {
-                                  setShowAltMenu(false);
-                                  onGenerateAlternative(message, provider.id);
-                                }}
-                                disabled={isLoading}
-                                role="menuitem"
-                              >
-                                <div className="alt-provider-info">
-                                  <span className="alt-provider-name">{provider.name}</span>
-                                  <span className="alt-provider-model">{provider.modelTag}</span>
-                                </div>
-                                {isCurrent ? (
-                                  <span className="alt-provider-current-tag">Active</span>
-                                ) : hasExistingAlt ? (
-                                  <span className="alt-provider-existing-tag">Generated</span>
-                                ) : null}
-                              </button>
-                            );
-                          })}
+                          {selectableModels.length > 0 ? (
+                            selectableModels.map((provider) => {
+                              const isCurrent = provider.id === currentProviderId;
+                              const hasExistingAlt = (message.alternatives || []).some((a) => a.provider === provider.id);
+                              return (
+                                <button
+                                  key={provider.id}
+                                  type="button"
+                                  className={`alternative-provider-option ${isCurrent ? 'is-active-provider' : ''}`}
+                                  onClick={() => {
+                                    setShowAltMenu(false);
+                                    onGenerateAlternative(message, provider.id);
+                                  }}
+                                  disabled={isLoading}
+                                  role="menuitem"
+                                >
+                                  <div className="alt-provider-info">
+                                    <span className="alt-provider-name">{provider.name}</span>
+                                    <span className="alt-provider-model">{provider.modelTag}</span>
+                                  </div>
+                                  {isCurrent ? (
+                                    <span className="alt-provider-current-tag" title="Currently viewing this model's response">
+                                      Current
+                                    </span>
+                                  ) : hasExistingAlt ? (
+                                    <span className="alt-provider-existing-tag" title="An alternative with this model was generated">
+                                      Generated
+                                    </span>
+                                  ) : (
+                                    <span className="alt-provider-ready-tag">Generate</span>
+                                  )}
+                                </button>
+                              );
+                            })
+                          ) : (
+                            <div className="alt-empty-note">No other models available</div>
+                          )}
                         </div>
                       </div>
                     )}
