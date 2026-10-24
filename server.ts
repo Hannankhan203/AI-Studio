@@ -150,7 +150,7 @@ app.use((req, _res, next) => {
   next();
 });
 
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '25mb' }));
 
 // Helper to pause execution with backoff
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -320,7 +320,20 @@ export function parseGeminiError(err: any, provider = 'gemini'): {
     lowerCause.includes('econnrefused') ||
     lowerMsg.includes('network error');
 
+  const isOllamaProvider = provider.toLowerCase() === 'ollama';
+
   if (isNetworkFailure) {
+    if (isOllamaProvider) {
+      return {
+        statusCode: 503,
+        status: 'NETWORK_FAILURE',
+        category: 'provider network failure',
+        isUnavailable: true,
+        isRetryable: false,
+        message: 'Unable to connect to Local AI (Ollama) at http://127.0.0.1:11434. Please ensure Ollama is running locally ("ollama serve") and model "qwen2.5:1.5b" is available.',
+        retryAfterSeconds
+      };
+    }
     const detail = causeCode || (lowerMsg.includes('fetch failed') ? 'connection failed' : 'network unreachable');
     return {
       statusCode: 503,
@@ -343,6 +356,17 @@ export function parseGeminiError(err: any, provider = 'gemini'): {
     lowerMsg.includes('service unavailable') ||
     lowerMsg.includes('temporarily unavailable')
   ) {
+    if (isOllamaProvider) {
+      return {
+        statusCode: 503,
+        status: 'UNAVAILABLE',
+        category: 'provider API error',
+        isUnavailable: true,
+        isRetryable: false,
+        message: 'Local AI (Ollama) at http://127.0.0.1:11434 is currently unavailable. Please verify that Ollama is running locally ("ollama serve").',
+        retryAfterSeconds
+      };
+    }
     return {
       statusCode: 503,
       status: 'UNAVAILABLE',
@@ -1584,13 +1608,17 @@ app.get(['/api/upload/:id/extraction', '/upload/:id/extraction'], async (req, re
 
     if (inputSource) {
       if (isImg) {
+        const isOfflineReq = req.query?.offline === 'true';
+        const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || null;
         const imgExtraction = await extractImageText(
           inputSource,
           record.originalName,
           ext,
           record.mimeType,
           record.id,
-          record.dimensions
+          record.dimensions,
+          geminiKey,
+          { offline: isOfflineReq }
         );
         record.extraction = imgExtraction;
         return res.json(imgExtraction);
@@ -1864,6 +1892,7 @@ app.post(['/api/upload', '/upload'], (req, res) => {
 
         if (isImg) {
           rec.isImage = true;
+          const isOfflineUpload = String(req.body?.offline || '').toLowerCase() === 'true';
           const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || null;
           const imgExtraction = (await extractImageText(
             inputSource,
@@ -1872,10 +1901,11 @@ app.post(['/api/upload', '/upload'], (req, res) => {
             rec.mimeType,
             rec.id,
             rec.dimensions,
-            geminiKey
+            geminiKey,
+            { offline: isOfflineUpload }
           )) as any;
           rec.extraction = imgExtraction;
-          rec.status = 'ready';
+          rec.status = imgExtraction?.status === 'error' ? 'error' : 'ready';
         } else {
           const extraction = (await extractDocumentContent(
             inputSource,
@@ -1912,6 +1942,7 @@ app.post(['/api/upload', '/upload'], (req, res) => {
           originalName: r.originalName,
           name: r.originalName,
           extension: r.extension,
+          format: r.extraction?.format || r.extension,
           mimeType: r.mimeType,
           type: r.mimeType,
           size: r.size,
@@ -1932,7 +1963,7 @@ app.post(['/api/upload', '/upload'], (req, res) => {
                 name: r.originalName,
                 status: r.extraction.status,
                 success: r.extraction.success,
-                format: r.extraction.format,
+                format: r.extraction.format || r.extension,
                 isImage: Boolean(r.extraction.isImage || isImg),
                 hasText: Boolean(r.extraction.hasText),
                 text: r.extraction.text || '',
@@ -1943,8 +1974,14 @@ app.post(['/api/upload', '/upload'], (req, res) => {
                 confidence: r.extraction.confidence,
                 summaryText: r.extraction.summaryText,
                 pageCount: r.extraction.pageCount,
+                pages: r.extraction.pages,
                 slideCount: r.extraction.slideCount,
+                slides: r.extraction.slides,
                 sectionCount: r.extraction.sectionCount,
+                sections: r.extraction.sections,
+                table: r.extraction.table,
+                headings: (r.extraction as any).headings,
+                metadata: (r.extraction as any).metadata,
                 isScanned: r.extraction.isScanned,
                 isTruncated: r.extraction.isTruncated,
                 warning: r.extraction.warning,
@@ -2128,7 +2165,7 @@ Spoken transcript:
                 setTimeout(() => reject(new Error('Refine timeout')), 6000)
               );
               const genPromise = ai.models.generateContent({
-                model: 'gemini-2.5-flash',
+                model: 'gemini-3.8-flash',
                 contents: [{ role: 'user', parts: [{ text: refinePrompt }] }]
               });
               const geminiRes = await Promise.race([genPromise, timeoutPromise]);
@@ -2296,7 +2333,14 @@ Spoken transcript:
     // Secondary Transcription Path: Gemini Audio Recognition Fallback
     if (hasGemini) {
       try {
-        const ai = new GoogleGenAI({ apiKey: geminiKey });
+        const ai = new GoogleGenAI({
+          apiKey: geminiKey,
+          httpOptions: {
+            headers: {
+              'User-Agent': 'aistudio-build'
+            }
+          }
+        });
         let cleanMime = (audioFile.mimetype || 'audio/webm').split(';')[0].trim().toLowerCase();
         if (cleanMime === 'audio/m4a' || cleanMime === 'audio/x-m4a' || cleanMime === 'audio/mp4') {
           cleanMime = 'audio/aac';
@@ -2310,7 +2354,7 @@ ${isoLang ? `The spoken language is: ${isoLang}.` : ''}
 Output ONLY the transcription text. Do not summarize, do not translate, do not add introductory commentary or timestamps.`;
 
         const geminiRes = await ai.models.generateContent({
-          model: 'gemini-2.5-flash',
+          model: 'gemini-3.5-transcribe',
           contents: [
             {
               role: 'user',
@@ -2333,7 +2377,7 @@ Output ONLY the transcription text. Do not summarize, do not translate, do not a
           text,
           language: isoLang || 'en',
           duration: 0,
-          model: 'gemini-2.5-flash',
+          model: 'gemini-3.5-transcribe',
           provider: 'gemini',
           highAccuracy: true
         });
@@ -2341,7 +2385,7 @@ Output ONLY the transcription text. Do not summarize, do not translate, do not a
         logAIDiagnostic({
           category: 'provider API error',
           provider: 'gemini',
-          model: 'gemini-2.5-flash',
+          model: 'gemini-3.5-transcribe',
           phase: 'dispatch',
           sanitizedMessage: geminiErr?.message || 'Gemini audio transcription failed'
         });
@@ -2549,6 +2593,9 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
             const inputSource = record.buffer || (fs.existsSync(fullDiskPath) ? fullDiskPath : null);
             if (inputSource) {
               if (isImg) {
+                const isOfflineChat =
+                  Boolean(req.body?.offline) ||
+                  String(req.body?.provider || '').toLowerCase() === 'ollama';
                 const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || null;
                 record.extraction = (await extractImageText(
                   inputSource,
@@ -2557,9 +2604,10 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
                   record.mimeType,
                   record.id,
                   record.dimensions,
-                  geminiKey
+                  geminiKey,
+                  { offline: isOfflineChat }
                 )) as any;
-                record.status = 'ready';
+                record.status = record.extraction?.status === 'error' ? 'error' : 'ready';
               } else {
                 record.extraction = (await extractDocumentContent(
                   inputSource,
@@ -2584,12 +2632,23 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
         const rawExtraction = record?.extraction || att.extraction;
         if (rawExtraction) {
+          const originalName = record?.originalName || att.originalName || att.name || (rawExtraction as any).originalName || 'document';
+          const extName = path.extname(originalName).toLowerCase();
+          const detectedFormat =
+            (rawExtraction as any).format ||
+            record?.extension ||
+            att.format ||
+            att.extension ||
+            (extName === '.pdf' ? 'PDF' : extName === '.docx' ? 'DOCX' : extName === '.pptx' ? 'PPTX' : extName === '.txt' ? 'TXT' : undefined);
+
           const docData: DocumentData = {
             ...(rawExtraction as DocumentData),
             id: att.id,
             fileId: att.id,
-            originalName: record?.originalName || att.originalName || att.name || (rawExtraction as any).originalName || 'image',
-            filename: record?.diskFilename || att.name || att.originalName || (rawExtraction as any).filename || 'image',
+            originalName,
+            filename: record?.diskFilename || att.name || att.originalName || (rawExtraction as any).filename || originalName,
+            format: detectedFormat || (rawExtraction as any).format,
+            pages: (rawExtraction as any).pages || record?.extraction?.pages,
             isImage: Boolean((rawExtraction as any).isImage || record?.isImage || att.isImage)
           };
           addDocIfValid(docData, record?.conversationId || conversationId || undefined);
@@ -4816,6 +4875,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
   } catch (error: any) {
     console.error('API Error in /api/chat:', error);
     const providerName = String(req.body?.provider || 'unknown');
+    const isOllamaReq = providerName.toLowerCase() === 'ollama';
     const parsed = parseGeminiError(error, providerName);
     logAIDiagnostic({
       category: parsed.category || 'internal server error',
@@ -4832,9 +4892,10 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         error: parsed.message,
         code: parsed.statusCode,
         status: parsed.status,
-        retryable: parsed.isRetryable,
-        canFallback: true,
-        suggestedProviders: ['gemini', 'groq', 'openrouter', 'cloudflare']
+        provider: providerName,
+        retryable: isOllamaReq ? false : parsed.isRetryable,
+        canFallback: !isOllamaReq,
+        suggestedProviders: isOllamaReq ? [] : ['gemini', 'groq', 'openrouter', 'cloudflare']
       });
       if (!res.writableEnded) res.end();
     } else {
@@ -4842,9 +4903,10 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         error: parsed.message,
         code: parsed.statusCode,
         status: parsed.status,
-        retryable: parsed.isRetryable,
-        canFallback: true,
-        suggestedProviders: ['gemini', 'groq', 'openrouter', 'cloudflare']
+        provider: providerName,
+        retryable: isOllamaReq ? false : parsed.isRetryable,
+        canFallback: !isOllamaReq,
+        suggestedProviders: isOllamaReq ? [] : ['gemini', 'groq', 'openrouter', 'cloudflare']
       });
     }
   }

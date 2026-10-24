@@ -14,10 +14,17 @@ import {
   subscribeToUserChats,
   loadConversationMessages,
   generateChatTitle,
-  updateChatMode
+  updateChatMode,
+  getCachedUserChats,
+  saveCachedChatMessages,
+  syncOfflineUserChatsToFirestore
 } from '../services/chatStorageService.js';
 import { exportAsMarkdown, exportAsPlainText } from '../utils/exportConversation.js';
-import { isFirebaseConfigured } from '../config/firebaseConfig.js';
+import {
+  isFirebaseConfigured,
+  isBrowserOnline,
+  subscribeToNetworkStatus
+} from '../config/firebaseConfig.js';
 import { getChatMode } from '../config/chatModes.js';
 import { useAuth } from '../context/AuthContext.jsx';
 import { useSettings } from '../context/SettingsContext.jsx';
@@ -37,17 +44,34 @@ import {
   createAlternativeRecord,
   getActiveAlternative
 } from '../services/alternativeResponseService.js';
-import { AlertCircle, X, Check } from 'lucide-react';
+import {
+  DEFAULT_WEBLLM_MODEL_ID,
+  WEBLLM_MODEL_CATALOG,
+  getWebLLMState,
+  subscribeWebLLMState,
+  checkWebGPUSupport,
+  ensureWebLLMEngine,
+  stopWebLLMGeneration,
+  unloadWebLLMEngine
+} from '../services/webllmService.js';
+import { AlertCircle, X, Check, WifiOff } from 'lucide-react';
 
 export default function ChatPage() {
   const { currentUser, username } = useAuth();
   const { settings } = useSettings();
   const { stopSpeech } = useSpeech();
-  const isCloudEnabled =
-    isFirebaseConfigured() && Boolean(currentUser?.uid);
 
+  const isGuestUser = Boolean(
+    !currentUser?.uid ||
+    currentUser?.isAnonymous ||
+    String(currentUser.uid).startsWith('guest-')
+  );
+  const isCloudEnabled = isFirebaseConfigured() && !isGuestUser;
+
+  const [isOffline, setIsOffline] = useState(() => !isBrowserOnline());
+  const [offlineBannerDismissed, setOfflineBannerDismissed] = useState(false);
   const [userChats, setUserChats] = useState([]);
-  const [chatsLoading, setChatsLoading] = useState(isCloudEnabled);
+  const [chatsLoading, setChatsLoading] = useState(isCloudEnabled && isBrowserOnline());
 
   const [activeChatId, setActiveChatId] = useState(() => {
     if (typeof window !== 'undefined') {
@@ -84,6 +108,22 @@ export default function ChatPage() {
     return DEFAULT_PROVIDER;
   });
 
+  const [webllmModelId, setWebllmModelId] = useState(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('orvix_webllm_model_id');
+      if (saved && WEBLLM_MODEL_CATALOG[saved]) {
+        return saved;
+      }
+    }
+    return DEFAULT_WEBLLM_MODEL_ID;
+  });
+  const [webllmState, setWebllmState] = useState(() => getWebLLMState());
+  const [webllmGpuCheck, setWebllmGpuCheck] = useState({
+    checking: false,
+    supported: null,
+    message: null
+  });
+
   const isSubmittingRef = useRef(false);
   const persistedMessageIdsRef = useRef(new Set());
   const activeChatIdRef = useRef(activeChatId);
@@ -103,6 +143,76 @@ export default function ChatPage() {
       localStorage.setItem('orvix_selected_provider', provider);
       localStorage.setItem('chatora_selected_provider', provider);
     }
+  };
+
+  const handleSelectWebLLMModel = (nextModelId) => {
+    if (!nextModelId || !WEBLLM_MODEL_CATALOG[nextModelId]) return;
+    setWebllmModelId(nextModelId);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('orvix_webllm_model_id', nextModelId);
+    }
+  };
+
+  // Subscribe to real Browser AI engine state updates
+  useEffect(() => {
+    return subscribeWebLLMState((snapshot) => {
+      setWebllmState(snapshot);
+    });
+  }, []);
+
+  // Perform lightweight, zero-download WebGPU compatibility check when Browser AI is selected
+  useEffect(() => {
+    if (selectedProvider !== 'webllm' || webllmGpuCheck.supported !== null) {
+      return undefined;
+    }
+    let cancelled = false;
+    setWebllmGpuCheck((prev) => ({ ...prev, checking: true }));
+    checkWebGPUSupport()
+      .then((res) => {
+        if (cancelled) return;
+        setWebllmGpuCheck({
+          checking: false,
+          supported: Boolean(res?.supported),
+          message: res?.message || null
+        });
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setWebllmGpuCheck({
+          checking: false,
+          supported: false,
+          message: 'Unable to verify WebGPU support in this browser.'
+        });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedProvider, webllmGpuCheck.supported]);
+
+  const handleLoadWebLLMModel = () => {
+    if (
+      webllmState.status === 'checking' ||
+      webllmState.status === 'downloading' ||
+      webllmState.status === 'loading' ||
+      webllmState.status === 'generating'
+    ) {
+      return;
+    }
+    void ensureWebLLMEngine({ modelId: webllmModelId }).catch((err) => {
+      if (err?.name !== 'AbortError') {
+        console.warn('[Orvix Browser AI] Initialization failed:', err?.message || err);
+      }
+    });
+  };
+
+  const handleCancelWebLLMLoad = () => {
+    stopWebLLMGeneration();
+  };
+
+  const handleUnloadWebLLMModel = () => {
+    if (isLoading || webllmState.status === 'generating') return;
+    void unloadWebLLMEngine();
   };
 
   // Stop any running animation, speech synthesis, and network request when the page unmounts.
@@ -200,22 +310,59 @@ export default function ChatPage() {
 
   const saveGuestChats = (chats) => {
     try {
-      if (typeof window !== 'undefined') {
-        localStorage.setItem(
-          'orvix_guest_chats',
-          JSON.stringify(chats)
-        );
-        localStorage.setItem(
-          'chatora_guest_chats',
-          JSON.stringify(chats)
-        );
+      if (typeof window !== 'undefined' && Array.isArray(chats)) {
+        // Strip heavy raw File/base64/dataUrl payloads before saving to 5MB localStorage
+        // (full image blobs are already persisted in IndexedDB via saveAttachmentBlob, and OCR text lives in extraction)
+        const sanitizedChats = chats.map((chat) => {
+          if (!chat || !Array.isArray(chat.messages)) return chat;
+          return {
+            ...chat,
+            messages: chat.messages.map((msg) => {
+              if (!msg || !Array.isArray(msg.attachments) || msg.attachments.length === 0) return msg;
+              return {
+                ...msg,
+                attachments: msg.attachments.map(({ file, base64, dataUrl, previewUrl, ...rest }) => rest)
+              };
+            })
+          };
+        });
+        const serialized = JSON.stringify(sanitizedChats);
+        localStorage.setItem('orvix_guest_chats', serialized);
+        localStorage.setItem('chatora_guest_chats', serialized);
       }
     } catch (error) {
       console.warn('Could not save guest chats:', error);
     }
   };
 
-  // 1. Subscribe to the conversation list.
+  // Listen for browser online/offline transitions and reconcile pending chats when connectivity returns
+  useEffect(() => {
+    return subscribeToNetworkStatus((online) => {
+      setIsOffline(!online);
+      if (!online) {
+        setOfflineBannerDismissed(false);
+      } else {
+        // Clear stale offline Firestore errors upon reconnecting
+        setPersistenceError((prev) =>
+          prev && prev.toLowerCase().includes('firestore') ? null : prev
+        );
+        if (isCloudEnabled && currentUser?.uid) {
+          syncOfflineUserChatsToFirestore(currentUser.uid)
+            .then(() => {
+              const refreshed = getCachedUserChats(currentUser.uid);
+              if (refreshed.length > 0) {
+                setUserChats(refreshed);
+              }
+            })
+            .catch((err) => {
+              console.warn('Background offline chat sync warning:', err);
+            });
+        }
+      }
+    });
+  }, [isCloudEnabled, currentUser?.uid]);
+
+  // 1. Subscribe to the conversation list (re-subscribes cleanly when transitioning back online).
   useEffect(() => {
     if (!isCloudEnabled || !currentUser?.uid) {
       const guestPinned = getGuestPinnedIds();
@@ -233,7 +380,23 @@ export default function ChatPage() {
       return undefined;
     }
 
-    setChatsLoading(true);
+    if (isOffline) {
+      const cached = getCachedUserChats(currentUser.uid);
+      setUserChats(cached);
+      setChatsLoading(false);
+      return undefined;
+    }
+
+    // Reconcile any pending offline chats when mounting online
+    void syncOfflineUserChatsToFirestore(currentUser.uid);
+
+    const cachedInitial = getCachedUserChats(currentUser.uid);
+    if (cachedInitial.length > 0) {
+      setUserChats(cachedInitial);
+      setChatsLoading(false);
+    } else {
+      setChatsLoading(true);
+    }
 
     const unsubscribe = subscribeToUserChats(
       currentUser.uid,
@@ -243,15 +406,17 @@ export default function ChatPage() {
       },
       (error) => {
         console.warn('Firestore subscription error:', error);
-        setPersistenceError(
-          'Unable to sync conversation list from Cloud Firestore.'
-        );
+        if (isBrowserOnline()) {
+          setPersistenceError(
+            'Unable to sync conversation list from Cloud Firestore.'
+          );
+        }
         setChatsLoading(false);
       }
     );
 
     return () => unsubscribe();
-  }, [isCloudEnabled, currentUser?.uid]);
+  }, [isCloudEnabled, currentUser?.uid, isOffline]);
 
   // 2. Restore conversation messages safely.
   useEffect(() => {
@@ -361,9 +526,11 @@ export default function ChatPage() {
             error
           );
 
-          setPersistenceError(
-            'Failed to load conversation history from Cloud Firestore.'
-          );
+          if (isBrowserOnline()) {
+            setPersistenceError(
+              'Failed to load conversation history from Cloud Firestore.'
+            );
+          }
         })
         .finally(() => {
           if (
@@ -470,6 +637,11 @@ export default function ChatPage() {
           chatId,
           sanitized
         );
+        setUserChats((previous) =>
+          previous.map((chat) =>
+            chat.id === chatId ? { ...chat, title: sanitized } : chat
+          )
+        );
       } else {
         setUserChats((previous) => {
           const next = previous.map((chat) =>
@@ -493,6 +665,9 @@ export default function ChatPage() {
     try {
       if (isCloudEnabled && currentUser?.uid) {
         await deleteConversation(currentUser.uid, chatId);
+        setUserChats((previous) =>
+          previous.filter((chat) => chat.id !== chatId)
+        );
       } else {
         setUserChats((previous) => {
           const next = previous.filter(
@@ -551,6 +726,17 @@ export default function ChatPage() {
           currentUser.uid,
           chatId,
           willPin
+        );
+        setUserChats((previous) =>
+          previous.map((chat) =>
+            chat.id === chatId
+              ? {
+                  ...chat,
+                  isPinned: willPin,
+                  pinnedAt: willPin ? Date.now() : null
+                }
+              : chat
+          )
         );
       } catch (error) {
         console.error('Failed to toggle pin in Firestore:', error);
@@ -643,14 +829,23 @@ export default function ChatPage() {
           chatId,
           normalizedMessage
         );
+        // Keep sidebar conversation list updated immediately while offline
+        if (!isBrowserOnline()) {
+          const cached = getCachedUserChats(currentUser.uid);
+          if (cached.length > 0) {
+            setUserChats(cached);
+          }
+        }
       } catch (error) {
         // Allow a future retry if this write failed.
         persistedMessageIdsRef.current.delete(message.id);
 
         console.warn('Firestore write warning:', error);
-        setPersistenceError(
-          'Notice: Could not save message to Cloud Firestore. Kept in memory.'
-        );
+        if (isBrowserOnline()) {
+          setPersistenceError(
+            'Notice: Could not save message to Cloud Firestore. Saved locally on this device.'
+          );
+        }
       }
 
       return;
@@ -722,7 +917,9 @@ export default function ChatPage() {
 
     let targetText = '';
     let displayedText = '';
-    let activeModel = overrideModel || null;
+    const effectiveModelOverride =
+      overrideModel || (providerToUse === 'webllm' ? webllmModelId : null);
+    let activeModel = effectiveModelOverride;
     let finalProvider = providerToUse;
     let isStreamDone = false;
     let timerId = null;
@@ -776,10 +973,7 @@ export default function ChatPage() {
               responseTimeMs: typeof finalResponseTime === 'number' ? finalResponseTime : normalized.responseTimeMs,
               isStreaming: false,
               isStopped: Boolean(isStopped),
-              referencedAttachments:
-                currentAttachments && currentAttachments.length > 0
-                  ? currentAttachments
-                  : normalized.referencedAttachments
+              referencedAttachments: undefined
             });
             completedMessage = finalized;
             return finalized;
@@ -801,10 +995,7 @@ export default function ChatPage() {
           isStreaming: false,
           isStopped: Boolean(isStopped),
           responseTimeMs: typeof finalResponseTime === 'number' ? finalResponseTime : undefined,
-          referencedAttachments:
-            currentAttachments && currentAttachments.length > 0
-              ? currentAttachments
-              : undefined
+          referencedAttachments: undefined
         });
       }
 
@@ -869,10 +1060,7 @@ export default function ChatPage() {
               modelUsed: activeModel || message.modelUsed,
               provider: finalProvider || message.provider,
               isStreaming: true,
-              referencedAttachments:
-                currentAttachments && currentAttachments.length > 0
-                  ? currentAttachments
-                  : message.referencedAttachments
+              referencedAttachments: undefined
             });
           })
         );
@@ -916,7 +1104,7 @@ export default function ChatPage() {
     try {
       const result = await streamAIMessage({
         provider: providerToUse,
-        model: overrideModel || null,
+        model: effectiveModelOverride,
         mode: activeMode,
         prompt: promptText,
         history: historyContext,
@@ -946,10 +1134,7 @@ export default function ChatPage() {
                 return updateActiveAlternativeInMessage(normalized, {
                   modelUsed: activeModel,
                   provider: finalProvider,
-                  referencedAttachments:
-                    currentAttachments && currentAttachments.length > 0
-                      ? currentAttachments
-                      : message.referencedAttachments
+                  referencedAttachments: undefined
                 });
               })
             );
@@ -1023,10 +1208,7 @@ export default function ChatPage() {
           provider: finalProvider || providerToUse,
           isStreaming: false,
           responseTimeMs: measuredResponseTimeMs,
-          referencedAttachments:
-            currentAttachments && currentAttachments.length > 0
-              ? currentAttachments
-              : undefined
+          referencedAttachments: undefined
         });
 
         if (targetChatId) {
@@ -1095,10 +1277,7 @@ export default function ChatPage() {
                 provider: finalProvider || providerToUse,
                 isStreaming: false,
                 isStopped: true,
-                referencedAttachments:
-                  currentAttachments && currentAttachments.length > 0
-                    ? currentAttachments
-                    : undefined
+                referencedAttachments: undefined
               });
               stoppedMessage = finalized;
               return finalized;
@@ -1147,6 +1326,8 @@ export default function ChatPage() {
         (effectiveProvider ? effectiveProvider.charAt(0).toUpperCase() + effectiveProvider.slice(1) : 'AI Provider');
 
       const isOllama = effectiveProvider === 'ollama';
+      const isWebLLM = effectiveProvider === 'webllm';
+      const isLocalProvider = isOllama || isWebLLM;
       const isGemini = effectiveProvider === 'gemini';
 
       const is503 =
@@ -1186,6 +1367,11 @@ export default function ChatPage() {
         } else {
           friendlyMsg = `An error occurred with Local AI (Ollama). Please make sure Ollama is running locally and model 'qwen2.5:1.5b' is installed.`;
         }
+      } else if (isWebLLM) {
+        // Browser AI (WebLLM) errors are local device/WebGPU/cache messages — preserve them verbatim without cloud demand rewrites.
+        friendlyMsg =
+          rawMsg ||
+          'Browser AI (WebLLM) encountered a local initialization or generation error on this device.';
       } else if (is503) {
         if (isGemini) {
           friendlyMsg =
@@ -1233,11 +1419,8 @@ export default function ChatPage() {
               isInterrupted,
               failedPrompt: promptText,
               failedProvider: effectiveProvider || finalProvider || providerToUse,
-              canSwitchProvider: true,
-              referencedAttachments:
-                currentAttachments && currentAttachments.length > 0
-                  ? currentAttachments
-                  : normalized.referencedAttachments
+              canSwitchProvider: error?.canFallback === false ? false : !isLocalProvider,
+              referencedAttachments: undefined
             });
             finalizedErrorMessage = updated;
             return updated;
@@ -1273,11 +1456,8 @@ export default function ChatPage() {
           isInterrupted,
           failedPrompt: promptText,
           failedProvider: effectiveProvider || finalProvider || providerToUse,
-          canSwitchProvider: true,
-          referencedAttachments:
-            currentAttachments && currentAttachments.length > 0
-              ? currentAttachments
-              : normalized.referencedAttachments
+          canSwitchProvider: error?.canFallback === false ? false : !isLocalProvider,
+          referencedAttachments: undefined
         });
 
         await persistMessageSafe(targetChatId, updated, true);
@@ -1344,6 +1524,8 @@ export default function ChatPage() {
           if (activeChatIdRef.current) {
             formData.append('conversationId', activeChatIdRef.current);
           }
+          formData.append('provider', selectedProvider || DEFAULT_PROVIDER);
+          formData.append('offline', String(!isBrowserOnline()));
           filesToUpload.forEach((att) => {
             formData.append('files', att.file, att.name);
           });
@@ -1450,7 +1632,15 @@ export default function ChatPage() {
               userMsg = 'Attachment upload was cancelled or timed out. Please try again.';
             }
           } else if (userMsg.toLowerCase().includes('failed to fetch') || userMsg.toLowerCase().includes('networkerror')) {
-            userMsg = 'Network error while connecting to upload server. Please verify your internet connection.';
+            if (selectedProvider === 'webllm') {
+              userMsg = !isBrowserOnline()
+                ? 'Offline file and image text extraction is not available in Browser AI while offline. Connect to the internet to process new attachments, or remove the attachment to chat offline with Browser AI.'
+                : 'Could not reach the attachment extraction service (/api/upload). Remove the attachment to chat locally with Browser AI, or check your connection and try again.';
+            } else {
+              userMsg = !isBrowserOnline() || selectedProvider === 'ollama'
+                ? 'Could not reach the local Orvix backend server (/api/upload). Please verify the local server is running.'
+                : 'Network error while connecting to upload server. Please verify the server is running and check your connection.';
+            }
           }
 
           setPersistenceError(
@@ -1495,20 +1685,27 @@ export default function ChatPage() {
               titleSnippet,
               activeMode
             );
-
-            // Prevent the history effect from replacing the new chat's
-            // messages with an empty database result.
             skipNextChatLoadRef.current = currentChatId;
+            // Ensure offline-created conversations appear immediately in the sidebar
+            const cachedList = getCachedUserChats(currentUser.uid);
+            if (cachedList.length > 0) {
+              setUserChats(cachedList);
+            }
           } catch (error) {
-            console.warn('Could not create Firestore chat doc:', error);
-
-            setPersistenceError(
-              'Failed to initialize conversation in Cloud Firestore.'
-            );
-
-            setIsLoading(false);
-            isSubmittingRef.current = false;
-            return false;
+            console.warn('Could not create Firestore chat doc, falling back to local conversation:', error);
+            currentChatId = `local-${Date.now()}`;
+            skipNextChatLoadRef.current = currentChatId;
+            const fallbackChat = {
+              id: currentChatId,
+              title: titleSnippet,
+              mode: activeMode || 'general',
+              timestamp: 'Just now',
+              rawUpdatedAt: Date.now(),
+              isPinned: false,
+              pinnedAt: null,
+              pendingSync: true
+            };
+            setUserChats((previous) => [fallbackChat, ...previous]);
           }
         } else {
           currentChatId = `guest-${Date.now()}`;
@@ -1616,10 +1813,7 @@ export default function ChatPage() {
           content: '',
           isStreaming: true,
           requestStartTime,
-          referencedAttachments:
-            activeAttachments && activeAttachments.length > 0
-              ? activeAttachments
-              : undefined
+          referencedAttachments: undefined
         },
         userMessage
       );
@@ -1726,10 +1920,7 @@ export default function ChatPage() {
       content: '',
       isStreaming: true,
       requestStartTime,
-      referencedAttachments:
-        retryAttachments && retryAttachments.length > 0
-          ? retryAttachments
-          : undefined
+      referencedAttachments: undefined
     };
 
     setMessages([
@@ -1818,10 +2009,7 @@ export default function ChatPage() {
       content: '',
       isStreaming: true,
       requestStartTime,
-      referencedAttachments:
-        switchAttachments && switchAttachments.length > 0
-          ? switchAttachments
-          : undefined
+      referencedAttachments: undefined
     };
 
     setMessages([
@@ -1941,10 +2129,7 @@ export default function ChatPage() {
           isStreaming: true,
           isError: false,
           isStopped: false,
-          referencedAttachments:
-            precedingAttachments.length > 0
-              ? precedingAttachments
-              : m.referencedAttachments
+          referencedAttachments: undefined
         });
         return {
           ...updated,
@@ -2000,6 +2185,8 @@ export default function ChatPage() {
       ? targetProvider.model
       : (chosenProvider === 'ollama'
           ? 'qwen2.5:1.5b'
+          : chosenProvider === 'webllm'
+          ? webllmModelId
           : chosenProvider === 'groq'
           ? 'openai/gpt-oss-120b'
           : chosenProvider === 'openrouter'
@@ -2046,7 +2233,7 @@ export default function ChatPage() {
         hour: '2-digit',
         minute: '2-digit'
       }),
-      referencedAttachments: precedingAttachments
+      referencedAttachments: undefined
     });
 
     setMessages((previous) =>
@@ -2102,6 +2289,15 @@ export default function ChatPage() {
   const handleStopGenerating = () => {
     stopSpeech();
     isUserStoppedRef.current = true;
+
+    if (
+      selectedProvider === 'webllm' ||
+      webllmState.status === 'generating' ||
+      webllmState.status === 'downloading' ||
+      webllmState.status === 'loading'
+    ) {
+      stopWebLLMGeneration();
+    }
 
     if (activeAbortControllerRef.current) {
       try {
@@ -2159,14 +2355,29 @@ export default function ChatPage() {
       const titleSnippet = generateChatTitle(trimmed);
       if (isCloudEnabled && currentUser?.uid) {
         try {
-          currentChatId = await createChatDocument(currentUser.uid, titleSnippet);
+          currentChatId = await createChatDocument(currentUser.uid, titleSnippet, activeMode);
           skipNextChatLoadRef.current = currentChatId;
+          const cachedList = getCachedUserChats(currentUser.uid);
+          if (cachedList.length > 0) {
+            setUserChats(cachedList);
+          }
         } catch (error) {
-          console.warn('Could not create Firestore chat doc for edit:', error);
-          setPersistenceError('Failed to initialize conversation in Cloud Firestore.');
-          setIsLoading(false);
-          isSubmittingRef.current = false;
-          return;
+          console.warn('Could not create Firestore chat doc for edit, using local fallback:', error);
+          currentChatId = `local-${Date.now()}`;
+          skipNextChatLoadRef.current = currentChatId;
+          setUserChats((previous) => [
+            {
+              id: currentChatId,
+              title: titleSnippet,
+              mode: activeMode || 'general',
+              timestamp: 'Just now',
+              rawUpdatedAt: Date.now(),
+              isPinned: false,
+              pinnedAt: null,
+              pendingSync: true
+            },
+            ...previous
+          ]);
         }
       } else {
         currentChatId = `guest-${Date.now()}`;
@@ -2235,10 +2446,7 @@ export default function ChatPage() {
         content: '',
         isStreaming: true,
         requestStartTime,
-        referencedAttachments:
-          updatedUserMessage.attachments && updatedUserMessage.attachments.length > 0
-            ? updatedUserMessage.attachments
-            : undefined
+        referencedAttachments: undefined
       },
       updatedUserMessage
     );
@@ -2257,6 +2465,12 @@ export default function ChatPage() {
         deleteChatMessages(currentUser.uid, currentChatId, laterMessageIds).catch((err) => {
           console.warn('Could not delete truncated messages from Cloud Firestore:', err);
         });
+      } else {
+        saveCachedChatMessages(
+          currentUser.uid,
+          currentChatId,
+          [...earlierMessages, updatedUserMessage]
+        );
       }
       void persistMessageSafe(currentChatId, updatedUserMessage);
     } else {
@@ -2366,6 +2580,7 @@ export default function ChatPage() {
       activeTitle={activeTitle}
       chatsLoading={chatsLoading}
       isCloudSynced={isCloudEnabled}
+      isOffline={isOffline}
       selectedProvider={selectedProvider}
       onSelectProvider={handleSelectProvider}
       activeMode={activeMode}
@@ -2374,6 +2589,58 @@ export default function ChatPage() {
       onExportText={handleExportText}
       hasExportableMessages={hasExportableMessages}
     >
+      {isOffline && !offlineBannerDismissed && (
+        <div
+          className="offline-status-banner"
+          role="status"
+          aria-live="polite"
+        >
+          <WifiOff
+            size={15}
+            className="offline-status-icon"
+          />
+
+          <span className="persistence-alert-text">
+            {selectedProvider === 'ollama'
+              ? isCloudEnabled
+                ? 'Offline mode — Local AI (Ollama) is ready. Messages are saved locally and will sync to Cloud Firestore when internet reconnects.'
+                : 'Offline mode — Local AI (Ollama) and local conversation history are active.'
+              : selectedProvider === 'webllm'
+              ? webllmState.status === 'ready' || webllmState.isCached
+                ? 'Offline mode — Browser AI (WebLLM) is cached on this device. Messages are saved locally.'
+                : 'Offline mode — Browser AI (WebLLM) runs offline only if the model was previously downloaded and cached in this browser.'
+              : 'You are offline — Cloud AI providers require internet. Switch to Browser AI (WebLLM) or Local AI (Ollama) to chat locally.'}
+          </span>
+
+          {selectedProvider !== 'ollama' && selectedProvider !== 'webllm' && (
+            <div className="offline-switch-actions">
+              <button
+                type="button"
+                className="offline-switch-btn"
+                onClick={() => handleSelectProvider('webllm')}
+              >
+                Switch to Browser AI
+              </button>
+              <button
+                type="button"
+                className="offline-switch-btn"
+                onClick={() => handleSelectProvider('ollama')}
+              >
+                Switch to Ollama
+              </button>
+            </div>
+          )}
+
+          <button
+            type="button"
+            className="persistence-alert-close"
+            onClick={() => setOfflineBannerDismissed(true)}
+            aria-label="Dismiss offline status banner"
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
       {exportNotice && (
         <div
           className={`persistence-alert-banner export-status-banner ${exportNotice.type}`}
@@ -2460,6 +2727,14 @@ export default function ChatPage() {
         onSelectMode={handleSelectMode}
         modeChangeNotice={modeChangeNotice}
         onDismissModeNotice={() => setModeChangeNotice(null)}
+        isOffline={isOffline}
+        webllmState={webllmState}
+        webllmGpuCheck={webllmGpuCheck}
+        webllmModelId={webllmModelId}
+        onSelectWebLLMModel={handleSelectWebLLMModel}
+        onLoadWebLLMModel={handleLoadWebLLMModel}
+        onCancelWebLLMLoad={handleCancelWebLLMLoad}
+        onUnloadWebLLMModel={handleUnloadWebLLMModel}
       />
     </Layout>
   );
