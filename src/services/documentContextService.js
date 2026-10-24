@@ -901,6 +901,15 @@ export const PROVIDER_PROFILES = {
     supportsSystemInstruction: true,
     messageFormat: 'cloudflare',
     notes: 'Serverless Llama 3.1 8B inference with 8k token context window'
+  },
+  ollama: {
+    id: 'ollama',
+    name: 'Local AI (Ollama)',
+    modelTag: 'qwen2.5:1.5b',
+    maxDocChars: 16_000,
+    supportsSystemInstruction: true,
+    messageFormat: 'openai',
+    notes: 'Local offline Ollama instance with Qwen 2.5 1.5B'
   }
 };
 

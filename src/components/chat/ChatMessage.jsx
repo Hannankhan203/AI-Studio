@@ -38,6 +38,7 @@ import { PROVIDER_OPTIONS } from '../../services/aiRouter.js';
 import { formatResponseTime, formatLiveElapsed } from '../../utils/formatResponseTime.js';
 export { formatLiveElapsed };
 import { getAlternativeMetrics, getActiveAlternative } from '../../services/alternativeResponseService.js';
+import { copyFormattedMessage } from '../../utils/clipboardFormatter.js';
 
 /**
  * Recursively extracts plain text from React nodes or arrays of tokens
@@ -56,8 +57,17 @@ function extractNodeText(node) {
  */
 function getErrorTitle(content = '') {
   const text = String(content || '').toLowerCase();
+  if (text.includes('ollama') && (text.includes('not found') || text.includes('pull'))) {
+    return 'Local Model Not Found';
+  }
+  if (text.includes('ollama') || text.includes('11434')) {
+    return 'Local AI Unavailable';
+  }
   if (text.includes('rate limit') || text.includes('quota') || text.includes('429') || text.includes('resource_exhausted')) {
     return 'Rate Limit or Quota Exceeded';
+  }
+  if (text.includes('not found') || text.includes('does not exist') || text.includes('decommissioned') || text.includes('retired')) {
+    return 'Model Unavailable';
   }
   if (text.includes('high demand') || text.includes('503') || text.includes('spikes in demand') || text.includes('overloaded') || text.includes('unavailable')) {
     return 'Service Temporarily Busy';
@@ -685,8 +695,8 @@ export default function ChatMessage({
     if (!message?.content) return;
 
     try {
-      if (navigator?.clipboard?.writeText) {
-        await navigator.clipboard.writeText(message.content);
+      const success = await copyFormattedMessage(message.content);
+      if (success) {
         setCopied(true);
         setCopyFeedback('Copied');
         setTimeout(() => {
@@ -695,34 +705,8 @@ export default function ChatMessage({
         }, 2000);
         return;
       }
-      throw new Error('Clipboard API unavailable');
+      throw new Error('All clipboard writing strategies failed');
     } catch (err) {
-      // Graceful fallback for restricted contexts (e.g. iframes / permissions)
-      try {
-        const textarea = document.createElement('textarea');
-        textarea.value = message.content;
-        textarea.style.position = 'fixed';
-        textarea.style.left = '-9999px';
-        textarea.style.top = '0';
-        document.body.appendChild(textarea);
-        textarea.focus();
-        textarea.select();
-        const success = document.execCommand('copy');
-        document.body.removeChild(textarea);
-
-        if (success) {
-          setCopied(true);
-          setCopyFeedback('Copied');
-          setTimeout(() => {
-            setCopied(false);
-            setCopyFeedback('Copy');
-          }, 2000);
-          return;
-        }
-      } catch (fallbackErr) {
-        console.warn('Fallback copy failed:', fallbackErr);
-      }
-
       console.warn('Clipboard write failed:', err);
       setCopyFeedback('Failed to copy');
       setTimeout(() => setCopyFeedback('Copy'), 2500);
@@ -1110,7 +1094,7 @@ export default function ChatMessage({
               )
             ) : (
               <>
-                {/* Copy Response Button (copies raw content, never rendered HTML) */}
+                {/* Copy Response Button (copies dual-format rich HTML and structured plain text) */}
                 {hasContent && (
                   <Button
                     variant="ghost"

@@ -21,8 +21,33 @@ import WelcomeScreen from './WelcomeScreen.jsx';
 import MessageList from './MessageList.jsx';
 import Button from '../ui/Button.jsx';
 import { useVoiceDictation, combineComposerText } from '../../hooks/useVoiceDictation.js';
-import { sendAIMessage } from '../../services/aiRouter.js';
+import { sendAIMessage, PROVIDER_OPTIONS } from '../../services/aiRouter.js';
 import { responseHasContinuationNotice } from '../../services/multiPartResponseService.js';
+import { polishSpokenTranscript } from '../../utils/speechTextCleaner.js';
+
+function getProviderFootnote(providerId) {
+  if (providerId === 'ollama') {
+    return 'Orvix is powered by Local AI (Ollama) (qwen2.5:1.5b). Local offline inference — verify important facts independently.';
+  }
+  if (providerId === 'groq') {
+    return 'Orvix is powered by Groq (GPT OSS 120B). Ultra-fast inference — verify important facts independently.';
+  }
+  if (providerId === 'openrouter') {
+    return 'Orvix is powered by OpenRouter (Llama 3.3 70B Free). Multi-model gateway — verify important facts independently.';
+  }
+  if (providerId === 'cloudflare') {
+    return 'Orvix is powered by Cloudflare Workers AI (Llama 3.1 8B). Serverless inference — verify important facts independently.';
+  }
+  if (providerId === 'gemini') {
+    return 'Orvix is powered by Google Gemini (Gemini 3.8 Flash). Client integration — verify important facts independently.';
+  }
+  const config = Array.isArray(PROVIDER_OPTIONS) ? PROVIDER_OPTIONS.find((p) => p.id === providerId) : null;
+  if (config) {
+    const model = config.defaultModel || config.modelTag || 'AI Model';
+    return `Orvix is powered by ${config.name} (${model}). ${config.description || 'Inference'} — verify important facts independently.`;
+  }
+  return 'Orvix is powered by Google Gemini (Gemini 3.8 Flash). Client integration — verify important facts independently.';
+}
 
 // Whitelist of supported image extensions
 const SUPPORTED_IMAGE_EXTENSIONS = new Set([
@@ -757,6 +782,7 @@ export default function ChatArea({
 
   const handleCancelListening = () => {
     cancelListening();
+    setSuggestedRefinement(null);
     requestAnimationFrame(() => {
       if (textareaRef.current) {
         textareaRef.current.focus();
@@ -994,7 +1020,10 @@ export default function ChatArea({
     setIsCleaningTranscript(true);
 
     try {
-      const cleanPrompt = `You are a specialized, context-aware speech-to-text transcript polisher for AI conversation and programming.
+      let polished = '';
+
+      try {
+        const cleanPrompt = `You are a specialized, context-aware speech-to-text transcript polisher for AI conversation and programming.
 
 TASK:
 Improve punctuation, capitalization, and phonetic speech recognition glitches in the provided spoken transcript while strictly preserving the speaker's original intent, task, and meaning.
@@ -1025,27 +1054,46 @@ Return ONLY the polished transcript text with no explanations, no introductory p
 Transcript:
 "${lastSessionTranscript}"`;
 
-      const res = await sendAIMessage({
-        provider: selectedProvider || 'gemini',
-        prompt: cleanPrompt,
-        history: [],
-        username: null
-      });
+        const res = await sendAIMessage({
+          provider: selectedProvider || 'gemini',
+          prompt: cleanPrompt,
+          history: [],
+          username: null
+        });
 
-      if (res && res.text) {
-        let polished = res.text.trim();
-        // Strip markdown code fences if present
-        if (polished.startsWith('```')) {
-          polished = polished.replace(/^```[a-zA-Z0-9_-]*\n?/i, '').replace(/\n?```$/i, '').trim();
-        }
-        // Strip common AI conversational prefixes if any leaked
-        polished = polished.replace(/^(?:here(?:'s| is) (?:the )?(?:polished|refined|corrected) transcript:?\s*)/i, '').trim();
-        // Strip wrapping quotes
-        polished = polished.replace(/^["'«»“](.*)["'«»”]$/s, '$1').trim();
+        if (res && res.text) {
+          let text = res.text.trim();
+          // Strip markdown code fences if present
+          if (text.startsWith('```')) {
+            text = text.replace(/^```[a-zA-Z0-9_-]*\n?/i, '').replace(/\n?```$/i, '').trim();
+          }
+          // Strip common AI conversational prefixes if any leaked
+          text = text.replace(/^(?:here(?:'s| is) (?:the )?(?:polished|refined|corrected) transcript:?\s*)/i, '').trim();
+          // Strip wrapping quotes
+          text = text.replace(/^["'«»“](.*)["'«»”]$/s, '$1').trim();
 
-        if (polished) {
-          setSuggestedRefinement(polished);
+          // Reject if the response is an unintended code block or simulated chatbot response
+          if (
+            text &&
+            !text.includes('function handleUserMessage') &&
+            !text.includes('**[Simulated Response') &&
+            !text.includes('export function solveProblem') &&
+            !text.includes('Clean implementation')
+          ) {
+            polished = text;
+          }
         }
+      } catch (networkErr) {
+        console.warn('Network transcript refinement failed, falling back to local polisher:', networkErr);
+      }
+
+      // If remote AI returned empty, failed, or was rejected, apply deterministic contextual polisher
+      if (!polished) {
+        polished = polishSpokenTranscript(lastSessionTranscript, inputValue);
+      }
+
+      if (polished) {
+        setSuggestedRefinement(polished);
       }
     } catch (err) {
       console.warn('Transcript refinement failed:', err);
@@ -1805,13 +1853,7 @@ Transcript:
           </form>
 
           <p className="composer-footnote">
-            {selectedProvider === 'groq'
-              ? 'Orvix is powered by Groq (GPT OSS 120B). Ultra-fast inference — verify important facts independently.'
-              : selectedProvider === 'openrouter'
-              ? 'Orvix is powered by OpenRouter (Llama 3.3 70B Free). Multi-model gateway — verify important facts independently.'
-              : selectedProvider === 'cloudflare'
-              ? 'Orvix is powered by Cloudflare Workers AI (Llama 3.1 8B). Serverless inference — verify important facts independently.'
-              : 'Orvix is powered by Google Gemini (Gemini 3.1 Flash Lite). Client integration — verify important facts independently.'}
+            {getProviderFootnote(selectedProvider)}
             {engineMode === 'direct-audio'
               ? ' • Dictation powered by direct audio capture with Whisper Large v3 server transcription.'
               : ' • Dictation combines live browser speech with Whisper Large v3 refinement via server API.'}
