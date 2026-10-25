@@ -253,3 +253,19 @@ export async function closeDatabase(): Promise<void> {
     }
   }
 }
+
+/**
+ * TEST HOOK: Sets an in-memory mock Db instance for isolated unit tests
+ * when testing environments do not have a live MongoDB Atlas connection string.
+ */
+export function setMockDatabaseForTesting(mockDb: any | null): void {
+  if (mockDb) {
+    state.db = mockDb;
+    state.isConnected = true;
+    state.lastError = null;
+  } else {
+    state.db = null;
+    state.isConnected = false;
+  }
+}
+

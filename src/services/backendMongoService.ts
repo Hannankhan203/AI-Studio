@@ -1,25 +1,31 @@
 /**
- * Orvix Express Backend MongoDB Service Layer (Phase 2, Step 4)
+ * Orvix Express Backend MongoDB Service Layer (Phase 3, Step 2)
  *
  * Integrates MongoDB repositories into the Express backend safely:
  * - Provides verified server-side data access helpers
  * - Validates input parameters strictly
- * - Respects the Phase 3 Authentication Boundary: does NOT trust client-supplied
- *   `userId` without cryptographic identity verification.
+ * - Strictly enforces Phase 3 Authentication & Ownership Boundaries:
+ *   Derives identity exclusively from verified Firebase ID token (req.user.uid)
+ *   and blocks unauthorized cross-user reads, mutations, or spoofing.
  */
 
 import { getDatabase, isMongoConfigured, getMongoStatus } from '../db/mongodb.ts';
 import {
   initializeRepositoryIndexes,
   findUserById,
+  findConversationById,
   findConversationsByUserId,
+  findMessageById,
   findMessagesByConversationId,
+  countPinnedConversations,
   getUserSettings,
   UserDocument,
   ConversationDocument,
   MessageDocument,
   UserSettingsDocument
 } from '../repositories/index.ts';
+
+export const MAX_PINNED_CONVERSATIONS = 5;
 
 export interface RepositoryReadiness {
   users: boolean;
@@ -36,7 +42,7 @@ export interface BackendMongoSummary {
   collections: RepositoryReadiness;
   authBoundary: {
     status: 'enforced';
-    phase: 'Phase 2 Step 4 Complete; Phase 3 Authentication Pending';
+    phase: string;
     message: string;
   };
 }
@@ -94,6 +100,79 @@ export function validateConversationId(conversationId?: string | null): { valid:
 }
 
 /**
+ * Validates a username string against Orvix application constraints.
+ */
+export function validateUsername(username?: string | null): { valid: boolean; error?: string; cleanUsername?: string } {
+  if (!username || typeof username !== 'string') {
+    return { valid: false, error: 'Username is required and must be a string.' };
+  }
+  const clean = username.trim();
+  if (clean.length < 2 || clean.length > 30) {
+    return { valid: false, error: 'Username must be between 2 and 30 characters.' };
+  }
+  if (!/^[a-zA-Z0-9_\-\. ]+$/.test(clean)) {
+    return { valid: false, error: 'Username contains invalid characters.' };
+  }
+  return { valid: true, cleanUsername: clean };
+}
+
+/**
+ * Verifies that a conversation exists and belongs to the authenticated user.
+ * Guarantees zero data leakage across users.
+ */
+export async function verifyConversationOwnership(
+  conversationId: string,
+  userId: string
+): Promise<{ conversation: ConversationDocument | null; isOwner: boolean; notFound: boolean }> {
+  if (!conversationId || !userId) {
+    return { conversation: null, isOwner: false, notFound: true };
+  }
+  const conv = await findConversationById(conversationId);
+  if (!conv) {
+    return { conversation: null, isOwner: false, notFound: true };
+  }
+  const isOwner = conv.userId === userId;
+  return { conversation: isOwner ? conv : null, isOwner, notFound: false };
+}
+
+/**
+ * Verifies that a message exists and its parent conversation belongs to the authenticated user.
+ */
+export async function verifyMessageOwnership(
+  messageId: string,
+  userId: string
+): Promise<{ message: MessageDocument | null; conversation: ConversationDocument | null; isOwner: boolean; notFound: boolean }> {
+  if (!messageId || !userId) {
+    return { message: null, conversation: null, isOwner: false, notFound: true };
+  }
+  const msg = await findMessageById(messageId);
+  if (!msg) {
+    return { message: null, conversation: null, isOwner: false, notFound: true };
+  }
+  const convOwnership = await verifyConversationOwnership(msg.conversationId, userId);
+  if (convOwnership.notFound || !convOwnership.isOwner) {
+    return { message: null, conversation: null, isOwner: false, notFound: convOwnership.notFound };
+  }
+  return { message: msg, conversation: convOwnership.conversation, isOwner: true, notFound: false };
+}
+
+/**
+ * Safely checks if a user can pin a conversation without exceeding the 5-pin maximum.
+ * If conversationId is provided and already pinned, returns true (idempotent).
+ */
+export async function canPinConversation(userId: string, conversationId?: string): Promise<boolean> {
+  if (!userId) return false;
+  if (conversationId) {
+    const existing = await findConversationById(conversationId);
+    if (existing && existing.isPinned) {
+      return true;
+    }
+  }
+  const currentCount = await countPinnedConversations(userId);
+  return currentCount < MAX_PINNED_CONVERSATIONS;
+}
+
+/**
  * Returns a high-level summary of backend MongoDB integration status.
  */
 export async function getBackendMongoSummary(): Promise<BackendMongoSummary> {
@@ -111,9 +190,9 @@ export async function getBackendMongoSummary(): Promise<BackendMongoSummary> {
     },
     authBoundary: {
       status: 'enforced',
-      phase: 'Phase 2 Step 4 Complete; Phase 3 Authentication Pending',
+      phase: 'Phase 3 Step 2 Complete: Authenticated MongoDB CRUD API Active',
       message:
-        'Client-supplied userIds are untrusted. Public user-data CRUD endpoints are gated until Phase 3 implements cryptographic server-side authentication (e.g. Firebase Admin ID token verification).'
+        'Cryptographic server-side identity verification via Firebase ID tokens is enforced for all MongoDB user-data endpoints.'
     }
   };
 }

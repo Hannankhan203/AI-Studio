@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
@@ -50,6 +51,20 @@ import {
   validateUserId,
   validateConversationId
 } from './src/services/backendMongoService.ts';
+import {
+  initializeFirebaseAdmin,
+  isFirebaseAdminConfigured
+} from './src/services/firebaseAdminService.ts';
+import {
+  requireAuth,
+  optionalAuth,
+  type AuthenticatedUser
+} from './src/middleware/authMiddleware.ts';
+import { mongoApiRouter } from './src/routes/mongoApiRoutes.ts';
+
+// Safe server-side Firebase Admin initialization (non-blocking)
+initializeFirebaseAdmin();
+
 
 
 
@@ -1027,7 +1042,8 @@ app.get(['/api/config', '/config'], (_req, res) => {
     whisperConfigured: Boolean(groqKey && groqKey !== 'YOUR_GROQ_API_KEY') || Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY'),
     whisperProvider: Boolean(groqKey && groqKey !== 'YOUR_GROQ_API_KEY') ? 'groq' : (Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY') ? 'gemini' : null),
     mongodbConfigured: isMongoConfigured(),
-    mongodbDatabase: getDatabaseName()
+    mongodbDatabase: getDatabaseName(),
+    firebaseAdminConfigured: isFirebaseAdminConfigured()
   });
 });
 
@@ -1052,33 +1068,27 @@ app.get(['/api/db/summary', '/api/mongodb/summary'], async (_req, res) => {
   res.json(summary);
 });
 
-// User-Data Protection Boundary (Phase 2 Step 4 -> Phase 3 Boundary)
-// Client-supplied userIds cannot be trusted without cryptographic verification.
-// Public unauthenticated requests to read/modify user-scoped documents are blocked
-// until Phase 3 implements server-side token authentication.
-app.all(
-  [
-    '/api/users',
-    '/api/users/:userId',
-    '/api/conversations',
-    '/api/conversations/:id',
-    '/api/messages',
-    '/api/messages/:id',
-    '/api/user-settings',
-    '/api/user-settings/:userId'
-  ],
-  (req, res) => {
-    res.status(501).json({
-      error: 'Direct user-data access via client-supplied ID is disabled to prevent unauthorized data access.',
-      message:
-        'Cryptographic server-side identity verification will be introduced in Phase 3. Existing client Firestore operations remain active.',
-      phase: 'Phase 2 Step 4: Express Backend Integration',
-      code: 'AUTH_PENDING_PHASE_3',
-      endpoint: req.originalUrl,
-      method: req.method
-    });
-  }
-);
+// Authenticated MongoDB User-Data API Router (Phase 3 Step 2)
+// Derives user identity exclusively from cryptographically verified req.user.uid
+// Enforces ownership checks on every user, conversation, message, and settings operation
+app.use('/api', mongoApiRouter);
+
+
+// Dedicated Firebase Auth Token Verification Check (Phase 3 Step 1)
+// Verifies Bearer ID token cryptographically and returns authenticated user identity
+app.get('/api/auth/verify', requireAuth, (req, res) => {
+  res.json({
+    status: 'authenticated',
+    message: 'Firebase ID token verified successfully.',
+    user: {
+      uid: req.user?.uid,
+      email: req.user?.email,
+      emailVerified: req.user?.emailVerified,
+      name: req.user?.name
+    }
+  });
+});
+
 
 /* ==========================================================================
    Controlled Temporary File Upload & Storage Management Architecture
@@ -4978,6 +4988,24 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
   }
 });
 
+// Database offline route-level fallback error middleware
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (
+    err?.name === 'MongooseError' ||
+    err?.name === 'MongoNetworkError' ||
+    err?.name === 'MongoServerSelectionError' ||
+    err?.message?.includes('buffering timed out') ||
+    err?.message?.includes('MongoDB is not connected')
+  ) {
+    console.warn('[AI Studio] Database offline — returning mock empty response');
+    if (req.method === 'GET') {
+      return res.json(req.path.endsWith('s') || req.path.endsWith('s/') ? [] : {});
+    }
+    return res.status(503).json({ error: 'Service temporarily unavailable (database offline)' });
+  }
+  next(err);
+});
+
 // Setup Vite middleware in dev or static serving in production
 async function startServer() {
   const publicPath = path.resolve(__dirname, 'public');
@@ -5037,4 +5065,4 @@ if (!process.env.VERCEL && !process.env.TESTING) {
   startServer();
 }
 
-export { app };
+export { app, requireAuth, optionalAuth };

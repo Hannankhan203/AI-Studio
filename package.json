@@ -14,6 +14,10 @@
     "test:mongo": "tsx scripts/testMongoConnection.ts",
     "test:repositories": "tsx scripts/testMongoRepositories.ts",
     "test:backend": "TESTING=true tsx scripts/testBackendIntegration.ts",
+    "test:auth": "TESTING=true tsx scripts/testFirebaseAuth.ts",
+    "test:admin-creds": "TESTING=true tsx scripts/testFirebaseAdminCredentials.ts",
+    "test:mongo-api": "TESTING=true tsx scripts/testAuthenticatedMongoApi.ts",
+    "test:profile": "TESTING=true tsx scripts/testUserProfileMigration.ts",
     "test": "npm run lint && node scripts/auditOfflineReliability.js"
   },
   "dependencies": {
@@ -24,6 +28,7 @@
     "dotenv": "^17.4.2",
     "express": "^4.22.3",
     "firebase": "11.4.0",
+    "firebase-admin": "^14.5.0",
     "jszip": "^3.10.2",
     "lucide-react": "^0.546.0",
     "mammoth": "^1.13.0",

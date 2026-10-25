@@ -132,18 +132,20 @@ async function run() {
   assert('Status endpoint returns collection readiness metadata', typeof statusRes.data?.readiness === 'object');
 
   // ---------------------------------------------------------------------------
-  // 3. User Data Boundary Protection (IDOR Prevention)
+  // 3. User Data Boundary Protection (IDOR Prevention & requireAuth Enforcement)
   // ---------------------------------------------------------------------------
   console.log('\n--- [3/4] Testing User-Data Protection Boundary ---');
   const unauthUsers = await simulateRequest('GET', '/api/users/target-victim-id');
-  assert('GET /api/users/:id returns HTTP 501', unauthUsers.status === 501);
-  assert('Response specifies AUTH_PENDING_PHASE_3', unauthUsers.data?.code === 'AUTH_PENDING_PHASE_3');
+  assert('GET /api/users/:id without token returns HTTP 401', unauthUsers.status === 401);
+  assert('Response specifies AUTH_TOKEN_MISSING', unauthUsers.data?.code === 'AUTH_TOKEN_MISSING');
 
   const unauthChats = await simulateRequest('GET', '/api/conversations/target-victim-chat');
-  assert('GET /api/conversations/:id returns HTTP 501', unauthChats.status === 501);
+  assert('GET /api/conversations/:id without token returns HTTP 401', unauthChats.status === 401);
+  assert('Response specifies AUTH_TOKEN_MISSING', unauthChats.data?.code === 'AUTH_TOKEN_MISSING');
 
   const unauthSettings = await simulateRequest('POST', '/api/user-settings/target-victim-id', { theme: 'light' });
-  assert('POST /api/user-settings/:id returns HTTP 501', unauthSettings.status === 501);
+  assert('POST /api/user-settings/:id without token returns HTTP 401', unauthSettings.status === 401);
+  assert('Response specifies AUTH_TOKEN_MISSING', unauthSettings.data?.code === 'AUTH_TOKEN_MISSING');
 
   // ---------------------------------------------------------------------------
   // 4. Existing Routes Integrity
