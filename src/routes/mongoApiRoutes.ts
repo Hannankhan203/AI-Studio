@@ -53,8 +53,16 @@ import {
 
 const router = Router();
 
-// Apply requireAuth to all endpoints on this router
-router.use(requireAuth);
+export const MONGO_USER_DATA_PREFIXES = [
+  '/users',
+  '/conversations',
+  '/messages',
+  '/user-settings'
+];
+
+// Apply requireAuth strictly to MongoDB user-data prefixes so unrelated /api/* routes
+// (e.g. /api/chat, /api/upload, /api/transcribe) mounted after mongoApiRouter pass through cleanly.
+router.use(MONGO_USER_DATA_PREFIXES, requireAuth);
 
 /* ==========================================================================
    1. USER PROFILE ENDPOINTS
@@ -216,6 +224,13 @@ router.post('/conversations', async (req: Request, res: Response) => {
 
     res.status(201).json({ conversation });
   } catch (err: any) {
+    if (err?.code === 'CONVERSATION_ID_CONFLICT') {
+      res.status(409).json({
+        error: 'Conversation ID already belongs to another user.',
+        code: 'CONVERSATION_ID_CONFLICT'
+      });
+      return;
+    }
     console.error('[API /conversations] Error creating conversation:', err?.message || err);
     res.status(500).json({ error: 'Failed to create conversation.', code: 'INTERNAL_ERROR' });
   }
@@ -449,6 +464,16 @@ router.post('/messages', async (req: Request, res: Response) => {
     return;
   }
 
+  if (id !== undefined && id !== null) {
+    if (typeof id !== 'string' || !id.trim() || id.trim().length > 128) {
+      res.status(400).json({
+        error: 'Message ID must be a non-empty string up to 128 characters.',
+        code: 'INVALID_MESSAGE_ID'
+      });
+      return;
+    }
+  }
+
   try {
     const check = await verifyConversationOwnership(conversationId, authUid);
     if (check.notFound) {
@@ -463,8 +488,10 @@ router.post('/messages', async (req: Request, res: Response) => {
       return;
     }
 
+    const { _id: _ignoredMongoId, userId: _ignoredUserId, ...safeBody } = req.body || {};
+
     const message = await createMessage({
-      ...req.body,
+      ...safeBody,
       id: typeof id === 'string' && id.trim() ? id.trim() : undefined,
       conversationId: check.conversation!._id,
       userId: authUid, // Strict ownership derivation
@@ -477,6 +504,13 @@ router.post('/messages', async (req: Request, res: Response) => {
 
     res.status(201).json({ message });
   } catch (err: any) {
+    if (err?.code === 'MESSAGE_ID_CONFLICT') {
+      res.status(409).json({
+        error: 'Conflict: Message ID already exists in another conversation.',
+        code: 'MESSAGE_ID_CONFLICT'
+      });
+      return;
+    }
     console.error('[API /messages] Error creating message:', err?.message || err);
     res.status(500).json({ error: 'Failed to create message.', code: 'INTERNAL_ERROR' });
   }
@@ -489,7 +523,20 @@ router.post('/messages', async (req: Request, res: Response) => {
 router.delete('/messages', async (req: Request, res: Response) => {
   const authUid = req.user!.uid;
   const convId = (req.query.conversationId as string) || req.body?.conversationId;
-  const messageIds = req.body?.messageIds;
+  let messageIds: string[] = [];
+
+  if (Array.isArray(req.body?.messageIds)) {
+    messageIds = req.body.messageIds;
+  } else if (typeof req.query.messageIds === 'string' && req.query.messageIds.trim()) {
+    messageIds = req.query.messageIds
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  } else if (Array.isArray(req.query.messageIds)) {
+    messageIds = (req.query.messageIds as string[])
+      .map((s) => String(s).trim())
+      .filter(Boolean);
+  }
 
   if (!convId || !Array.isArray(messageIds) || messageIds.length === 0) {
     res.status(400).json({

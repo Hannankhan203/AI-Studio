@@ -73,7 +73,7 @@ async function simulateRequest(
       query,
       params: {},
       setTimeout: () => {},
-      socket: { setTimeout: () => {} },
+      socket: { setTimeout: () => {}, setNoDelay: () => {}, setKeepAlive: () => {} },
       on: () => req,
       emit: () => true,
       listeners: () => []
@@ -109,7 +109,7 @@ async function simulateRequest(
         resolve({ status: statusCode, data: responseBody, headers: resHeaders });
       },
       setTimeout: () => {},
-      socket: { setTimeout: () => {} },
+      socket: { setTimeout: () => {}, setNoDelay: () => {}, setKeepAlive: () => {} },
       on: () => res,
       emit: () => true,
       listeners: () => []
@@ -630,6 +630,19 @@ async function run() {
 
     const verify = await simulateRequest('GET', '/api/auth/verify', authAlice);
     assert('GET /api/auth/verify verifies token and returns user context', verify.status === 200 && verify.data?.user?.uid === 'user-alice-111');
+
+    // Non-MongoDB /api/* routes mounted after mongoApiRouter must NOT be intercepted by requireAuth
+    const unauthChatValidation = await simulateRequest('POST', '/api/chat', {}, {});
+    assert(
+      'POST /api/chat without Bearer token reaches chat handler (HTTP 400 validation, not 401 AUTH_TOKEN_MISSING)',
+      unauthChatValidation.status === 400 && unauthChatValidation.data?.code !== 'AUTH_TOKEN_MISSING'
+    );
+
+    const unauthUploadConfig = await simulateRequest('GET', '/api/upload/config');
+    assert(
+      'GET /api/upload/config without Bearer token returns HTTP 200 (not intercepted by requireAuth)',
+      unauthUploadConfig.status === 200 && unauthUploadConfig.data?.maxFileSizeBytes > 0
+    );
 
     // Clean up test mocks
     resetFirebaseAdminForTesting();

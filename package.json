@@ -20,6 +20,11 @@
     "test:profile": "TESTING=true tsx scripts/testUserProfileMigration.ts",
     "test:settings": "TESTING=true tsx scripts/testUserSettingsMigration.ts",
     "test:conversation": "TESTING=true tsx scripts/testConversationMigration.ts",
+    "test:messages": "TESTING=true tsx scripts/testMessageMigration.ts",
+    "test:ai-regression": "TESTING=true tsx scripts/testAiProviderAuthRegression.ts",
+    "test:stop-lifecycle": "TESTING=true tsx scripts/testStopResponseLifecycle.ts",
+    "test:sidebar-a11y": "TESTING=true tsx scripts/testSidebarAccessibility.ts",
+    "test:legacy-discovery": "TESTING=true tsx scripts/testLegacyConversationDiscovery.ts",
     "test": "npm run lint && node scripts/auditOfflineReliability.js"
   },
   "dependencies": {

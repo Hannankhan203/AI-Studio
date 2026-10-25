@@ -165,7 +165,7 @@ const PORT = Number(portFromArg) || Number(process.env.PORT) || 3000;
 // Permissive CORS middleware for cross-origin and Vercel preview environments
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, X-Title');
   if (req.method === 'OPTIONS') {
     return res.sendStatus(204);
@@ -2247,7 +2247,7 @@ Spoken transcript:
                 setTimeout(() => reject(new Error('Refine timeout')), 6000)
               );
               const genPromise = ai.models.generateContent({
-                model: 'gemini-2.5-flash',
+                model: 'gemini-3.8-flash',
                 contents: [{ role: 'user', parts: [{ text: refinePrompt }] }]
               });
               const geminiRes = await Promise.race([genPromise, timeoutPromise]);
@@ -2436,7 +2436,7 @@ ${isoLang ? `The spoken language is: ${isoLang}.` : ''}
 Output ONLY the transcription text. Do not summarize, do not translate, do not add introductory commentary or timestamps.`;
 
         const geminiRes = await ai.models.generateContent({
-          model: 'gemini-2.5-flash',
+          model: 'gemini-3.5-transcribe',
           contents: [
             {
               role: 'user',
@@ -2459,7 +2459,7 @@ Output ONLY the transcription text. Do not summarize, do not translate, do not a
           text,
           language: isoLang || 'en',
           duration: 0,
-          model: 'gemini-2.5-flash',
+          model: 'gemini-3.5-transcribe',
           provider: 'gemini',
           highAccuracy: true
         });
@@ -2467,7 +2467,7 @@ Output ONLY the transcription text. Do not summarize, do not translate, do not a
         logAIDiagnostic({
           category: 'provider API error',
           provider: 'gemini',
-          model: 'gemini-2.5-flash',
+          model: 'gemini-3.5-transcribe',
           phase: 'dispatch',
           sanitizedMessage: geminiErr?.message || 'Gemini audio transcription failed'
         });

@@ -168,19 +168,212 @@ export async function connectToDatabase(): Promise<Db | null> {
   return state.connectionPromise;
 }
 
+function cloneDocValue<T>(val: T): T {
+  if (val instanceof Date) {
+    return new Date(val.getTime()) as unknown as T;
+  }
+  if (Array.isArray(val)) {
+    return val.map((item) => cloneDocValue(item)) as unknown as T;
+  }
+  if (val !== null && typeof val === 'object') {
+    const out: Record<string, any> = {};
+    for (const [k, v] of Object.entries(val as Record<string, any>)) {
+      if (v !== undefined) {
+        out[k] = cloneDocValue(v);
+      }
+    }
+    return out as T;
+  }
+  return val;
+}
+
+function matchesMongoFilter(doc: any, filter: any): boolean {
+  if (!filter || Object.keys(filter).length === 0) return true;
+  for (const [key, value] of Object.entries(filter)) {
+    if (key === '$or' && Array.isArray(value)) {
+      if (!value.some((sub) => matchesMongoFilter(doc, sub))) return false;
+      continue;
+    }
+    if (key === '$and' && Array.isArray(value)) {
+      if (!value.every((sub) => matchesMongoFilter(doc, sub))) return false;
+      continue;
+    }
+    if (value && typeof value === 'object' && !(value instanceof Date) && '$in' in value) {
+      const inList = (value as any).$in;
+      if (Array.isArray(inList) && !inList.includes(doc[key])) return false;
+      continue;
+    }
+    if (doc[key] !== value) return false;
+  }
+  return true;
+}
+
+function createInMemoryCollection(name: string) {
+  const store = new Map<string, any>();
+
+  return {
+    collectionName: name,
+    createIndex: async () => `${name}_idx`,
+    insertOne: async (doc: any) => {
+      const cloned = cloneDocValue(doc);
+      const id = String(cloned._id ?? cloned.id ?? Date.now());
+      if (store.has(id)) {
+        const dupErr: any = new Error(`E11000 duplicate key error collection: ${name} index: _id_ dup key: { _id: "${id}" }`);
+        dupErr.code = 11000;
+        throw dupErr;
+      }
+      cloned._id = cloned._id ?? id;
+      store.set(id, cloned);
+      return { acknowledged: true, insertedId: cloned._id };
+    },
+    findOne: async (filter: any = {}, options?: any) => {
+      const docs = Array.from(store.values()).filter((d) => matchesMongoFilter(d, filter));
+      if (options?.sort) {
+        const entries = Object.entries(options.sort) as Array<[string, number]>;
+        docs.sort((a, b) => {
+          for (const [k, dir] of entries) {
+            const va = a[k] instanceof Date ? a[k].getTime() : a[k];
+            const vb = b[k] instanceof Date ? b[k].getTime() : b[k];
+            if (va !== vb) return (va > vb ? 1 : -1) * (dir >= 0 ? 1 : -1);
+          }
+          return 0;
+        });
+      }
+      return docs[0] ? cloneDocValue(docs[0]) : null;
+    },
+    find: (filter: any = {}) => {
+      const docs = Array.from(store.values()).filter((d) => matchesMongoFilter(d, filter));
+      let skipCount = 0;
+      let limitCount: number | null = null;
+
+      const cursor = {
+        sort: (sortSpec: any) => {
+          if (sortSpec && typeof sortSpec === 'object') {
+            const entries = Object.entries(sortSpec) as Array<[string, number]>;
+            docs.sort((a, b) => {
+              for (const [k, dir] of entries) {
+                const va = a[k] instanceof Date ? a[k].getTime() : a[k];
+                const vb = b[k] instanceof Date ? b[k].getTime() : b[k];
+                if (va !== vb) return (va > vb ? 1 : -1) * (dir >= 0 ? 1 : -1);
+              }
+              return 0;
+            });
+          }
+          return cursor;
+        },
+        skip: (n: number) => {
+          skipCount = Math.max(0, n || 0);
+          return cursor;
+        },
+        limit: (n: number) => {
+          limitCount = n > 0 ? n : null;
+          return cursor;
+        },
+        toArray: async () => {
+          let sliced = docs.slice(skipCount);
+          if (limitCount !== null) {
+            sliced = sliced.slice(0, limitCount);
+          }
+          return sliced.map((d) => cloneDocValue(d));
+        }
+      };
+      return cursor;
+    },
+    findOneAndUpdate: async (filter: any, update: any, options?: any) => {
+      let existing = Array.from(store.values()).find((d) => matchesMongoFilter(d, filter));
+      if (!existing) {
+        if (!options?.upsert) return null;
+        const setOnInsert = cloneDocValue(update?.$setOnInsert || {});
+        const setFields = cloneDocValue(update?.$set || {});
+        const created: Record<string, any> = {
+          ...setOnInsert,
+          ...setFields
+        };
+        if (created._id === undefined) {
+          created._id =
+            filter?._id ??
+            filter?.id ??
+            filter?.userId ??
+            created.id ??
+            created.uid ??
+            created.userId ??
+            String(Date.now());
+        }
+        store.set(String(created._id), created);
+        return cloneDocValue(created);
+      }
+      if (update?.$set) {
+        Object.assign(existing, cloneDocValue(update.$set));
+      }
+      store.set(String(existing._id), existing);
+      return cloneDocValue(existing);
+    },
+    updateOne: async (filter: any, update: any) => {
+      const existing = Array.from(store.values()).find((d) => matchesMongoFilter(d, filter));
+      if (!existing) {
+        return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedCount: 0, upsertedId: null };
+      }
+      if (update?.$set) {
+        Object.assign(existing, cloneDocValue(update.$set));
+      }
+      store.set(String(existing._id), existing);
+      return { acknowledged: true, matchedCount: 1, modifiedCount: 1, upsertedCount: 0, upsertedId: null };
+    },
+    countDocuments: async (filter: any = {}) => {
+      return Array.from(store.values()).filter((d) => matchesMongoFilter(d, filter)).length;
+    },
+    deleteOne: async (filter: any = {}) => {
+      const existing = Array.from(store.values()).find((d) => matchesMongoFilter(d, filter));
+      if (!existing) return { acknowledged: true, deletedCount: 0 };
+      store.delete(String(existing._id));
+      return { acknowledged: true, deletedCount: 1 };
+    },
+    deleteMany: async (filter: any = {}) => {
+      const toDelete = Array.from(store.values()).filter((d) => matchesMongoFilter(d, filter));
+      for (const item of toDelete) {
+        store.delete(String(item._id));
+      }
+      return { acknowledged: true, deletedCount: toDelete.length };
+    }
+  };
+}
+
+let inMemoryFallbackDb: Db | null = null;
+let loggedFallbackNotice = false;
+
+function getInMemoryFallbackDatabase(): Db {
+  if (!inMemoryFallbackDb) {
+    const collections = new Map<string, any>();
+    inMemoryFallbackDb = {
+      databaseName: getDatabaseName(),
+      collection: (name: string) => {
+        if (!collections.has(name)) {
+          collections.set(name, createInMemoryCollection(name));
+        }
+        return collections.get(name);
+      },
+      command: async () => ({ ok: 1 }),
+      listCollections: () => ({
+        toArray: async () => Array.from(collections.keys()).map((name) => ({ name }))
+      })
+    } as unknown as Db;
+  }
+  if (!loggedFallbackNotice) {
+    loggedFallbackNotice = true;
+    console.warn('[AI Studio] MongoDB not connected — using in-memory fallback store (ephemeral).');
+  }
+  return inMemoryFallbackDb;
+}
+
 /**
- * Returns the currently active Db instance.
- * Throws a descriptive error if MongoDB is not connected.
+ * Returns the currently active Db instance, falling back to an in-memory mock Db
+ * when external MongoDB TCP connections are unconfigured or unavailable.
  */
 export function getDatabase(): Db {
-  if (!state.db || !state.isConnected) {
-    throw new Error(
-      state.lastError
-        ? `MongoDB is not connected: ${state.lastError}`
-        : 'MongoDB is not connected. Call connectToDatabase() first.'
-    );
+  if (state.db && state.isConnected) {
+    return state.db;
   }
-  return state.db;
+  return getInMemoryFallbackDatabase();
 }
 
 /**

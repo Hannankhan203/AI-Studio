@@ -85,6 +85,9 @@ export async function createConversation(input: CreateConversationInput): Promis
       if (existing.userId === input.userId.trim()) {
         return existing;
       }
+      const conflictErr: any = new Error('Conversation ID already belongs to a different user.');
+      conflictErr.code = 'CONVERSATION_ID_CONFLICT';
+      throw conflictErr;
     }
   }
 

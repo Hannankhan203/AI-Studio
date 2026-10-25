@@ -23,24 +23,17 @@
 import {
   collection,
   doc,
-  getDoc,
-  setDoc,
-  updateDoc,
   deleteDoc,
   getDocs,
   query,
-  where,
   orderBy,
-  onSnapshot,
-  serverTimestamp,
   writeBatch
 } from 'firebase/firestore';
 import {
   auth,
   db,
   isFirebaseConfigured,
-  isBrowserOnline,
-  syncFirestoreNetworkState
+  isBrowserOnline
 } from '../config/firebaseConfig.js';
 import { getIdToken } from './authService.js';
 import {
@@ -53,13 +46,56 @@ const activeSyncPromises = new Map();
 const activeSubscriptions = new Map();
 
 let customTokenProvider = null;
+let customLegacyFirestoreLoader = null;
+let customLegacyFirestoreChatsLoader = null;
+let customLegacyFirestoreDeleteHandler = null;
+let customFirestoreOpTimeoutMs = null;
+
+function getFirestoreTimeoutMs() {
+  return customFirestoreOpTimeoutMs || FIRESTORE_OP_TIMEOUT_MS;
+}
 
 /**
  * Testing hook allowing unit and integration tests to supply mocked Firebase ID tokens.
- * @param {(() => Promise<string|null>)|null} provider
+ * @param {((forceRefresh?: boolean) => Promise<string|null>)|null} provider
  */
 export function setAuthTokenProviderForTesting(provider) {
   customTokenProvider = provider;
+}
+
+/**
+ * Testing hook allowing unit and integration tests to simulate read-only legacy Firestore message loading.
+ * @param {((userId: string, chatId: string) => Promise<Array>)|null} loader
+ */
+export function setLegacyFirestoreMessagesLoaderForTesting(loader) {
+  customLegacyFirestoreLoader = loader;
+}
+
+/**
+ * Testing hook allowing unit and integration tests to simulate read-only legacy Firestore conversation discovery.
+ * @param {((userId: string) => Promise<Array>)|null} loader
+ */
+export function setLegacyFirestoreChatsLoaderForTesting(loader) {
+  customLegacyFirestoreChatsLoader = loader;
+}
+
+/**
+ * Testing hook allowing unit and integration tests to observe/simulate Firestore cleanup during deleteConversation.
+ * @param {((userId: string, chatId: string) => Promise<void>|void)|null} handler
+ */
+export function setLegacyFirestoreDeleteHandlerForTesting(handler) {
+  customLegacyFirestoreDeleteHandler = handler;
+}
+
+/**
+ * Testing hook allowing tests to override the bounded Firestore timeout duration.
+ * @param {number|null} timeoutMs
+ */
+export function setFirestoreTimeoutMsForTesting(timeoutMs) {
+  customFirestoreOpTimeoutMs =
+    typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? timeoutMs
+      : null;
 }
 
 /**
@@ -69,7 +105,7 @@ export function setAuthTokenProviderForTesting(provider) {
  */
 export async function resolveAuthToken(forceRefresh = false) {
   if (customTokenProvider) {
-    return customTokenProvider();
+    return customTokenProvider(forceRefresh);
   }
   try {
     if (typeof getIdToken === 'function') {
@@ -83,6 +119,42 @@ export async function resolveAuthToken(forceRefresh = false) {
     console.warn('Could not resolve Firebase ID token:', err?.message || err);
   }
   return null;
+}
+
+/**
+ * Performs an authenticated fetch against the Express/MongoDB API using Bearer ID token,
+ * retrying once with a force-refreshed token if the server responds with 401.
+ * @param {string} endpointPath
+ * @param {RequestInit} [options]
+ * @returns {Promise<{ res: Response | null, token: string | null }>}
+ */
+async function authorizedApiFetch(endpointPath, options = {}) {
+  let token = await resolveAuthToken(false);
+  if (!token) {
+    return { res: null, token: null };
+  }
+
+  const endpoint = getApiEndpoint(endpointPath);
+  const execute = (bearerToken) =>
+    fetch(endpoint, {
+      ...options,
+      headers: {
+        ...(options.headers || {}),
+        'Authorization': `Bearer ${bearerToken}`,
+        'Accept': 'application/json'
+      }
+    });
+
+  let res = await execute(token);
+  if (res.status === 401) {
+    const refreshed = await resolveAuthToken(true);
+    if (refreshed && refreshed !== token) {
+      token = refreshed;
+      res = await execute(token);
+    }
+  }
+
+  return { res, token };
 }
 
 /**
@@ -115,6 +187,75 @@ export function mapMongoConversationToChat(conv) {
     rawUpdatedAt: updatedMs,
     isPinned: Boolean(conv.isPinned),
     pinnedAt: pinnedMs
+  };
+}
+
+function parseLegacyTimestampMs(val) {
+  if (val === null || val === undefined) return null;
+  if (typeof val === 'number') {
+    return Number.isFinite(val) ? val : null;
+  }
+  if (typeof val?.toMillis === 'function') {
+    const ms = val.toMillis();
+    return Number.isFinite(ms) ? ms : null;
+  }
+  if (typeof val?.seconds === 'number') {
+    const ns = typeof val.nanoseconds === 'number' ? val.nanoseconds : 0;
+    return val.seconds * 1000 + Math.floor(ns / 1e6);
+  }
+  if (val instanceof Date) {
+    const ms = val.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+  if (typeof val === 'string' && val.trim()) {
+    const ms = new Date(val).getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+  return null;
+}
+
+/**
+ * Maps a legacy Cloud Firestore conversation document (`users/{uid}/chats/{chatId}`)
+ * to the frontend conversation UI model using existing Orvix defaults.
+ *
+ * @param {string} docId
+ * @param {any} [data]
+ * @returns {any}
+ */
+export function mapLegacyFirestoreConversationToChat(docId, data = {}) {
+  const resolvedId = String(docId || data?.id || '').trim();
+  if (!resolvedId) return null;
+
+  const createdMs =
+    parseLegacyTimestampMs(data?.createdAt) ??
+    parseLegacyTimestampMs(data?.createdAtMs);
+  const updatedMs =
+    parseLegacyTimestampMs(data?.updatedAt) ??
+    parseLegacyTimestampMs(data?.rawUpdatedAt) ??
+    createdMs ??
+    0;
+  const isPinned = Boolean(data?.isPinned);
+  const pinnedMs = isPinned ? parseLegacyTimestampMs(data?.pinnedAt) : null;
+  const cleanTitle =
+    typeof data?.title === 'string' && data.title.trim()
+      ? data.title.trim()
+      : 'Untitled Chat';
+  const cleanMode =
+    typeof data?.mode === 'string' && data.mode.trim()
+      ? data.mode.trim().toLowerCase()
+      : 'general';
+
+  return {
+    id: resolvedId,
+    title: cleanTitle,
+    mode: cleanMode,
+    timestamp: formatChatDateLabel(updatedMs),
+    rawUpdatedAt: updatedMs,
+    ...(createdMs !== null ? { createdAtMs: createdMs } : {}),
+    isPinned,
+    pinnedAt: pinnedMs,
+    storageSource: 'legacy-firestore',
+    hasLegacyFirestore: true
   };
 }
 
@@ -156,6 +297,14 @@ function getUserMessagesCacheKey(userId, chatId) {
 
 function getUserDeletedChatsKey(userId) {
   return `orvix_user_deleted_chats_${userId}`;
+}
+
+function getUserDeletedMessagesKey(userId, chatId) {
+  return `orvix_user_deleted_messages_${userId}_${chatId}`;
+}
+
+function getUserPendingDeletedMessagesKey(userId) {
+  return `orvix_user_pending_deleted_msgs_${userId}`;
 }
 
 function formatChatDateLabel(ms) {
@@ -288,6 +437,83 @@ function savePendingDeletedChatIds(userId, ids) {
   } catch (_) {}
 }
 
+function getDeletedMessageTombstones(userId, chatId) {
+  if (!userId || !chatId || typeof window === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(getUserDeletedMessagesKey(userId, chatId));
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function saveDeletedMessageTombstones(userId, chatId, ids) {
+  if (!userId || !chatId || typeof window === 'undefined') return;
+  try {
+    const unique = Array.from(new Set((ids || []).filter(Boolean)));
+    if (unique.length === 0) {
+      localStorage.removeItem(getUserDeletedMessagesKey(userId, chatId));
+    } else {
+      localStorage.setItem(getUserDeletedMessagesKey(userId, chatId), JSON.stringify(unique));
+    }
+  } catch (_) {}
+}
+
+function getPendingDeletedMessagesMap(userId) {
+  if (!userId || typeof window === 'undefined') return {};
+  try {
+    const raw = localStorage.getItem(getUserPendingDeletedMessagesKey(userId));
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function savePendingDeletedMessagesMap(userId, mapObj) {
+  if (!userId || typeof window === 'undefined') return;
+  try {
+    const cleaned = {};
+    for (const [cid, arr] of Object.entries(mapObj || {})) {
+      if (Array.isArray(arr) && arr.length > 0) {
+        cleaned[cid] = Array.from(new Set(arr.filter(Boolean)));
+      }
+    }
+    if (Object.keys(cleaned).length === 0) {
+      localStorage.removeItem(getUserPendingDeletedMessagesKey(userId));
+    } else {
+      localStorage.setItem(getUserPendingDeletedMessagesKey(userId), JSON.stringify(cleaned));
+    }
+  } catch (_) {}
+}
+
+function addPendingDeletedMessages(userId, chatId, messageIds) {
+  if (!userId || !chatId || !Array.isArray(messageIds) || messageIds.length === 0) return;
+  const current = getPendingDeletedMessagesMap(userId);
+  const existing = Array.isArray(current[chatId]) ? current[chatId] : [];
+  current[chatId] = Array.from(new Set([...existing, ...messageIds]));
+  savePendingDeletedMessagesMap(userId, current);
+}
+
+function removePendingDeletedMessages(userId, chatId, messageIds = null) {
+  if (!userId || !chatId) return;
+  const current = getPendingDeletedMessagesMap(userId);
+  if (!current[chatId]) return;
+  if (messageIds === null) {
+    delete current[chatId];
+  } else {
+    const removeSet = new Set(messageIds);
+    const remaining = current[chatId].filter((id) => !removeSet.has(id));
+    if (remaining.length === 0) {
+      delete current[chatId];
+    } else {
+      current[chatId] = remaining;
+    }
+  }
+  savePendingDeletedMessagesMap(userId, current);
+}
+
 function upsertCachedUserChat(userId, chatPatch) {
   if (!userId || !chatPatch?.id) return [];
   const existing = getCachedUserChats(userId);
@@ -317,7 +543,10 @@ function upsertCachedChatMessage(userId, chatId, messageObj) {
 }
 
 function serializeAttachmentForStorage(att) {
+  if (!att || typeof att !== 'object') return att;
+  const { file, base64, dataUrl, previewUrl, ...rest } = att;
   return {
+    ...rest,
     id: att.id,
     name: att.name || att.originalName || 'document',
     originalName: att.originalName || att.name || 'document',
@@ -327,22 +556,20 @@ function serializeAttachmentForStorage(att) {
     extension: att.extension || '',
     isImage: Boolean(att.isImage),
     status: att.status || 'uploaded',
-    extraction: att.extraction || null
+    extraction: att.extraction ?? null
   };
 }
 
-function buildFirestoreMessagePayload(targetMessage) {
-  return {
-    id: targetMessage.id,
-    sender: targetMessage.sender,
-    content: targetMessage.content,
-    modelUsed: targetMessage.modelUsed || null,
-    provider: targetMessage.provider || null,
-    responseTimeMs: typeof targetMessage.responseTimeMs === 'number' ? targetMessage.responseTimeMs : null,
-    parentMessageId: targetMessage.parentMessageId || null,
-    activeAlternativeId: targetMessage.activeAlternativeId || null,
-    alternatives: Array.isArray(targetMessage.alternatives)
-      ? targetMessage.alternatives.map((alt) => ({
+function sanitizeMessageForStorage(targetMessage, clientTimestamp, createdAtMs, flags = {}) {
+  const sanitizedAlternatives = Array.isArray(targetMessage.alternatives)
+    ? targetMessage.alternatives.map((alt) => {
+        const {
+          isStreaming: _ignoreAltStreaming,
+          requestStartTime: _ignoreAltStart,
+          ...cleanAlt
+        } = alt || {};
+        return {
+          ...cleanAlt,
           id: alt.id,
           parentMessageId: alt.parentMessageId || targetMessage.parentMessageId || null,
           sender: 'assistant',
@@ -351,25 +578,181 @@ function buildFirestoreMessagePayload(targetMessage) {
           modelUsed: alt.modelUsed || null,
           responseTimeMs: typeof alt.responseTimeMs === 'number' ? alt.responseTimeMs : null,
           timestamp: alt.timestamp || '',
-          createdAt: typeof alt.createdAt === 'number' ? alt.createdAt : Date.now(),
+          createdAt: typeof alt.createdAt === 'number' ? alt.createdAt : createdAtMs,
           referencedAttachments: Array.isArray(alt.referencedAttachments)
             ? alt.referencedAttachments.map(serializeAttachmentForStorage)
             : [],
           isError: Boolean(alt.isError),
           isStopped: Boolean(alt.isStopped)
-        }))
-      : [],
+        };
+      })
+    : [];
+
+  const {
+    isStreaming: _ignoreStreaming,
+    requestStartTime: _ignoreRequestStart,
+    ...cleanTarget
+  } = targetMessage || {};
+
+  return {
+    ...cleanTarget,
+    id: targetMessage.id,
+    sender: targetMessage.sender,
+    content: typeof targetMessage.content === 'string' ? targetMessage.content : '',
+    modelUsed: targetMessage.modelUsed || null,
+    provider: targetMessage.provider || null,
+    mode: targetMessage.mode || undefined,
+    responseTimeMs: typeof targetMessage.responseTimeMs === 'number' ? targetMessage.responseTimeMs : null,
+    parentMessageId: targetMessage.parentMessageId || null,
+    activeAlternativeId: targetMessage.activeAlternativeId || null,
+    alternatives: sanitizedAlternatives,
     attachments: Array.isArray(targetMessage.attachments)
       ? targetMessage.attachments.map(serializeAttachmentForStorage)
       : [],
     referencedAttachments: Array.isArray(targetMessage.referencedAttachments)
       ? targetMessage.referencedAttachments.map(serializeAttachmentForStorage)
       : [],
-    createdAt: serverTimestamp(),
-    clientTimestamp:
-      targetMessage.timestamp ||
-      new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    isStreaming: false,
+    isStopped: Boolean(targetMessage.isStopped),
+    isInterrupted: Boolean(targetMessage.isInterrupted),
+    timestamp: clientTimestamp,
+    createdAtMs,
+    pendingSync: Boolean(flags.pendingSync),
+    syncedToMongo: Boolean(flags.syncedToMongo)
   };
+}
+
+function buildMongoMessagePayload(chatId, record) {
+  return {
+    id: record.id,
+    conversationId: chatId,
+    sender: record.sender,
+    content: typeof record.content === 'string' ? record.content : '',
+    modelUsed: record.modelUsed || null,
+    provider: record.provider || null,
+    mode: record.mode || null,
+    responseTimeMs: typeof record.responseTimeMs === 'number' ? record.responseTimeMs : null,
+    parentMessageId: record.parentMessageId || null,
+    activeAlternativeId: record.activeAlternativeId || null,
+    alternatives: Array.isArray(record.alternatives) ? record.alternatives : [],
+    attachments: Array.isArray(record.attachments) ? record.attachments : [],
+    referencedAttachments: Array.isArray(record.referencedAttachments) ? record.referencedAttachments : [],
+    isStopped: Boolean(record.isStopped),
+    isInterrupted: Boolean(record.isInterrupted),
+    clientTimestamp: record.timestamp || '',
+    createdAtMs: typeof record.createdAtMs === 'number' ? record.createdAtMs : Date.now()
+  };
+}
+
+/**
+ * Maps a MongoDB message document to the frontend message UI model.
+ * @param {any} docItem
+ * @returns {any}
+ */
+export function mapMongoMessageToUiMessage(docItem) {
+  if (!docItem) return null;
+  const parsedCreatedMs = docItem.createdAt ? new Date(docItem.createdAt).getTime() : NaN;
+  const createdAtMs = Number.isFinite(parsedCreatedMs)
+    ? parsedCreatedMs
+    : typeof docItem.createdAtMs === 'number'
+      ? docItem.createdAtMs
+      : undefined;
+  const fallbackTimeLabel = Number.isFinite(parsedCreatedMs)
+    ? new Date(parsedCreatedMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : '';
+
+  const mapped = {
+    id: docItem.id || docItem._id,
+    sender: docItem.sender,
+    content: typeof docItem.content === 'string' ? docItem.content : '',
+    modelUsed: docItem.modelUsed || null,
+    provider: docItem.provider || null,
+    mode: docItem.mode || undefined,
+    responseTimeMs: typeof docItem.responseTimeMs === 'number' ? docItem.responseTimeMs : null,
+    parentMessageId: docItem.parentMessageId || null,
+    activeAlternativeId: docItem.activeAlternativeId || null,
+    alternatives: Array.isArray(docItem.alternatives) ? docItem.alternatives : [],
+    attachments: Array.isArray(docItem.attachments) ? docItem.attachments : [],
+    referencedAttachments: Array.isArray(docItem.referencedAttachments) ? docItem.referencedAttachments : [],
+    isStreaming: false,
+    isStopped: Boolean(docItem.isStopped),
+    isInterrupted: Boolean(docItem.isInterrupted),
+    createdAtMs,
+    timestamp: docItem.clientTimestamp || fallbackTimeLabel,
+    pendingSync: false,
+    syncedToMongo: true
+  };
+
+  return mapped.sender === 'assistant' ? normalizeAssistantMessage(mapped) : mapped;
+}
+
+/**
+ * Deterministically sorts messages in chronological order (oldest -> newest)
+ * with tie-breaking by parentMessageId link, user-before-assistant role, and original index.
+ * @param {Array} messages
+ * @returns {Array}
+ */
+function sortMessagesChronologically(messages) {
+  if (!Array.isArray(messages) || messages.length <= 1) return messages || [];
+  const indexed = messages.map((msg, idx) => ({ msg, idx }));
+  indexed.sort((a, b) => {
+    const aTime =
+      typeof a.msg?.createdAtMs === 'number' && Number.isFinite(a.msg.createdAtMs)
+        ? a.msg.createdAtMs
+        : null;
+    const bTime =
+      typeof b.msg?.createdAtMs === 'number' && Number.isFinite(b.msg.createdAtMs)
+        ? b.msg.createdAtMs
+        : null;
+
+    if (aTime !== null && bTime !== null && aTime !== bTime) {
+      return aTime - bTime;
+    }
+    if (a.msg?.parentMessageId && a.msg.parentMessageId === b.msg?.id) return 1;
+    if (b.msg?.parentMessageId && b.msg.parentMessageId === a.msg?.id) return -1;
+    if (aTime !== null && bTime !== null && aTime === bTime && a.msg?.sender !== b.msg?.sender) {
+      return a.msg?.sender === 'user' ? -1 : 1;
+    }
+    return a.idx - b.idx;
+  });
+  return indexed.map((entry) => entry.msg);
+}
+
+/**
+ * Ensures a user's locally known conversation metadata exists in MongoDB before writing messages
+ * (e.g. for offline-created conversations or pre-migration legacy conversations).
+ */
+async function ensureParentConversationInMongo(chatMeta, fallbackMode = 'general') {
+  if (!chatMeta?.id) return false;
+  const payload = {
+    id: chatMeta.id,
+    title: chatMeta.title || 'New Conversation',
+    mode: chatMeta.mode || fallbackMode || 'general',
+    isPinned: Boolean(chatMeta.isPinned)
+  };
+
+  const { res } = await authorizedApiFetch('/api/conversations', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+
+  if (!res) return false;
+  if (res.ok) return true;
+
+  if (res.status === 400 && payload.isPinned) {
+    const errBody = await res.json().catch(() => ({}));
+    if (errBody?.code === 'PIN_LIMIT_EXCEEDED') {
+      const retry = await authorizedApiFetch('/api/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...payload, isPinned: false })
+      });
+      return Boolean(retry.res?.ok);
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -408,17 +791,15 @@ export function generateChatTitle(promptText, maxLength = 36) {
 }
 
 /**
- * Generates a valid chat ID without requiring network connectivity.
- * @param {string} [userId]
+ * Generates a valid chat ID locally without requiring network connectivity or Firestore.
+ * @param {string} [_userId]
  * @returns {string}
  */
-export function generateLocalChatId(userId = '') {
-  if (db && userId) {
-    try {
-      return doc(collection(db, 'users', userId, 'chats')).id;
-    } catch (_) {}
+export function generateLocalChatId(_userId = '') {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `local-${crypto.randomUUID()}`;
   }
-  return `local-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 8)}`;
+  return `local-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 10)}`;
 }
 
 /**
@@ -450,6 +831,7 @@ export async function createChatDocument(userId, initialTitle = 'New Conversatio
     createdAtMs: nowMs,
     isPinned: false,
     pinnedAt: null,
+    ...(isGuest ? {} : { storageSource: 'mongodb', hasLegacyFirestore: false }),
     pendingSync: !isGuest,
     createdOffline: !isBrowserOnline()
   });
@@ -494,12 +876,16 @@ export async function createChatDocument(userId, initialTitle = 'New Conversatio
         const mapped = mapMongoConversationToChat(resData.conversation);
         upsertCachedUserChat(userId, {
           ...mapped,
+          storageSource: 'mongodb',
+          hasLegacyFirestore: false,
           pendingSync: false,
           createdOffline: false
         });
       } else {
         upsertCachedUserChat(userId, {
           id: chatId,
+          storageSource: 'mongodb',
+          hasLegacyFirestore: false,
           pendingSync: false,
           createdOffline: false
         });
@@ -512,33 +898,6 @@ export async function createChatDocument(userId, initialTitle = 'New Conversatio
       return chatId;
     }
     throw err;
-  }
-
-  // Also ensure parent chat document in Firestore for legacy Firestore message subcollection
-  if (db && isFirebaseConfigured() && isBrowserOnline()) {
-    try {
-      const chatDocRef = doc(db, 'users', userId, 'chats', chatId);
-      await withBoundedTimeout(
-        setDoc(
-          chatDocRef,
-          {
-            id: chatId,
-            title: initialTitle,
-            mode: cleanMode,
-            userId,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-            isPinned: false,
-            pinnedAt: null
-          },
-          { merge: true }
-        ),
-        FIRESTORE_OP_TIMEOUT_MS,
-        'ensureFirestoreChatDoc'
-      );
-    } catch (_) {
-      // Non-fatal, unmigrated messages still function via subcollection doc reference
-    }
   }
 
   return chatId;
@@ -554,6 +913,7 @@ export async function updateChatMode(userId, chatId, mode) {
   if (!userId || !chatId) return;
   const cleanMode = mode || 'general';
   const isGuest = String(userId).startsWith('guest-');
+  const existingLocalChat = getCachedUserChats(userId).find((c) => c.id === chatId);
 
   upsertCachedUserChat(userId, {
     id: chatId,
@@ -581,6 +941,24 @@ export async function updateChatMode(userId, chatId, mode) {
         body: JSON.stringify({ mode: cleanMode })
       });
 
+      if (res.status === 404 && existingLocalChat?.storageSource === 'legacy-firestore') {
+        const promoted = await ensureParentConversationInMongo(
+          { ...existingLocalChat, mode: cleanMode },
+          cleanMode
+        );
+        if (promoted) {
+          upsertCachedUserChat(userId, {
+            id: chatId,
+            mode: cleanMode,
+            storageSource: 'hybrid',
+            hasLegacyFirestore: true,
+            pendingMetaSync: false
+          });
+          notifyConversationListeners(userId);
+          return;
+        }
+      }
+
       if (res.ok) {
         upsertCachedUserChat(userId, { id: chatId, mode: cleanMode, pendingMetaSync: false });
         notifyConversationListeners(userId);
@@ -592,29 +970,15 @@ export async function updateChatMode(userId, chatId, mode) {
     upsertCachedUserChat(userId, { id: chatId, pendingMetaSync: true });
     console.warn('Could not update conversation mode in MongoDB API (saved locally):', err?.message || err);
   }
-
-  // Also update Firestore if configured for legacy parity
-  if (db && isFirebaseConfigured() && isBrowserOnline()) {
-    try {
-      const chatDocRef = doc(db, 'users', userId, 'chats', chatId);
-      await withBoundedTimeout(
-        updateDoc(chatDocRef, {
-          mode: cleanMode,
-          updatedAt: serverTimestamp()
-        }),
-        FIRESTORE_OP_TIMEOUT_MS,
-        'updateChatModeFirestore'
-      );
-    } catch (_) {}
-  }
 }
 
 /**
- * Appends a message to a chat's messages subcollection and updates parent chat's updatedAt.
- * Always writes to user-scoped local cache first and falls back gracefully when offline.
+ * Persists a user or assistant message via the authenticated Express/MongoDB API (/api/messages)
+ * and updates the parent conversation's updatedAt timestamp on the server.
+ * Preserves guest isolation, local caching, idempotent updates/retries, and offline queueing.
  *
- * @param {string} userId - Authenticated user UID
- * @param {string} chatId - Chat document ID
+ * @param {string} userId - Authenticated user UID (or guest session ID)
+ * @param {string} chatId - Conversation ID
  * @param {Object} message - Message object
  */
 export async function saveChatMessage(userId, chatId, message) {
@@ -622,105 +986,155 @@ export async function saveChatMessage(userId, chatId, message) {
     return;
   }
 
-  // Never persist temporary mock messages, loading states, or failed error messages
+  // Never persist temporary mock messages, loading states, or failed pure-error messages
   if (message.isError || (message.sender !== 'user' && message.sender !== 'assistant')) {
     return;
   }
 
+  const isGuest = String(userId).startsWith('guest-');
   const targetMessage =
     message.sender === 'assistant'
       ? normalizeAssistantMessage(message)
       : message;
 
+  const prevLocalMessages = getCachedChatMessages(userId, chatId);
+  const prevLocalChats = getCachedUserChats(userId);
+  const existingLocalMsg = prevLocalMessages.find((m) => m.id === targetMessage.id);
+  const existingLocalChat = prevLocalChats.find((c) => c.id === chatId);
+
   const clientTimestamp =
     targetMessage.timestamp ||
+    existingLocalMsg?.timestamp ||
     new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const nowMs = Date.now();
+  const createdAtMs =
+    typeof targetMessage.createdAtMs === 'number' && Number.isFinite(targetMessage.createdAtMs)
+      ? targetMessage.createdAtMs
+      : typeof existingLocalMsg?.createdAtMs === 'number' && Number.isFinite(existingLocalMsg.createdAtMs)
+        ? existingLocalMsg.createdAtMs
+        : nowMs;
 
-  const localRecord = {
-    ...targetMessage,
-    timestamp: clientTimestamp,
-    createdAtMs: typeof targetMessage.createdAtMs === 'number' ? targetMessage.createdAtMs : nowMs,
-    pendingSync: true
-  };
-
-  // 1. Always persist locally first so messages survive refreshes while offline
-  upsertCachedChatMessage(userId, chatId, localRecord);
-  const cachedChat = getCachedUserChats(userId).find((c) => c.id === chatId);
-  upsertCachedUserChat(userId, {
-    id: chatId,
-    title: cachedChat?.title || 'Conversation',
-    mode: cachedChat?.mode || targetMessage.mode || 'general',
-    timestamp: formatChatDateLabel(nowMs),
-    rawUpdatedAt: nowMs,
-    isPinned: Boolean(cachedChat?.isPinned),
-    pinnedAt: cachedChat?.pinnedAt || null,
-    pendingSync: true
+  const localRecord = sanitizeMessageForStorage(targetMessage, clientTimestamp, createdAtMs, {
+    pendingSync: !isGuest,
+    syncedToMongo: false
   });
 
-  if (!db || !isFirebaseConfigured() || !isBrowserOnline()) {
+  // Guest isolation: persist strictly to guest-scoped local storage with zero cloud/token traffic
+  if (isGuest) {
+    upsertCachedChatMessage(userId, chatId, localRecord);
+    upsertCachedUserChat(userId, {
+      id: chatId,
+      title: existingLocalChat?.title || 'Conversation',
+      mode: existingLocalChat?.mode || targetMessage.mode || 'general',
+      timestamp: formatChatDateLabel(nowMs),
+      rawUpdatedAt: nowMs,
+      isPinned: Boolean(existingLocalChat?.isPinned),
+      pinnedAt: existingLocalChat?.pinnedAt || null,
+      pendingSync: false
+    });
     return;
   }
 
-  const messageDocRef = doc(db, 'users', userId, 'chats', chatId, 'messages', targetMessage.id);
-  const chatDocRef = doc(db, 'users', userId, 'chats', chatId);
-  const payload = buildFirestoreMessagePayload({
-    ...targetMessage,
-    timestamp: clientTimestamp
+  // 1. Optimistically persist locally first so messages survive refreshes while offline
+  upsertCachedChatMessage(userId, chatId, localRecord);
+  upsertCachedUserChat(userId, {
+    id: chatId,
+    title: existingLocalChat?.title || 'Conversation',
+    mode: existingLocalChat?.mode || targetMessage.mode || 'general',
+    timestamp: formatChatDateLabel(nowMs),
+    rawUpdatedAt: nowMs,
+    isPinned: Boolean(existingLocalChat?.isPinned),
+    pinnedAt: existingLocalChat?.pinnedAt || null,
+    pendingSync: true
   });
 
+  if (!isBrowserOnline()) {
+    return;
+  }
+
+  const payload = buildMongoMessagePayload(chatId, localRecord);
+
   try {
-    // Ensure parent chat exists in Firestore if it was originally created offline
-    if (cachedChat?.createdOffline) {
-      await withBoundedTimeout(
-        setDoc(
-          chatDocRef,
-          {
-            id: chatId,
-            title: cachedChat.title || 'New Conversation',
-            mode: cachedChat.mode || 'general',
-            userId,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-            isPinned: Boolean(cachedChat.isPinned),
-            pinnedAt: cachedChat.pinnedAt || null
-          },
-          { merge: true }
-        ),
-        FIRESTORE_OP_TIMEOUT_MS,
-        'ensureParentChatDoc'
-      );
+    let { res, token } = await authorizedApiFetch('/api/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    if (!token || !res) {
+      return;
     }
 
-    // Write message document idempotently by stable ID
-    await withBoundedTimeout(setDoc(messageDocRef, payload), FIRESTORE_OP_TIMEOUT_MS, 'saveChatMessage');
-
-    // Touch parent chat's updatedAt timestamp
-    try {
-      await withBoundedTimeout(
-        updateDoc(chatDocRef, {
-          updatedAt: serverTimestamp()
-        }),
-        FIRESTORE_OP_TIMEOUT_MS,
-        'touchParentChatUpdatedAt'
+    // If the parent conversation only existed locally/offline or in legacy storage, create it first and retry once
+    if (res.status === 404 && existingLocalChat) {
+      const parentCreated = await ensureParentConversationInMongo(
+        existingLocalChat,
+        localRecord.mode || 'general'
       );
-    } catch (_) {}
+      if (parentCreated) {
+        const retryResult = await authorizedApiFetch('/api/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        if (retryResult.res) {
+          res = retryResult.res;
+        }
+      }
+    }
+
+    if (!res.ok) {
+      // Transient 5xx errors stay safely queued in local cache for later sync
+      if (res.status >= 500) {
+        console.warn(`MongoDB API returned ${res.status} while saving message; retained in local sync queue:`, localRecord.id);
+        return;
+      }
+
+      // Authorization, ownership, conflict, or validation failure: roll back optimistic local cache and surface error
+      saveCachedChatMessages(userId, chatId, prevLocalMessages);
+      saveCachedUserChats(userId, prevLocalChats);
+
+      const errorData = await res.json().catch(() => ({}));
+      const apiErr = new Error(errorData.error || `Failed to save message (${res.status})`);
+      apiErr.status = res.status;
+      apiErr.code = errorData.code || 'MESSAGE_SAVE_FAILED';
+      throw apiErr;
+    }
+
+    const resData = await res.json().catch(() => ({}));
+    const savedDoc = resData?.message;
+    const savedCreatedMs = savedDoc?.createdAt ? new Date(savedDoc.createdAt).getTime() : NaN;
+
+    // Clear any prior deletion tombstones for this ID if re-saved
+    const tombstones = getDeletedMessageTombstones(userId, chatId);
+    if (tombstones.includes(localRecord.id)) {
+      saveDeletedMessageTombstones(
+        userId,
+        chatId,
+        tombstones.filter((id) => id !== localRecord.id)
+      );
+    }
+    removePendingDeletedMessages(userId, chatId, [localRecord.id]);
 
     upsertCachedChatMessage(userId, chatId, {
       ...localRecord,
-      pendingSync: false
+      createdAtMs: Number.isFinite(savedCreatedMs) ? savedCreatedMs : localRecord.createdAtMs,
+      pendingSync: false,
+      syncedToMongo: true
     });
 
-    // Clear chat-level pendingSync if no other messages in this chat are still pending
     const remainingPending = getCachedChatMessages(userId, chatId).some((m) => m.pendingSync);
     upsertCachedUserChat(userId, {
       id: chatId,
+      ...(existingLocalChat?.storageSource === 'legacy-firestore'
+        ? { storageSource: 'hybrid', hasLegacyFirestore: true }
+        : {}),
       pendingSync: remainingPending,
       createdOffline: false
     });
   } catch (err) {
     if (isOfflineOrNetworkError(err)) {
-      console.warn('Firestore unreachable while saving message; retained in local sync queue:', targetMessage.id);
+      console.warn('MongoDB API unreachable while saving message; retained in local sync queue:', localRecord.id);
       return;
     }
     throw err;
@@ -740,6 +1154,9 @@ export async function renameConversation(userId, chatId, newTitle) {
   }
 
   const isGuest = !userId || String(userId).startsWith('guest-');
+  const existingLocalChat = userId && chatId
+    ? getCachedUserChats(userId).find((c) => c.id === chatId)
+    : null;
 
   if (userId && chatId) {
     upsertCachedUserChat(userId, {
@@ -769,6 +1186,24 @@ export async function renameConversation(userId, chatId, newTitle) {
         body: JSON.stringify({ title: sanitized })
       });
 
+      if (res.status === 404 && existingLocalChat?.storageSource === 'legacy-firestore') {
+        const promoted = await ensureParentConversationInMongo(
+          { ...existingLocalChat, title: sanitized },
+          existingLocalChat.mode || 'general'
+        );
+        if (promoted) {
+          upsertCachedUserChat(userId, {
+            id: chatId,
+            title: sanitized,
+            storageSource: 'hybrid',
+            hasLegacyFirestore: true,
+            pendingMetaSync: false
+          });
+          notifyConversationListeners(userId);
+          return;
+        }
+      }
+
       if (!res.ok) {
         const errorData = await res.json().catch(() => ({}));
         throw new Error(errorData.error || `Failed to rename conversation (${res.status})`);
@@ -783,21 +1218,6 @@ export async function renameConversation(userId, chatId, newTitle) {
       return;
     }
     throw err;
-  }
-
-  // Also update Firestore if configured for legacy parity
-  if (db && isFirebaseConfigured() && isBrowserOnline()) {
-    try {
-      const chatDocRef = doc(db, 'users', userId, 'chats', chatId);
-      await withBoundedTimeout(
-        updateDoc(chatDocRef, {
-          title: sanitized,
-          updatedAt: serverTimestamp()
-        }),
-        FIRESTORE_OP_TIMEOUT_MS,
-        'renameConversationFirestore'
-      );
-    } catch (_) {}
   }
 }
 
@@ -817,6 +1237,7 @@ export async function toggleChatPinned(userId, chatId, isPinned) {
 
   const isGuest = String(userId).startsWith('guest-');
   const cachedChats = getCachedUserChats(userId);
+  const existingLocalChat = cachedChats.find((c) => c.id === chatId);
   if (isPinned) {
     const localPinnedCount = cachedChats.filter((c) => c.isPinned && c.id !== chatId).length;
     if (localPinnedCount >= 5) {
@@ -843,7 +1264,7 @@ export async function toggleChatPinned(userId, chatId, isPinned) {
     const token = await resolveAuthToken();
     if (token) {
       const endpoint = getApiEndpoint(`/api/conversations/${encodeURIComponent(chatId)}`);
-      const res = await fetch(endpoint, {
+      let res = await fetch(endpoint, {
         method: 'PATCH',
         headers: {
           'Authorization': `Bearer ${token}`,
@@ -852,6 +1273,26 @@ export async function toggleChatPinned(userId, chatId, isPinned) {
         },
         body: JSON.stringify({ isPinned: Boolean(isPinned) })
       });
+
+      let promotedFromLegacy = false;
+      if (res.status === 404 && existingLocalChat?.storageSource === 'legacy-firestore') {
+        const createEndpoint = getApiEndpoint('/api/conversations');
+        res = await fetch(createEndpoint, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          body: JSON.stringify({
+            id: chatId,
+            title: existingLocalChat.title || 'Untitled Chat',
+            mode: existingLocalChat.mode || 'general',
+            isPinned: Boolean(isPinned)
+          })
+        });
+        promotedFromLegacy = res.ok;
+      }
 
       if (!res.ok) {
         const errorData = await res.json().catch(() => ({}));
@@ -869,26 +1310,10 @@ export async function toggleChatPinned(userId, chatId, isPinned) {
         isPinned: resultingPinned,
         pinnedAt: resultingPinned ? (data?.conversation?.pinnedAt ? new Date(data.conversation.pinnedAt).getTime() : nowMs) : null,
         rawUpdatedAt: nowMs,
+        ...(promotedFromLegacy ? { storageSource: 'hybrid', hasLegacyFirestore: true } : {}),
         pendingMetaSync: false
       });
       notifyConversationListeners(userId);
-
-      // Also update Firestore if configured
-      if (db && isFirebaseConfigured() && isBrowserOnline()) {
-        try {
-          const chatDocRef = doc(db, 'users', userId, 'chats', chatId);
-          await withBoundedTimeout(
-            updateDoc(chatDocRef, {
-              isPinned: resultingPinned,
-              pinnedAt: resultingPinned ? serverTimestamp() : null,
-              updatedAt: serverTimestamp()
-            }),
-            FIRESTORE_OP_TIMEOUT_MS,
-            'toggleChatPinnedFirestore'
-          );
-        } catch (_) {}
-      }
-
       return resultingPinned;
     }
   } catch (err) {
@@ -935,8 +1360,10 @@ export async function deleteConversation(userId, chatId) {
   if (typeof window !== 'undefined') {
     try {
       localStorage.removeItem(getUserMessagesCacheKey(userId, chatId));
+      localStorage.removeItem(getUserDeletedMessagesKey(userId, chatId));
     } catch (_) {}
   }
+  removePendingDeletedMessages(userId, chatId, null);
   notifyConversationListeners(userId);
 
   if (isGuest) {
@@ -977,11 +1404,25 @@ export async function deleteConversation(userId, chatId) {
     throw err;
   }
 
+  const timeoutMs = getFirestoreTimeoutMs();
+
+  if (customLegacyFirestoreDeleteHandler && isBrowserOnline()) {
+    try {
+      await withBoundedTimeout(
+        Promise.resolve().then(() => customLegacyFirestoreDeleteHandler(userId, chatId)),
+        timeoutMs,
+        'deleteLegacyFirestoreChat'
+      );
+    } catch (err) {
+      console.warn('Could not clean up simulated Firestore documents during conversation deletion:', err?.message || err);
+    }
+  }
+
   // Clean up unmigrated Firestore messages and parent doc for this specific conversation
   if (db && isFirebaseConfigured() && isBrowserOnline()) {
     try {
       const messagesRef = collection(db, 'users', userId, 'chats', chatId, 'messages');
-      const snapshot = await withBoundedTimeout(getDocs(messagesRef), FIRESTORE_OP_TIMEOUT_MS, 'loadMessagesForDelete');
+      const snapshot = await withBoundedTimeout(getDocs(messagesRef), timeoutMs, 'loadMessagesForDelete');
 
       const docs = snapshot.docs;
       const CHUNK_SIZE = 400;
@@ -992,11 +1433,11 @@ export async function deleteConversation(userId, chatId) {
         chunk.forEach((docSnap) => {
           batch.delete(docSnap.ref);
         });
-        await withBoundedTimeout(batch.commit(), FIRESTORE_OP_TIMEOUT_MS, 'deleteMessagesBatch');
+        await withBoundedTimeout(batch.commit(), timeoutMs, 'deleteMessagesBatch');
       }
 
       const chatDocRef = doc(db, 'users', userId, 'chats', chatId);
-      await withBoundedTimeout(deleteDoc(chatDocRef), FIRESTORE_OP_TIMEOUT_MS, 'deleteChatDoc');
+      await withBoundedTimeout(deleteDoc(chatDocRef), timeoutMs, 'deleteChatDoc');
     } catch (err) {
       console.warn('Could not clean up Firestore documents during conversation deletion:', err?.message || err);
     }
@@ -1004,57 +1445,167 @@ export async function deleteConversation(userId, chatId) {
 }
 
 /**
- * Deletes specific messages from a chat's messages subcollection in Firestore (and local cache).
+ * Deletes specific messages belonging to a single conversation via the authenticated
+ * Express/MongoDB API (/api/messages) and updates local cache/tombstones.
  * Used when truncating conversation branches during Edit and Resend.
+ * Does not modify or delete legacy Firestore documents.
  *
- * @param {string} userId - Authenticated user UID
- * @param {string} chatId - Chat document ID
- * @param {string[]} messageIds - Array of message document IDs to delete
+ * @param {string} userId - Authenticated user UID (or guest session ID)
+ * @param {string} chatId - Conversation ID
+ * @param {string[]} messageIds - Array of message IDs to delete
  */
 export async function deleteChatMessages(userId, chatId, messageIds = []) {
   if (!userId || !chatId || !Array.isArray(messageIds) || messageIds.length === 0) {
     return;
   }
 
-  const validIds = messageIds.filter((id) => typeof id === 'string' && id.trim().length > 0);
+  const validIds = Array.from(
+    new Set(messageIds.filter((id) => typeof id === 'string' && id.trim().length > 0))
+  );
   if (validIds.length === 0) return;
 
+  const isGuest = String(userId).startsWith('guest-');
+  const prevLocalMessages = getCachedChatMessages(userId, chatId);
+  const prevTombstones = getDeletedMessageTombstones(userId, chatId);
+
   const removeSet = new Set(validIds);
-  const remainingLocal = getCachedChatMessages(userId, chatId).filter((m) => !removeSet.has(m.id));
+  const remainingLocal = prevLocalMessages.filter((m) => !removeSet.has(m.id));
   saveCachedChatMessages(userId, chatId, remainingLocal);
 
-  if (!db || !isFirebaseConfigured() || !isBrowserOnline()) {
+  if (isGuest) {
+    return;
+  }
+
+  saveDeletedMessageTombstones(userId, chatId, [...prevTombstones, ...validIds]);
+
+  if (!isBrowserOnline()) {
+    addPendingDeletedMessages(userId, chatId, validIds);
     return;
   }
 
   try {
-    const CHUNK_SIZE = 400;
-    for (let i = 0; i < validIds.length; i += CHUNK_SIZE) {
-      const chunk = validIds.slice(i, i + CHUNK_SIZE);
-      const batch = writeBatch(db);
-      chunk.forEach((msgId) => {
-        const msgRef = doc(db, 'users', userId, 'chats', chatId, 'messages', msgId);
-        batch.delete(msgRef);
-      });
-      await withBoundedTimeout(batch.commit(), FIRESTORE_OP_TIMEOUT_MS, 'deleteChatMessages');
+    const { res, token } = await authorizedApiFetch(
+      `/api/messages?conversationId=${encodeURIComponent(chatId)}`,
+      {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          conversationId: chatId,
+          messageIds: validIds
+        })
+      }
+    );
+
+    if (!token || !res) {
+      addPendingDeletedMessages(userId, chatId, validIds);
+      return;
     }
+
+    if (!res.ok && res.status !== 404) {
+      if (res.status >= 500) {
+        addPendingDeletedMessages(userId, chatId, validIds);
+        return;
+      }
+
+      // Authorization or validation failure: restore local state and throw
+      saveCachedChatMessages(userId, chatId, prevLocalMessages);
+      saveDeletedMessageTombstones(userId, chatId, prevTombstones);
+
+      const errorData = await res.json().catch(() => ({}));
+      const apiErr = new Error(errorData.error || `Failed to delete messages (${res.status})`);
+      apiErr.status = res.status;
+      apiErr.code = errorData.code || 'MESSAGE_DELETE_FAILED';
+      throw apiErr;
+    }
+
+    removePendingDeletedMessages(userId, chatId, validIds);
   } catch (err) {
-    console.warn('Could not delete truncated messages in Firestore (updated locally):', err?.message || err);
+    if (isOfflineOrNetworkError(err)) {
+      addPendingDeletedMessages(userId, chatId, validIds);
+      console.warn('Offline/network fallback: queued message deletions for sync:', validIds.length);
+      return;
+    }
+    throw err;
   }
 }
 
 /**
- * Merges cloud conversation metadata with locally cached pending conversations
- * so offline-created or unsynced chats are never overwritten or hidden.
+ * Deterministically merges authoritative MongoDB conversation metadata, read-only legacy
+ * Firestore conversations, and locally cached pending conversations/tombstones.
+ *
+ * Precedence: Legacy Firestore < MongoDB < Pending Local Changes / Deletion Tombstones.
  */
-function mergeCloudAndLocalChats(userId, cloudChats) {
+function mergeCloudAndLocalChats(
+  userId,
+  cloudChats,
+  legacyResult = { loaded: false, chats: [] },
+  options = { persistCache: true }
+) {
   const localChats = getCachedUserChats(userId);
   const deletedSet = new Set(getPendingDeletedChatIds(userId));
+  const legacyMap = new Map();
+
+  if (Array.isArray(legacyResult?.chats)) {
+    for (const leg of legacyResult.chats) {
+      if (!leg?.id || deletedSet.has(leg.id)) continue;
+      if (!legacyMap.has(leg.id)) {
+        legacyMap.set(leg.id, leg);
+      }
+    }
+  }
+
   const mergedMap = new Map();
 
+  // 1. Seed legacy Firestore conversations as lowest-priority compatibility baseline
+  for (const leg of legacyMap.values()) {
+    const localMatch = localChats.find((l) => l.id === leg.id);
+    if (localMatch && (localMatch.pendingSync || localMatch.pendingMetaSync)) {
+      const newerRawUpdated = Math.max(leg.rawUpdatedAt || 0, localMatch.rawUpdatedAt || 0);
+      mergedMap.set(leg.id, {
+        ...leg,
+        title: localMatch.pendingMetaSync ? localMatch.title : (leg.title || localMatch.title),
+        mode: localMatch.pendingMetaSync ? localMatch.mode : (leg.mode || localMatch.mode),
+        isPinned: localMatch.pendingMetaSync ? Boolean(localMatch.isPinned) : Boolean(leg.isPinned),
+        pinnedAt: localMatch.pendingMetaSync ? localMatch.pinnedAt : leg.pinnedAt,
+        rawUpdatedAt: newerRawUpdated,
+        timestamp: formatChatDateLabel(newerRawUpdated),
+        storageSource: 'legacy-firestore',
+        hasLegacyFirestore: true,
+        pendingSync: Boolean(localMatch.pendingSync),
+        pendingMetaSync: Boolean(localMatch.pendingMetaSync),
+        createdOffline: false
+      });
+    } else {
+      mergedMap.set(leg.id, {
+        ...leg,
+        storageSource: 'legacy-firestore',
+        hasLegacyFirestore: true,
+        pendingSync: false,
+        pendingMetaSync: false,
+        createdOffline: false
+      });
+    }
+  }
+
+  // 2. Apply authoritative MongoDB conversations (strictly overrides legacy Firestore on same chatId)
   for (const c of cloudChats) {
-    if (deletedSet.has(c.id)) continue;
+    if (!c?.id || deletedSet.has(c.id)) continue;
     const localMatch = localChats.find((l) => l.id === c.id);
+    const inLegacy = legacyMap.has(c.id);
+    const resolvedHasLegacy = inLegacy
+      ? true
+      : legacyResult?.loaded
+        ? false
+        : typeof localMatch?.hasLegacyFirestore === 'boolean'
+          ? localMatch.hasLegacyFirestore
+          : undefined;
+    const resolvedSource =
+      resolvedHasLegacy === true
+        ? 'hybrid'
+        : resolvedHasLegacy === false
+          ? 'mongodb'
+          : localMatch?.storageSource || 'mongodb';
+
     if (localMatch && (localMatch.pendingSync || localMatch.pendingMetaSync)) {
       const newerRawUpdated = Math.max(c.rawUpdatedAt || 0, localMatch.rawUpdatedAt || 0);
       mergedMap.set(c.id, {
@@ -1065,6 +1616,8 @@ function mergeCloudAndLocalChats(userId, cloudChats) {
         pinnedAt: localMatch.pendingMetaSync ? localMatch.pinnedAt : c.pinnedAt,
         rawUpdatedAt: newerRawUpdated,
         timestamp: formatChatDateLabel(newerRawUpdated),
+        storageSource: resolvedSource,
+        ...(typeof resolvedHasLegacy === 'boolean' ? { hasLegacyFirestore: resolvedHasLegacy } : {}),
         pendingSync: Boolean(localMatch.pendingSync),
         pendingMetaSync: Boolean(localMatch.pendingMetaSync),
         createdOffline: false
@@ -1072,6 +1625,8 @@ function mergeCloudAndLocalChats(userId, cloudChats) {
     } else {
       mergedMap.set(c.id, {
         ...c,
+        storageSource: resolvedSource,
+        ...(typeof resolvedHasLegacy === 'boolean' ? { hasLegacyFirestore: resolvedHasLegacy } : {}),
         pendingSync: false,
         pendingMetaSync: false,
         createdOffline: false
@@ -1079,30 +1634,34 @@ function mergeCloudAndLocalChats(userId, cloudChats) {
     }
   }
 
+  // 3. Preserve unsynced local pending conversations (and cached legacy items if Firestore transiently failed)
   for (const localChat of localChats) {
-    if (deletedSet.has(localChat.id)) continue;
-    if (!mergedMap.has(localChat.id) && (localChat.pendingSync || localChat.createdOffline || localChat.pendingMetaSync)) {
-      mergedMap.set(localChat.id, localChat);
+    if (!localChat?.id || deletedSet.has(localChat.id)) continue;
+    if (!mergedMap.has(localChat.id)) {
+      if (localChat.pendingSync || localChat.createdOffline || localChat.pendingMetaSync) {
+        mergedMap.set(localChat.id, localChat);
+      } else if (!legacyResult?.loaded && localChat.storageSource === 'legacy-firestore') {
+        mergedMap.set(localChat.id, localChat);
+      }
     }
   }
 
-  const merged = Array.from(mergedMap.values()).sort(
-    (a, b) => (b.rawUpdatedAt || 0) - (a.rawUpdatedAt || 0)
-  );
-  saveCachedUserChats(userId, merged);
+  const merged = Array.from(mergedMap.values()).sort((a, b) => {
+    const diff = (b.rawUpdatedAt || 0) - (a.rawUpdatedAt || 0);
+    if (diff !== 0) return diff;
+    return String(a.id || '').localeCompare(String(b.id || ''));
+  });
+
+  if (options?.persistCache !== false) {
+    saveCachedUserChats(userId, merged);
+  }
   return merged;
 }
 
 /**
- * Synchronizes any offline-created or offline-updated chats and messages to Cloud Firestore
- * idempotently once internet connectivity returns, without duplicating or losing messages.
- *
- * @param {string} userId
- * @returns {Promise<{ syncedChats: number, syncedMessages: number }>}
- */
-/**
- * Synchronizes any offline-created or offline-updated conversations to MongoDB Atlas
- * and unmigrated offline messages to Cloud Firestore idempotently once internet connectivity returns.
+ * Synchronizes any offline-created or offline-updated conversations, message deletions,
+ * and pending messages to the authenticated Express/MongoDB API idempotently once
+ * internet connectivity returns, without duplicating or losing messages.
  *
  * @param {string} userId
  * @returns {Promise<{ syncedChats: number, syncedMessages: number }>}
@@ -1121,7 +1680,7 @@ export async function syncOfflineUserChatsToFirestore(userId) {
     let syncedMessages = 0;
 
     try {
-      // 1. Replay any pending offline deletions via MongoDB API
+      // 1. Replay any pending offline conversation deletions via MongoDB API
       const pendingDeleted = getPendingDeletedChatIds(userId);
       if (pendingDeleted.length > 0) {
         const remainingDeletes = [];
@@ -1136,12 +1695,45 @@ export async function syncOfflineUserChatsToFirestore(userId) {
         savePendingDeletedChatIds(userId, remainingDeletes);
       }
 
-      // 2. Sync pending conversation metadata to MongoDB API
       const token = await resolveAuthToken();
+      if (!token) {
+        return { syncedChats, syncedMessages };
+      }
+
+      // 2. Replay any pending offline message deletions via MongoDB API
+      const pendingMsgDeletes = getPendingDeletedMessagesMap(userId);
+      for (const [delChatId, msgIds] of Object.entries(pendingMsgDeletes)) {
+        if (!isBrowserOnline()) break;
+        if (!Array.isArray(msgIds) || msgIds.length === 0) continue;
+        try {
+          const { res } = await authorizedApiFetch(
+            `/api/messages?conversationId=${encodeURIComponent(delChatId)}`,
+            {
+              method: 'DELETE',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ conversationId: delChatId, messageIds: msgIds })
+            }
+          );
+          if (res && (res.ok || res.status === 404 || res.status === 403)) {
+            removePendingDeletedMessages(userId, delChatId, msgIds);
+          }
+        } catch (delErr) {
+          console.warn('Deferred syncing message deletions to MongoDB:', delChatId, delErr?.message || delErr);
+        }
+      }
+
+      // 3. Sync pending conversation metadata and pending messages to MongoDB API
       const localChats = getCachedUserChats(userId);
 
       for (const localChat of localChats) {
         if (!isBrowserOnline()) break;
+
+        const localMessages = getCachedChatMessages(userId, localChat.id);
+        const pendingMessages = sortMessagesChronologically(
+          localMessages.filter(
+            (m) => m && m.pendingSync && !m.isError && (m.sender === 'user' || m.sender === 'assistant')
+          )
+        );
 
         const needsMetaSync = Boolean(
           localChat.pendingSync ||
@@ -1149,49 +1741,47 @@ export async function syncOfflineUserChatsToFirestore(userId) {
           localChat.createdOffline
         );
 
-        if (needsMetaSync && token) {
+        if (needsMetaSync) {
           try {
             if (localChat.createdOffline || localChat.pendingSync) {
-              const createEndpoint = getApiEndpoint('/api/conversations');
-              const res = await fetch(createEndpoint, {
-                method: 'POST',
-                headers: {
-                  'Authorization': `Bearer ${token}`,
-                  'Content-Type': 'application/json',
-                  'Accept': 'application/json'
-                },
-                body: JSON.stringify({
-                  id: localChat.id,
-                  title: localChat.title || 'New Conversation',
-                  mode: localChat.mode || 'general',
-                  isPinned: Boolean(localChat.isPinned)
-                })
-              });
-              if (res.ok) {
+              const ok = await ensureParentConversationInMongo(localChat, localChat.mode || 'general');
+              if (ok) {
                 syncedChats++;
                 upsertCachedUserChat(userId, {
                   id: localChat.id,
-                  pendingSync: false,
+                  ...(localChat.storageSource === 'legacy-firestore'
+                    ? { storageSource: 'hybrid', hasLegacyFirestore: true }
+                    : {}),
+                  pendingSync: pendingMessages.length > 0,
                   createdOffline: false,
                   pendingMetaSync: false
                 });
               }
             } else if (localChat.pendingMetaSync) {
-              const patchEndpoint = getApiEndpoint(`/api/conversations/${encodeURIComponent(localChat.id)}`);
-              const res = await fetch(patchEndpoint, {
-                method: 'PATCH',
-                headers: {
-                  'Authorization': `Bearer ${token}`,
-                  'Content-Type': 'application/json',
-                  'Accept': 'application/json'
-                },
-                body: JSON.stringify({
-                  title: localChat.title,
-                  mode: localChat.mode,
-                  isPinned: Boolean(localChat.isPinned)
-                })
-              });
-              if (res.ok) {
+              const { res } = await authorizedApiFetch(
+                `/api/conversations/${encodeURIComponent(localChat.id)}`,
+                {
+                  method: 'PATCH',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    title: localChat.title,
+                    mode: localChat.mode,
+                    isPinned: Boolean(localChat.isPinned)
+                  })
+                }
+              );
+              if (res?.status === 404 && localChat.storageSource === 'legacy-firestore') {
+                const promoted = await ensureParentConversationInMongo(localChat, localChat.mode || 'general');
+                if (promoted) {
+                  syncedChats++;
+                  upsertCachedUserChat(userId, {
+                    id: localChat.id,
+                    storageSource: 'hybrid',
+                    hasLegacyFirestore: true,
+                    pendingMetaSync: false
+                  });
+                }
+              } else if (res?.ok) {
                 syncedChats++;
                 upsertCachedUserChat(userId, {
                   id: localChat.id,
@@ -1204,53 +1794,72 @@ export async function syncOfflineUserChatsToFirestore(userId) {
           }
         }
 
-        // 3. Sync pending messages to Firestore (unmigrated message persistence)
-        if (db && isFirebaseConfigured() && isBrowserOnline()) {
-          const localMessages = getCachedChatMessages(userId, localChat.id);
-          const pendingMessages = localMessages.filter(
-            (m) => m && m.pendingSync && !m.isError && (m.sender === 'user' || m.sender === 'assistant')
-          );
-
-          if (pendingMessages.length > 0) {
+        // 4. Replay pending messages for this conversation via POST /api/messages (idempotent by message ID)
+        if (pendingMessages.length > 0 && isBrowserOnline()) {
+          for (const msg of pendingMessages) {
+            if (!isBrowserOnline()) break;
             try {
-              await syncFirestoreNetworkState(true);
-              const chatDocRef = doc(db, 'users', userId, 'chats', localChat.id);
-              let allMessagesSynced = true;
+              const targetMsg = msg.sender === 'assistant' ? normalizeAssistantMessage(msg) : msg;
+              const clientTs =
+                targetMsg.timestamp ||
+                new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+              const createdAtMs =
+                typeof targetMsg.createdAtMs === 'number' && Number.isFinite(targetMsg.createdAtMs)
+                  ? targetMsg.createdAtMs
+                  : Date.now();
+              const sanitized = sanitizeMessageForStorage(targetMsg, clientTs, createdAtMs, {
+                pendingSync: true,
+                syncedToMongo: false
+              });
+              const payload = buildMongoMessagePayload(localChat.id, sanitized);
 
-              for (const msg of pendingMessages) {
-                try {
-                  const targetMsg = msg.sender === 'assistant' ? normalizeAssistantMessage(msg) : msg;
-                  const msgRef = doc(db, 'users', userId, 'chats', localChat.id, 'messages', targetMsg.id);
-                  const payload = buildFirestoreMessagePayload(targetMsg);
-                  await withBoundedTimeout(
-                    setDoc(msgRef, payload, { merge: true }),
-                    FIRESTORE_OP_TIMEOUT_MS,
-                    'syncMessageDoc'
-                  );
-                  upsertCachedChatMessage(userId, localChat.id, {
-                    ...msg,
-                    pendingSync: false
+              let { res } = await authorizedApiFetch('/api/messages', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+              });
+
+              if (res && res.status === 404) {
+                const parentOk = await ensureParentConversationInMongo(localChat, sanitized.mode || 'general');
+                if (parentOk) {
+                  const retryRes = await authorizedApiFetch('/api/messages', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
                   });
-                  syncedMessages++;
-                } catch (msgErr) {
-                  allMessagesSynced = false;
-                  console.warn('Deferred syncing message until next online cycle:', msg?.id, msgErr?.message || msgErr);
+                  res = retryRes.res;
                 }
               }
 
-              if (allMessagesSynced) {
-                try {
-                  await withBoundedTimeout(
-                    updateDoc(chatDocRef, { updatedAt: serverTimestamp() }),
-                    FIRESTORE_OP_TIMEOUT_MS,
-                    'syncTouchUpdatedAt'
-                  );
-                } catch (_) {}
+              if (res?.ok) {
+                const resData = await res.json().catch(() => ({}));
+                const savedCreatedMs = resData?.message?.createdAt
+                  ? new Date(resData.message.createdAt).getTime()
+                  : NaN;
+                upsertCachedChatMessage(userId, localChat.id, {
+                  ...sanitized,
+                  createdAtMs: Number.isFinite(savedCreatedMs) ? savedCreatedMs : sanitized.createdAtMs,
+                  pendingSync: false,
+                  syncedToMongo: true
+                });
+                syncedMessages++;
+              } else {
+                console.warn('Deferred syncing message until next online cycle:', msg?.id, res?.status);
               }
-            } catch (fsErr) {
-              console.warn('Error during Firestore message sync:', fsErr?.message || fsErr);
+            } catch (msgErr) {
+              console.warn('Deferred syncing message until next online cycle:', msg?.id, msgErr?.message || msgErr);
             }
           }
+
+          const stillPending = getCachedChatMessages(userId, localChat.id).some((m) => m.pendingSync);
+          upsertCachedUserChat(userId, {
+            id: localChat.id,
+            ...(localChat.storageSource === 'legacy-firestore'
+              ? { storageSource: 'hybrid', hasLegacyFirestore: true }
+              : {}),
+            pendingSync: stillPending,
+            createdOffline: false
+          });
         }
       }
 
@@ -1267,7 +1876,72 @@ export async function syncOfflineUserChatsToFirestore(userId) {
 }
 
 /**
- * Lists conversations for the authenticated user from MongoDB API (with local cache fallback).
+ * Reads unmigrated legacy conversation metadata (`users/{userId}/chats`) from Cloud Firestore
+ * in strictly READ-ONLY mode. Never creates, updates, pins, renames, or deletes Firestore docs.
+ *
+ * @param {string} userId
+ * @returns {Promise<{ loaded: boolean, chats: Array }>}
+ */
+async function readLegacyFirestoreConversations(userId) {
+  if (!userId || String(userId).startsWith('guest-')) {
+    return { loaded: false, chats: [] };
+  }
+
+  const timeoutMs = getFirestoreTimeoutMs();
+
+  if (customLegacyFirestoreChatsLoader) {
+    try {
+      const rawList = await withBoundedTimeout(
+        Promise.resolve().then(() => customLegacyFirestoreChatsLoader(userId)),
+        timeoutMs,
+        'loadLegacyFirestoreChats'
+      );
+      if (!Array.isArray(rawList)) {
+        return { loaded: true, chats: [] };
+      }
+      const mapped = rawList
+        .map((item) => {
+          if (!item || typeof item !== 'object') return null;
+          return mapLegacyFirestoreConversationToChat(item.id || item._id, item);
+        })
+        .filter(Boolean);
+      return { loaded: true, chats: mapped };
+    } catch (err) {
+      console.warn('Read-only legacy Firestore conversation discovery skipped:', err?.message || err);
+      return { loaded: false, chats: [] };
+    }
+  }
+
+  if (!db || !isFirebaseConfigured() || !isBrowserOnline()) {
+    return { loaded: false, chats: [] };
+  }
+
+  try {
+    const chatsRef = collection(db, 'users', userId, 'chats');
+    const snapshot = await withBoundedTimeout(
+      getDocs(chatsRef),
+      timeoutMs,
+      'loadLegacyFirestoreChats'
+    );
+    const legacyChats = [];
+
+    snapshot.forEach((docSnap) => {
+      const mapped = mapLegacyFirestoreConversationToChat(docSnap.id, docSnap.data());
+      if (mapped) {
+        legacyChats.push(mapped);
+      }
+    });
+
+    return { loaded: true, chats: legacyChats };
+  } catch (err) {
+    console.warn('Read-only legacy Firestore conversation discovery skipped:', err?.message || err);
+    return { loaded: false, chats: [] };
+  }
+}
+
+/**
+ * Lists conversations for the authenticated user from MongoDB API, deterministically merged
+ * with read-only legacy Firestore conversations and local cache fallback.
  * @param {string} userId
  * @param {Object} [options]
  * @returns {Promise<Array>}
@@ -1280,25 +1954,24 @@ export async function listConversations(userId, options = {}) {
   }
 
   try {
-    const token = await resolveAuthToken();
-    if (!token) {
+    const initialToken = await resolveAuthToken(false);
+    if (!initialToken) {
       return getCachedUserChats(userId);
     }
 
+    const hasFilterOrSlice = Boolean(options?.mode || options?.limit || options?.skip);
     const queryParams = new URLSearchParams();
     if (options.mode) queryParams.set('mode', options.mode);
-    if (options.limit) queryParams.set('limit', String(options.limit));
-    if (options.skip) queryParams.set('skip', String(options.skip));
     const qs = queryParams.toString();
-    const endpoint = getApiEndpoint(`/api/conversations${qs ? '?' + qs : ''}`);
 
-    const res = await fetch(endpoint, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Accept': 'application/json'
-      }
-    });
+    const [{ res }, legacyOutcome] = await Promise.all([
+      authorizedApiFetch(`/api/conversations${qs ? '?' + qs : ''}`, { method: 'GET' }),
+      readLegacyFirestoreConversations(userId)
+    ]);
+
+    if (!res) {
+      return getCachedUserChats(userId);
+    }
 
     if (!res.ok) {
       throw new Error(`Failed to list conversations (${res.status})`);
@@ -1307,7 +1980,34 @@ export async function listConversations(userId, options = {}) {
     const data = await res.json();
     if (Array.isArray(data?.conversations)) {
       const mapped = data.conversations.map(mapMongoConversationToChat).filter(Boolean);
-      return mergeCloudAndLocalChats(userId, mapped);
+      if (!hasFilterOrSlice) {
+        return mergeCloudAndLocalChats(userId, mapped, legacyOutcome, { persistCache: true });
+      }
+
+      const modeFilter = options.mode ? String(options.mode).trim().toLowerCase() : null;
+      const filteredLegacy = modeFilter
+        ? legacyOutcome.chats.filter((c) => (c.mode || 'general') === modeFilter)
+        : legacyOutcome.chats;
+      let merged = mergeCloudAndLocalChats(
+        userId,
+        mapped,
+        { loaded: legacyOutcome.loaded, chats: filteredLegacy },
+        { persistCache: false }
+      );
+      if (modeFilter) {
+        merged = merged.filter((c) => (c.mode || 'general') === modeFilter);
+      }
+      const skipCount =
+        Number.isFinite(Number(options.skip)) && Number(options.skip) > 0
+          ? Number(options.skip)
+          : 0;
+      const limitCount =
+        Number.isFinite(Number(options.limit)) && Number(options.limit) > 0
+          ? Number(options.limit)
+          : 0;
+      if (skipCount > 0) merged = merged.slice(skipCount);
+      if (limitCount > 0) merged = merged.slice(0, limitCount);
+      return merged;
     }
     return getCachedUserChats(userId);
   } catch (err) {
@@ -1320,7 +2020,8 @@ export async function listConversations(userId, options = {}) {
 
 /**
  * Subscribes in real-time to the authenticated user's conversations list.
- * Hydrates immediately from local cache and syncs with the authenticated MongoDB API.
+ * Hydrates immediately from local cache and syncs with the authenticated MongoDB API
+ * alongside read-only legacy Firestore conversation discovery.
  *
  * @param {string} userId
  * @param {(chats: Array) => void} onUpdate
@@ -1358,17 +2059,15 @@ export function subscribeToUserChats(userId, onUpdate, onError = null) {
 
   async function fetchFromMongo() {
     try {
-      const token = await resolveAuthToken();
-      if (!token || !isSubscribed) return;
+      const initialToken = await resolveAuthToken(false);
+      if (!initialToken || !isSubscribed) return;
 
-      const endpoint = getApiEndpoint('/api/conversations');
-      const res = await fetch(endpoint, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Accept': 'application/json'
-        }
-      });
+      const [{ res }, legacyOutcome] = await Promise.all([
+        authorizedApiFetch('/api/conversations', { method: 'GET' }),
+        readLegacyFirestoreConversations(userId)
+      ]);
+
+      if (!res || !isSubscribed) return;
 
       if (!res.ok) {
         throw new Error(`Failed to fetch conversations (${res.status})`);
@@ -1379,7 +2078,7 @@ export function subscribeToUserChats(userId, onUpdate, onError = null) {
 
       if (Array.isArray(data?.conversations)) {
         const mapped = data.conversations.map(mapMongoConversationToChat).filter(Boolean);
-        const merged = mergeCloudAndLocalChats(userId, mapped);
+        const merged = mergeCloudAndLocalChats(userId, mapped, legacyOutcome, { persistCache: true });
         onUpdate(merged);
       }
     } catch (err) {
@@ -1404,77 +2103,248 @@ export function subscribeToUserChats(userId, onUpdate, onError = null) {
 }
 
 /**
- * Loads all messages for a specific conversation, ordered chronologically.
- * Falls back cleanly to user-scoped local cache when offline, and merges any unsynced local messages when online.
+ * Reads unmigrated legacy messages for a conversation from Cloud Firestore in read-only mode.
+ * Never modifies, deletes, or bulk-migrates Firestore documents.
  *
  * @param {string} userId
  * @param {string} chatId
- * @returns {Promise<Array>}
+ * @returns {Promise<{ loaded: boolean, messages: Array }>}
  */
-export async function loadConversationMessages(userId, chatId) {
-  const localMessages = getCachedChatMessages(userId, chatId);
-
-  if (!db || !isFirebaseConfigured() || !isBrowserOnline()) {
-    return ensureConversationAlternatives(localMessages);
+async function readLegacyFirestoreMessages(userId, chatId) {
+  if (!userId || !chatId || String(userId).startsWith('guest-')) {
+    return { loaded: false, messages: [] };
   }
 
-  const messagesRef = collection(db, 'users', userId, 'chats', chatId, 'messages');
-  const q = query(messagesRef, orderBy('createdAt', 'asc'));
+  const timeoutMs = getFirestoreTimeoutMs();
+
+  if (customLegacyFirestoreLoader) {
+    try {
+      const rawList = await withBoundedTimeout(
+        Promise.resolve().then(() => customLegacyFirestoreLoader(userId, chatId)),
+        timeoutMs,
+        'loadLegacyFirestoreMessages'
+      );
+      if (!Array.isArray(rawList)) {
+        return { loaded: true, messages: [] };
+      }
+      const mapped = rawList
+        .filter((item) => item && item.id)
+        .map((data) => {
+          const createdAtMs =
+            typeof data.createdAtMs === 'number'
+              ? data.createdAtMs
+              : data.createdAt?.toMillis
+                ? data.createdAt.toMillis()
+                : typeof data.createdAt === 'number'
+                  ? data.createdAt
+                  : data.createdAt
+                    ? new Date(data.createdAt).getTime()
+                    : undefined;
+          const msg = {
+            id: data.id,
+            sender: data.sender,
+            content: typeof data.content === 'string' ? data.content : '',
+            modelUsed: data.modelUsed || null,
+            provider: data.provider || null,
+            mode: data.mode || undefined,
+            responseTimeMs: typeof data.responseTimeMs === 'number' ? data.responseTimeMs : null,
+            parentMessageId: data.parentMessageId || null,
+            activeAlternativeId: data.activeAlternativeId || null,
+            alternatives: Array.isArray(data.alternatives) ? data.alternatives : [],
+            attachments: Array.isArray(data.attachments) ? data.attachments : [],
+            referencedAttachments: Array.isArray(data.referencedAttachments) ? data.referencedAttachments : [],
+            isStopped: Boolean(data.isStopped),
+            isInterrupted: Boolean(data.isInterrupted),
+            createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : undefined,
+            timestamp:
+              data.clientTimestamp ||
+              data.timestamp ||
+              (Number.isFinite(createdAtMs)
+                ? new Date(createdAtMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                : ''),
+            pendingSync: false,
+            syncedToMongo: false
+          };
+          return msg.sender === 'assistant' ? normalizeAssistantMessage(msg) : msg;
+        });
+      return { loaded: true, messages: mapped };
+    } catch (err) {
+      console.warn('Legacy Firestore loader warning:', err?.message || err);
+      return { loaded: false, messages: [] };
+    }
+  }
+
+  if (!db || !isFirebaseConfigured() || !isBrowserOnline()) {
+    return { loaded: false, messages: [] };
+  }
 
   try {
-    const snapshot = await withBoundedTimeout(getDocs(q), FIRESTORE_OP_TIMEOUT_MS, 'loadConversationMessages');
-    const cloudMessages = [];
+    const messagesRef = collection(db, 'users', userId, 'chats', chatId, 'messages');
+    const q = query(messagesRef, orderBy('createdAt', 'asc'));
+    const snapshot = await withBoundedTimeout(
+      getDocs(q),
+      timeoutMs,
+      'loadLegacyFirestoreMessages'
+    );
+    const legacyMessages = [];
 
     snapshot.forEach((docSnap) => {
       const data = docSnap.data();
-      cloudMessages.push({
+      const createdAtMs = data.createdAt?.toMillis
+        ? data.createdAt.toMillis()
+        : typeof data.createdAtMs === 'number'
+          ? data.createdAtMs
+          : undefined;
+      const msg = {
         id: docSnap.id,
         sender: data.sender,
-        content: data.content,
+        content: typeof data.content === 'string' ? data.content : '',
         modelUsed: data.modelUsed || null,
         provider: data.provider || null,
+        mode: data.mode || undefined,
         responseTimeMs: typeof data.responseTimeMs === 'number' ? data.responseTimeMs : null,
         parentMessageId: data.parentMessageId || null,
         activeAlternativeId: data.activeAlternativeId || null,
         alternatives: Array.isArray(data.alternatives) ? data.alternatives : [],
         attachments: Array.isArray(data.attachments) ? data.attachments : [],
         referencedAttachments: Array.isArray(data.referencedAttachments) ? data.referencedAttachments : [],
-        createdAtMs: data.createdAt?.toMillis ? data.createdAt.toMillis() : undefined,
+        isStopped: Boolean(data.isStopped),
+        isInterrupted: Boolean(data.isInterrupted),
+        createdAtMs,
         timestamp:
           data.clientTimestamp ||
           (data.createdAt?.toDate
             ? data.createdAt.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
             : ''),
-        pendingSync: false
-      });
+        pendingSync: false,
+        syncedToMongo: false
+      };
+      legacyMessages.push(msg.sender === 'assistant' ? normalizeAssistantMessage(msg) : msg);
     });
 
-    // Merge cloud messages with any unsynced local messages by deterministic message ID (zero duplicates)
-    const byId = new Map();
-    for (const cm of cloudMessages) {
-      byId.set(cm.id, cm);
+    return { loaded: true, messages: legacyMessages };
+  } catch (err) {
+    console.warn('Read-only legacy Firestore message fallback skipped:', err?.message || err);
+    return { loaded: false, messages: [] };
+  }
+}
+
+/**
+ * Loads all messages for a specific conversation via the authenticated Express/MongoDB API
+ * (/api/messages), ordered chronologically.
+ * Safely merges unmigrated legacy Firestore messages (read-only) and unsynced local messages
+ * by deterministic message ID without duplicates, and preserves guest/offline local behavior.
+ *
+ * @param {string} userId
+ * @param {string} chatId
+ * @returns {Promise<Array>}
+ */
+export async function loadConversationMessages(userId, chatId) {
+  if (!userId || !chatId) {
+    return [];
+  }
+
+  const isGuest = String(userId).startsWith('guest-');
+  const localMessages = getCachedChatMessages(userId, chatId);
+
+  if (isGuest || !isBrowserOnline()) {
+    return ensureConversationAlternatives(sortMessagesChronologically(localMessages));
+  }
+
+  const deletedSet = new Set(getDeletedMessageTombstones(userId, chatId));
+  let mongoMessages = [];
+  let mongoLoaded = false;
+  let mongoNotFound = false;
+  let mongoNetworkFallback = false;
+
+  try {
+    const { res, token } = await authorizedApiFetch(
+      `/api/messages?conversationId=${encodeURIComponent(chatId)}&sort=asc`,
+      { method: 'GET' }
+    );
+
+    if (!token || !res) {
+      return ensureConversationAlternatives(sortMessagesChronologically(localMessages));
     }
-    for (const lm of localMessages) {
-      if (!lm?.id) continue;
-      if (!byId.has(lm.id)) {
-        if (lm.pendingSync || cloudMessages.length === 0) {
-          byId.set(lm.id, lm);
-        }
-      } else if (lm.pendingSync) {
-        // Prefer locally updated version until sync completes
+
+    if (res.status === 401 || res.status === 403 || res.status === 400) {
+      const errorData = await res.json().catch(() => ({}));
+      const apiErr = new Error(errorData.error || `Access denied while loading messages (${res.status})`);
+      apiErr.status = res.status;
+      apiErr.code = errorData.code || 'MESSAGE_LOAD_DENIED';
+      throw apiErr;
+    }
+
+    if (res.status === 404) {
+      mongoNotFound = true;
+    } else if (res.ok) {
+      const data = await res.json().catch(() => ({}));
+      if (Array.isArray(data?.messages)) {
+        mongoMessages = data.messages.map(mapMongoMessageToUiMessage).filter(Boolean);
+      }
+      mongoLoaded = true;
+    } else {
+      mongoNetworkFallback = true;
+    }
+  } catch (err) {
+    if (err?.status === 400 || err?.status === 401 || err?.status === 403) {
+      throw err;
+    }
+    if (isOfflineOrNetworkError(err)) {
+      mongoNetworkFallback = true;
+    } else {
+      throw err;
+    }
+  }
+
+  // Skip legacy Firestore message lookup when conversation is reliably confirmed MongoDB-only
+  const cachedChat = getCachedUserChats(userId).find((c) => c.id === chatId);
+  const canSkipLegacyMessages =
+    mongoLoaded &&
+    cachedChat?.hasLegacyFirestore === false &&
+    !(customLegacyFirestoreLoader && !customLegacyFirestoreChatsLoader);
+
+  // Read-only compatibility merge with any legacy messages still stored in Firestore
+  const legacyResult = canSkipLegacyMessages
+    ? { loaded: true, messages: [] }
+    : await readLegacyFirestoreMessages(userId, chatId);
+
+  if (mongoNetworkFallback && !legacyResult.loaded) {
+    console.warn('Offline/network fallback: loaded conversation messages from local cache:', chatId);
+    return ensureConversationAlternatives(
+      sortMessagesChronologically(localMessages.filter((m) => m?.id && !deletedSet.has(m.id)))
+    );
+  }
+
+  // Deterministic merge by message ID (MongoDB overrides legacy Firestore; pendingSync local overrides cloud)
+  const byId = new Map();
+
+  for (const legacyMsg of legacyResult.messages) {
+    if (!legacyMsg?.id || deletedSet.has(legacyMsg.id)) continue;
+    byId.set(legacyMsg.id, legacyMsg);
+  }
+
+  for (const mongoMsg of mongoMessages) {
+    if (!mongoMsg?.id || deletedSet.has(mongoMsg.id)) continue;
+    byId.set(mongoMsg.id, mongoMsg);
+  }
+
+  for (const lm of localMessages) {
+    if (!lm?.id || deletedSet.has(lm.id)) continue;
+    if (lm.pendingSync) {
+      byId.set(lm.id, lm);
+    } else if (!byId.has(lm.id)) {
+      if (
+        mongoNetworkFallback ||
+        (!lm.syncedToMongo && !legacyResult.loaded && mongoNotFound)
+      ) {
         byId.set(lm.id, lm);
       }
     }
-
-    const merged = Array.from(byId.values());
-    const normalized = ensureConversationAlternatives(merged);
-    saveCachedChatMessages(userId, chatId, normalized);
-    return normalized;
-  } catch (err) {
-    if (isOfflineOrNetworkError(err)) {
-      console.warn('Offline fallback: loaded conversation messages from local cache:', chatId);
-      return ensureConversationAlternatives(localMessages);
-    }
-    throw err;
   }
+
+  const sorted = sortMessagesChronologically(Array.from(byId.values()));
+  const normalized = ensureConversationAlternatives(sorted);
+  saveCachedChatMessages(userId, chatId, normalized);
+  return normalized;
 }
