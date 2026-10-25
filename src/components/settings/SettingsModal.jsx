@@ -181,13 +181,16 @@ export default function SettingsModal() {
         aria-labelledby="settings-dialog-title"
         ref={modalRef}
       >
+        {/* Mobile Drag Handle Affordance */}
+        <div className="settings-drag-handle" aria-hidden="true" />
+
         {/* Modal Header */}
         <div className="settings-modal-header">
           <div className="settings-header-title-block">
             <div className="settings-header-icon-wrap" aria-hidden="true">
               <Sliders size={18} />
             </div>
-            <div>
+            <div className="settings-header-titles">
               <h2 id="settings-dialog-title" className="settings-modal-title">
                 Personalization Settings
               </h2>
@@ -569,7 +572,7 @@ export default function SettingsModal() {
                   </div>
 
                   <div
-                    className="settings-segmented-group"
+                    className="settings-segmented-group settings-segmented-rates"
                     role="radiogroup"
                     aria-labelledby="speech-rate-label"
                   >
@@ -605,10 +608,10 @@ export default function SettingsModal() {
         {/* Modal Footer */}
         <div className="settings-modal-footer">
           {confirmReset ? (
-            <div className="settings-confirm-reset-box">
-              <div className="flex items-center gap-2 text-amber-400 text-xs font-medium">
-                <AlertTriangle size={14} className="shrink-0" />
-                <span>Reset all settings to original defaults?</span>
+            <div className="settings-confirm-reset-box" role="alertdialog" aria-label="Confirm settings reset">
+              <div className="settings-confirm-reset-text flex items-center gap-2 text-amber-400 text-xs font-medium">
+                <AlertTriangle size={14} className="shrink-0" aria-hidden="true" />
+                <span>Reset all preferences to their factory defaults?</span>
               </div>
               <div className="flex items-center gap-2">
                 <Button
@@ -616,6 +619,7 @@ export default function SettingsModal() {
                   size="sm"
                   onClick={() => setConfirmReset(false)}
                   disabled={isSaving}
+                  autoFocus
                 >
                   Cancel
                 </Button>

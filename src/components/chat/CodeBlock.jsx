@@ -130,7 +130,7 @@ function renderHighlightedTokens(tokens) {
  * - Synchronized vertical scrolling for large code blocks
  * - Preserves tabs, spaces, blank lines, and special characters
  */
-export default function CodeBlock({
+function CodeBlock({
   code = '',
   language = '',
   isStreaming = false,
@@ -261,18 +261,19 @@ export default function CodeBlock({
           className={`code-copy-btn ${copied ? 'copied' : ''} ${copyFailed ? 'failed' : ''}`}
           onClick={handleCopy}
           title="Copy code to clipboard"
-          aria-label="Copy code snippet"
+          aria-label={copied ? 'Code copied to clipboard' : 'Copy code snippet to clipboard'}
+          aria-live="polite"
         >
           {copied ? (
             <>
-              <Check size={13} className="copy-icon success" />
+              <Check size={13} className="copy-icon success" aria-hidden="true" />
               <span>Copied!</span>
             </>
           ) : copyFailed ? (
             <span>Failed</span>
           ) : (
             <>
-              <Copy size={13} className="copy-icon" />
+              <Copy size={13} className="copy-icon" aria-hidden="true" />
               <span>Copy code</span>
             </>
           )}
@@ -302,7 +303,13 @@ export default function CodeBlock({
           </div>
         )}
 
-        <pre className="code-content" tabIndex={0}>
+        <pre
+          className="code-content"
+          tabIndex={0}
+          role="region"
+          aria-label={`${langInfo.label} source code`}
+          spellCheck="false"
+        >
           <code className={`code-syntax language-${langInfo.id}`}>
             {highlightedContent}
           </code>
@@ -311,3 +318,5 @@ export default function CodeBlock({
     </div>
   );
 }
+
+export default React.memo(CodeBlock);

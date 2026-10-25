@@ -1,6 +1,10 @@
 /**
  * Orvix OpenRouter AI Service
- * Dedicated service module routing OpenRouter chat requests through the server-side endpoint (/api/chat).
+ * Dedicated service module handling communication with OpenRouter API.
+ * Uses OpenRouter's OpenAI-compatible endpoint with free model preference.
+ *
+ * NOTE: As per prototype requirements, the client reads VITE_OPENROUTER_API_KEY.
+ * For production deployment, API requests should be proxied through a secure backend.
  */
 
 import { getChatMode } from '../config/chatModes.js';
@@ -10,6 +14,7 @@ export function getOpenRouterApiKey() {
   return '';
 }
 
+// OpenRouter free model
 const DEFAULT_MODEL = 'openrouter/free';
 
 function normalizeAttachments(attachments = []) {
@@ -28,6 +33,16 @@ function normalizeAttachments(attachments = []) {
     });
 }
 
+/**
+ * Formats conversation history into OpenAI-compatible format expected by OpenRouter,
+ * integrating document context adaptation when attachments are provided.
+ * @param {Array} history
+ * @param {string} prompt
+ * @param {number} [maxContextMessages=12]
+ * @param {string} [mode='general']
+ * @param {Array} [attachments=[]]
+ * @returns {Array<{ role: string, content: string }>}
+ */
 export function formatOpenRouterMessages(history = [], prompt, maxContextMessages = 12, mode = 'general', attachments = []) {
   const modeObj = getChatMode(mode);
   const baseSystemContent = [
@@ -80,15 +95,15 @@ export function formatOpenRouterMessages(history = [], prompt, maxContextMessage
   return messages;
 }
 
-export async function sendOpenRouterMessage({
-  prompt,
-  history = [],
-  username = null,
-  preferences = null,
-  mode = 'general',
-  conversationId = null,
-  attachments = []
-}) {
+/**
+ * Sends a conversation to the OpenRouter API via the server-side proxy and returns the generated text.
+ * @param {Object} params
+ * @param {string} params.prompt - Current user input prompt
+ * @param {Array} [params.history=[]] - Previous conversation messages
+ * @param {Array} [params.attachments=[]]
+ * @returns {Promise<{ text: string, modelUsed: string }>}
+ */
+export async function sendOpenRouterMessage({ prompt, history = [], mode = 'general', attachments = [], conversationId = null }) {
   const response = await fetch('/api/chat', {
     method: 'POST',
     headers: {
@@ -99,9 +114,6 @@ export async function sendOpenRouterMessage({
       mode,
       prompt,
       history,
-      username: username ? String(username).trim() : null,
-      preferences: preferences || null,
-      stream: false,
       conversationId: conversationId || null,
       attachments: Array.isArray(attachments) ? attachments : []
     })
@@ -129,17 +141,16 @@ export async function sendOpenRouterMessage({
   };
 }
 
-export async function streamOpenRouterMessage({
-  prompt,
-  history = [],
-  username = null,
-  preferences = null,
-  mode = 'general',
-  onChunk,
-  signal,
-  conversationId = null,
-  attachments = []
-}) {
+/**
+ * Streams conversation responses from OpenRouter API via the server-side SSE endpoint.
+ * @param {Object} params
+ * @param {string} params.prompt
+ * @param {Array} [params.history=[]]
+ * @param {(chunk: string, accumulated: string) => void} [params.onChunk]
+ * @param {AbortSignal} [params.signal]
+ * @returns {Promise<{ text: string, modelUsed: string }>}
+ */
+export async function streamOpenRouterMessage({ prompt, history = [], mode = 'general', onChunk, signal, attachments = [], conversationId = null }) {
   const response = await fetch('/api/chat', {
     method: 'POST',
     headers: {
@@ -151,8 +162,6 @@ export async function streamOpenRouterMessage({
       mode,
       prompt,
       history,
-      username: username ? String(username).trim() : null,
-      preferences: preferences || null,
       stream: true,
       conversationId: conversationId || null,
       attachments: Array.isArray(attachments) ? attachments : []
@@ -231,3 +240,4 @@ export async function streamOpenRouterMessage({
     modelUsed: data.modelUsed || DEFAULT_MODEL
   };
 }
+

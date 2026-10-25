@@ -576,6 +576,11 @@ export async function inspectWebLLMReadiness(preferredModelId = DEFAULT_WEBLLM_M
   });
 
   if (!gpuSupport.supported) {
+    updateEngineState({
+      isCached: false,
+      modelId: resolvedId,
+      hasShaderF16: false
+    });
     return {
       modelId: resolvedId,
       isCached: false,
@@ -584,6 +589,12 @@ export async function inspectWebLLMReadiness(preferredModelId = DEFAULT_WEBLLM_M
   }
 
   const isCached = await isWebLLMModelCached(resolvedId);
+  updateEngineState({
+    isCached,
+    modelId: resolvedId,
+    hasShaderF16: gpuSupport.hasShaderF16
+  });
+
   return {
     modelId: resolvedId,
     isCached,

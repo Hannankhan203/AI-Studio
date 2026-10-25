@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   X,
   Download,
@@ -18,6 +18,7 @@ import {
   downloadAttachmentFile,
   isFormatPreviewable
 } from '../../services/attachmentStorageService.js';
+import { extractBrowserDocument } from '../../services/browserDocumentExtractor.js';
 
 function getModalFormatIcon(ext = '') {
   const cleanExt = (ext || '').replace('.', '').toLowerCase();
@@ -65,6 +66,7 @@ export default function DocumentPreviewModal({ isOpen, onClose, attachment }) {
   const [activeView, setActiveView] = useState('image'); // 'image' | 'ocr'
   const [ocrData, setOcrData] = useState(attachment?.extraction || null);
   const [ocrLoading, setOcrLoading] = useState(false);
+  const createdObjectUrlRef = useRef(null);
 
   const filename = attachment?.name || attachment?.originalName || 'Document';
   const filenameExt = filename.includes('.') ? filename.split('.').pop()?.toLowerCase() : '';
@@ -82,6 +84,8 @@ export default function DocumentPreviewModal({ isOpen, onClose, attachment }) {
     mime === 'application/json' ||
     mime === 'application/xml';
   const isOffice = ['docx', 'doc', 'pptx', 'ppt', 'xlsx', 'xls'].includes(ext);
+  const isUnsubmittedComposerFile =
+    attachment?.file instanceof Blob && String(attachment?.id || '').startsWith('att-') && !attachment?.extraction;
 
   useEffect(() => {
     if (!isOpen || !attachment?.id) return;
@@ -95,16 +99,26 @@ export default function DocumentPreviewModal({ isOpen, onClose, attachment }) {
     setActiveView('image');
     setOcrData(attachment?.extraction || null);
 
+    const registerCreatedUrl = (url) => {
+      if (createdObjectUrlRef.current && createdObjectUrlRef.current !== url) {
+        try {
+          URL.revokeObjectURL(createdObjectUrlRef.current);
+        } catch (_) {}
+      }
+      createdObjectUrlRef.current = url;
+      setBlobUrl(url);
+    };
+
     async function loadContent() {
       try {
-        // Fetch OCR extraction if not already present on image
+        // Fetch OCR extraction if not already present on image (skip for unsubmitted local composer attachments)
         if (isImage) {
           if (attachment.extraction) {
             setOcrData(attachment.extraction);
             if (attachment.extraction.text) {
               setTextContent(attachment.extraction.text);
             }
-          } else {
+          } else if (!isUnsubmittedComposerFile) {
             setOcrLoading(true);
             fetch(`/api/upload/${attachment.id}/extraction`)
               .then((r) => (r.ok ? r.json() : null))
@@ -125,18 +139,35 @@ export default function DocumentPreviewModal({ isOpen, onClose, attachment }) {
         if (attachment.file instanceof Blob) {
           if (!active) return;
           const url = URL.createObjectURL(attachment.file);
-          setBlobUrl(url);
+          registerCreatedUrl(url);
           if (isTextual) {
             try {
               const text = await attachment.file.text();
               if (active) setTextContent(text);
             } catch (_) {}
+          } else if (isOffice) {
+            if (attachment.extraction?.text) {
+              if (active) setTextContent(attachment.extraction.text);
+            } else {
+              try {
+                const extracted = await extractBrowserDocument(attachment.file, {
+                  id: attachment.id,
+                  name: filename,
+                  originalName: filename,
+                  mimeType: mime,
+                  extension: ext
+                });
+                if (active && extracted?.text) {
+                  setTextContent(extracted.text);
+                }
+              } catch (_) {}
+            }
           }
           if (active) setLoading(false);
           return;
         }
 
-        // Direct previewUrl or dataUrl (data: or blob:)
+        // Direct previewUrl or dataUrl (data: or blob: owned externally — do NOT revoke on modal close)
         const directDataUri = attachment.previewUrl || attachment.dataUrl;
         if (typeof directDataUri === 'string' && (directDataUri.startsWith('data:') || directDataUri.startsWith('blob:'))) {
           if (!active) return;
@@ -150,13 +181,15 @@ export default function DocumentPreviewModal({ isOpen, onClose, attachment }) {
         if (localRecord?.blob) {
           if (!active) return;
           const url = URL.createObjectURL(localRecord.blob);
-          setBlobUrl(url);
+          registerCreatedUrl(url);
 
           if (isTextual) {
             try {
               const text = await localRecord.blob.text();
               if (active) setTextContent(text);
             } catch (_) {}
+          } else if (isOffice && attachment.extraction?.text) {
+            setTextContent(attachment.extraction.text);
           }
           if (active) setLoading(false);
           return;
@@ -179,7 +212,7 @@ export default function DocumentPreviewModal({ isOpen, onClose, attachment }) {
         const blob = await fileRes.blob();
         if (!active) return;
         const url = URL.createObjectURL(blob);
-        setBlobUrl(url);
+        registerCreatedUrl(url);
 
         if (isTextual) {
           const text = await blob.text();
@@ -205,21 +238,23 @@ export default function DocumentPreviewModal({ isOpen, onClose, attachment }) {
 
     return () => {
       active = false;
-    };
-  }, [isOpen, attachment?.id, ext, isTextual, isOffice, isImage]);
-
-  // Clean up object URLs on unmount / change
-  useEffect(() => {
-    return () => {
-      if (blobUrl) {
-        URL.revokeObjectURL(blobUrl);
+      if (createdObjectUrlRef.current) {
+        try {
+          URL.revokeObjectURL(createdObjectUrlRef.current);
+        } catch (_) {}
+        createdObjectUrlRef.current = null;
       }
     };
-  }, [blobUrl]);
+  }, [isOpen, attachment?.id, ext, isTextual, isOffice, isImage, isUnsubmittedComposerFile, filename, mime]);
 
-  // Handle ESC key to close
+  // Handle ESC key to close and focus close button on open
+  const closeBtnRef = useRef(null);
+
   useEffect(() => {
     if (!isOpen) return;
+    const focusTimer = setTimeout(() => {
+      closeBtnRef.current?.focus();
+    }, 50);
     const handleKeyDown = (e) => {
       if (e.key === 'Escape') {
         e.preventDefault();
@@ -227,7 +262,10 @@ export default function DocumentPreviewModal({ isOpen, onClose, attachment }) {
       }
     };
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    return () => {
+      clearTimeout(focusTimer);
+      window.removeEventListener('keydown', handleKeyDown);
+    };
   }, [isOpen, onClose]);
 
   if (!isOpen || !attachment) return null;
@@ -269,21 +307,21 @@ export default function DocumentPreviewModal({ isOpen, onClose, attachment }) {
         onClick={(e) => e.stopPropagation()}
       >
         {/* Modal Header */}
-        <div className="preview-modal-header flex items-center justify-between px-5 py-3.5 border-b border-white/10 bg-[#141b24]/80">
-          <div className="flex items-center gap-3 min-w-0 flex-1">
-            <div className="p-2 rounded-lg bg-blue-500/10 text-blue-400 flex-shrink-0">
+        <div className="preview-modal-header">
+          <div className="preview-modal-title-group">
+            <div className="preview-modal-icon-badge" aria-hidden="true">
               <IconComponent size={18} />
             </div>
-            <div className="min-w-0 flex-1">
+            <div className="preview-modal-title-wrap">
               <h2
                 id="preview-modal-title"
-                className="text-sm font-semibold text-slate-100 truncate"
+                className="preview-modal-title"
                 title={filename}
               >
                 {filename}
               </h2>
-              <div className="flex items-center gap-2 text-xs text-slate-400 mt-0.5">
-                <span className="uppercase font-semibold tracking-wider text-[11px] px-1.5 py-0.5 rounded bg-white/5">
+              <div className="preview-modal-meta">
+                <span className="preview-modal-ext-pill">
                   {ext || 'FILE'}
                 </span>
                 {sizeText && <span>• {sizeText}</span>}
@@ -291,36 +329,32 @@ export default function DocumentPreviewModal({ isOpen, onClose, attachment }) {
             </div>
           </div>
 
-          <div className="flex items-center gap-2 flex-shrink-0 ml-4">
-            {isImage && (
-              <div className="flex items-center rounded-lg bg-black/40 p-0.5 border border-white/10 text-xs mr-1">
+          <div className="preview-modal-desktop-controls">
+            {isImage && !isUnsubmittedComposerFile && (
+              <div className="preview-view-tabs" role="tablist" aria-label="Preview modes">
                 <button
                   type="button"
+                  role="tab"
+                  aria-selected={activeView === 'image'}
                   onClick={() => setActiveView('image')}
-                  className={`px-2.5 py-1 rounded-md font-medium transition-colors flex items-center gap-1.5 ${
-                    activeView === 'image'
-                      ? 'bg-blue-600 text-white shadow-xs'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
+                  className={`preview-tab-btn ${activeView === 'image' ? 'active' : ''}`}
                   title="View original image"
                 >
-                  <FileImage size={13} />
+                  <FileImage size={13} aria-hidden="true" />
                   <span>Image</span>
                 </button>
                 <button
                   type="button"
+                  role="tab"
+                  aria-selected={activeView === 'ocr'}
                   onClick={() => setActiveView('ocr')}
-                  className={`px-2.5 py-1 rounded-md font-medium transition-colors flex items-center gap-1.5 ${
-                    activeView === 'ocr'
-                      ? 'bg-blue-600 text-white shadow-xs'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
+                  className={`preview-tab-btn ${activeView === 'ocr' ? 'active' : ''}`}
                   title="View OCR extracted text"
                 >
-                  <FileText size={13} />
+                  <FileText size={13} aria-hidden="true" />
                   <span>Extracted Text</span>
                   {ocrData?.status === 'ready' && ocrData?.hasText ? (
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" title="Text detected"></span>
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" title="Text detected" />
                   ) : null}
                 </button>
               </div>
@@ -330,8 +364,9 @@ export default function DocumentPreviewModal({ isOpen, onClose, attachment }) {
               <button
                 type="button"
                 onClick={handleCopyText}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-white/5 hover:bg-white/10 text-slate-200 border border-white/10 transition-colors"
-                title="Copy extracted text"
+                className="preview-copy-btn"
+                title="Copy extracted text to clipboard"
+                aria-label="Copy extracted text"
               >
                 {copied ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} />}
                 <span>{copied ? 'Copied' : 'Copy Text'}</span>
@@ -342,21 +377,83 @@ export default function DocumentPreviewModal({ isOpen, onClose, attachment }) {
               type="button"
               onClick={handleDownloadOriginal}
               disabled={downloading}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors disabled:opacity-50"
+              className="preview-download-btn"
               title="Download original file"
+              aria-label={`Download original file ${filename}`}
             >
               {downloading ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
               <span>Download</span>
             </button>
+          </div>
+
+          <button
+            ref={closeBtnRef}
+            type="button"
+            onClick={onClose}
+            className="preview-close-btn"
+            aria-label="Close preview"
+            title="Close preview (Esc)"
+          >
+            <X size={18} />
+          </button>
+        </div>
+
+        {/* Mobile Dedicated Toolbar for Tabs and Actions */}
+        <div className="preview-modal-mobile-toolbar">
+          {isImage && !isUnsubmittedComposerFile && (
+            <div className="preview-view-tabs" role="tablist" aria-label="Preview modes">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeView === 'image'}
+                onClick={() => setActiveView('image')}
+                className={`preview-tab-btn ${activeView === 'image' ? 'active' : ''}`}
+                title="View original image"
+              >
+                <FileImage size={13} aria-hidden="true" />
+                <span>Image</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeView === 'ocr'}
+                onClick={() => setActiveView('ocr')}
+                className={`preview-tab-btn ${activeView === 'ocr' ? 'active' : ''}`}
+                title="View OCR extracted text"
+              >
+                <FileText size={13} aria-hidden="true" />
+                <span>Extracted Text</span>
+                {ocrData?.status === 'ready' && ocrData?.hasText ? (
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" title="Text detected" />
+                ) : null}
+              </button>
+            </div>
+          )}
+
+          <div className="preview-modal-mobile-actions">
+            {hasCopyableText && (
+              <button
+                type="button"
+                onClick={handleCopyText}
+                className="preview-copy-btn"
+                title="Copy extracted text to clipboard"
+                aria-label="Copy extracted text"
+              >
+                {copied ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} />}
+                <span>{copied ? 'Copied' : 'Copy'}</span>
+              </button>
+            )}
 
             <button
               type="button"
-              onClick={onClose}
-              className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/10 transition-colors"
-              aria-label="Close preview"
-              title="Close preview (Esc)"
+              onClick={handleDownloadOriginal}
+              disabled={downloading}
+              className="preview-download-btn"
+              title="Download original file"
+              aria-label={`Download original file ${filename}`}
             >
-              <X size={18} />
+              {downloading ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+              <span>Download</span>
             </button>
           </div>
         </div>
@@ -413,14 +510,14 @@ export default function DocumentPreviewModal({ isOpen, onClose, attachment }) {
               </div>
             ) : ocrData?.status === 'ready' && ocrData?.hasText ? (
               <div className="w-full h-full max-h-[70vh] flex flex-col">
-                <div className="text-xs text-slate-300 bg-white/5 border border-white/10 px-3 py-2 rounded-md mb-3 flex items-center justify-between">
-                  <div className="flex items-center gap-2">
+                <div className="preview-ocr-stats-bar text-xs text-slate-300 bg-white/5 border border-white/10 px-3 py-2 rounded-md mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <span className="font-semibold text-emerald-400">OCR Text Extracted</span>
                     {ocrData.confidence > 0 && (
                       <span className="text-slate-400">• Confidence: {ocrData.confidence}%</span>
                     )}
                   </div>
-                  <div className="flex items-center gap-3 text-slate-400">
+                  <div className="flex items-center gap-3 text-slate-400 flex-wrap">
                     <span>{ocrData.totalWords || 0} words</span>
                     <span>{ocrData.totalCharacters || 0} characters</span>
                     {ocrData.lineCount ? <span>{ocrData.lineCount} lines</span> : null}

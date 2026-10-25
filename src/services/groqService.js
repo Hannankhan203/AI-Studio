@@ -1,6 +1,10 @@
 /**
  * Orvix Groq AI Service
- * Dedicated service module routing Groq chat requests through the server-side endpoint (/api/chat).
+ * Dedicated service module handling communication with the Groq API.
+ * Uses Groq's high-speed OpenAI-compatible API endpoint.
+ *
+ * NOTE: As per prototype requirements, the client reads VITE_GROQ_API_KEY.
+ * For production deployment, API requests should be proxied through a secure backend.
  */
 
 import { getChatMode } from '../config/chatModes.js';
@@ -28,6 +32,16 @@ function normalizeAttachments(attachments = []) {
     });
 }
 
+/**
+ * Formats conversation history into OpenAI-compatible format expected by Groq,
+ * integrating document context adaptation when attachments are provided.
+ * @param {Array} history
+ * @param {string} prompt
+ * @param {number} [maxContextMessages=12]
+ * @param {string} [mode='general']
+ * @param {Array} [attachments=[]]
+ * @returns {Array<{ role: string, content: string }>}
+ */
 export function formatGroqMessages(history = [], prompt, maxContextMessages = 12, mode = 'general', attachments = []) {
   const modeObj = getChatMode(mode);
   const baseSystemContent = [
@@ -80,15 +94,15 @@ export function formatGroqMessages(history = [], prompt, maxContextMessages = 12
   return messages;
 }
 
-export async function sendGroqMessage({
-  prompt,
-  history = [],
-  username = null,
-  preferences = null,
-  mode = 'general',
-  conversationId = null,
-  attachments = []
-}) {
+/**
+ * Sends a conversation to the Groq API via the server-side proxy and returns the generated text.
+ * @param {Object} params
+ * @param {string} params.prompt - Current user input prompt
+ * @param {Array} [params.history=[]] - Previous conversation messages
+ * @param {Array} [params.attachments=[]]
+ * @returns {Promise<{ text: string, modelUsed: string }>}
+ */
+export async function sendGroqMessage({ prompt, history = [], mode = 'general', attachments = [], conversationId = null }) {
   const response = await fetch('/api/chat', {
     method: 'POST',
     headers: {
@@ -99,9 +113,6 @@ export async function sendGroqMessage({
       mode,
       prompt,
       history,
-      username: username ? String(username).trim() : null,
-      preferences: preferences || null,
-      stream: false,
       conversationId: conversationId || null,
       attachments: Array.isArray(attachments) ? attachments : []
     })
@@ -129,17 +140,16 @@ export async function sendGroqMessage({
   };
 }
 
-export async function streamGroqMessage({
-  prompt,
-  history = [],
-  username = null,
-  preferences = null,
-  mode = 'general',
-  onChunk,
-  signal,
-  conversationId = null,
-  attachments = []
-}) {
+/**
+ * Streams conversation responses from Groq via the server-side SSE endpoint.
+ * @param {Object} params
+ * @param {string} params.prompt
+ * @param {Array} [params.history=[]]
+ * @param {(chunk: string, accumulated: string) => void} [params.onChunk]
+ * @param {AbortSignal} [params.signal]
+ * @returns {Promise<{ text: string, modelUsed: string }>}
+ */
+export async function streamGroqMessage({ prompt, history = [], mode = 'general', onChunk, signal, attachments = [], conversationId = null }) {
   const response = await fetch('/api/chat', {
     method: 'POST',
     headers: {
@@ -151,8 +161,6 @@ export async function streamGroqMessage({
       mode,
       prompt,
       history,
-      username: username ? String(username).trim() : null,
-      preferences: preferences || null,
       stream: true,
       conversationId: conversationId || null,
       attachments: Array.isArray(attachments) ? attachments : []
@@ -231,3 +239,4 @@ export async function streamGroqMessage({
     modelUsed: data.modelUsed || DEFAULT_MODEL
   };
 }
+

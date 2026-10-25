@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
 import {
   ArrowUp,
   ArrowDown,
@@ -15,11 +15,13 @@ import {
   Loader2,
   Globe,
   Paperclip,
-  FileImage
+  FileImage,
+  Eye
 } from 'lucide-react';
 import WelcomeScreen from './WelcomeScreen.jsx';
 import MessageList from './MessageList.jsx';
 import BrowserAIStatusBar from './BrowserAIStatusBar.jsx';
+import DocumentPreviewModal from './DocumentPreviewModal.jsx';
 import Button from '../ui/Button.jsx';
 import { useVoiceDictation, combineComposerText } from '../../hooks/useVoiceDictation.js';
 import { sendAIMessage, PROVIDER_OPTIONS } from '../../services/aiRouter.js';
@@ -233,6 +235,13 @@ export default function ChatArea({
   // Selected file attachments state (strictly capped at 1 attachment per user message)
   const [attachments, setAttachments] = useState([]);
   const [attachmentNotice, setAttachmentNotice] = useState(null);
+  const [previewingComposerAttachment, setPreviewingComposerAttachment] = useState(null);
+
+  // Mobile/compact viewport & multiline expansion tracking
+  const [isCompactViewport, setIsCompactViewport] = useState(
+    () => typeof window !== 'undefined' && window.innerWidth < 768
+  );
+  const [isExpandedInput, setIsExpandedInput] = useState(false);
 
   // Drag-and-drop file attachment state
   const [isDraggingOver, setIsDraggingOver] = useState(false);
@@ -247,10 +256,15 @@ export default function ChatArea({
     return () => clearTimeout(timer);
   }, [attachmentNotice]);
 
-  // Revoke object URLs on component unmount to prevent memory leaks
+  // Track unsubmitted attachments in a ref so object URLs are revoked only on component unmount
+  // (individual removal is handled in handleRemoveAttachment; revoking on every attachments array change
+  // would prematurely revoke previewUrl when attachments are cleared upon message submission)
+  const attachmentsRef = useRef(attachments);
+  attachmentsRef.current = attachments;
+
   useEffect(() => {
     return () => {
-      attachments.forEach((att) => {
+      attachmentsRef.current.forEach((att) => {
         if (att.previewUrl) {
           try {
             URL.revokeObjectURL(att.previewUrl);
@@ -258,7 +272,7 @@ export default function ChatArea({
         }
       });
     };
-  }, [attachments]);
+  }, []);
 
   const handleAttachClick = () => {
     if (attachments.length > 0) {
@@ -363,7 +377,13 @@ export default function ChatArea({
       file
     };
 
-    setAttachmentNotice(null);
+    if (isOffline && isImage && selectedProvider === 'webllm') {
+      setAttachmentNotice(
+        `Notice: Image text extraction (OCR) requires an internet connection. To chat offline with Browser AI, please attach a text-based document (PDF, DOCX, PPTX, TXT, MD, CSV, JSON, XML).`
+      );
+    } else {
+      setAttachmentNotice(null);
+    }
     setAttachments([singleAttachment]);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
@@ -564,6 +584,7 @@ export default function ChatArea({
 
   const handleRemoveAttachment = (idToRemove) => {
     setAttachmentNotice(null);
+    setPreviewingComposerAttachment((prev) => (prev?.id === idToRemove ? null : prev));
     setAttachments((prev) => {
       const removed = prev.find((att) => att.id === idToRemove);
       if (removed?.previewUrl) {
@@ -576,6 +597,11 @@ export default function ChatArea({
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
+    requestAnimationFrame(() => {
+      if (textareaRef.current) {
+        textareaRef.current.focus();
+      }
+    });
   };
 
   // Floating scroll-to-bottom button visibility
@@ -586,6 +612,9 @@ export default function ChatArea({
   const prevActiveChatIdRef = useRef(activeChatId || null);
   const prevMessagesCountRef = useRef(messages.length);
   const isUserFollowingBottomRef = useRef(false);
+  const lastScrollTopRef = useRef(0);
+  const isAutoScrollingRef = useRef(false);
+  const isTouchScrollingRef = useRef(false);
 
   // Language dropdown toggle state
   const [langMenuOpen, setLangMenuOpen] = useState(false);
@@ -593,6 +622,60 @@ export default function ChatArea({
   // AI Transcript Refinement (Phase 4) state
   const [isCleaningTranscript, setIsCleaningTranscript] = useState(false);
   const [suggestedRefinement, setSuggestedRefinement] = useState(null);
+
+  // Dismiss transcript refinement review dialog on Escape
+  useEffect(() => {
+    if (!suggestedRefinement) return;
+    const handleRefinementEsc = (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setSuggestedRefinement(null);
+      }
+    };
+    window.addEventListener('keydown', handleRefinementEsc);
+    return () => window.removeEventListener('keydown', handleRefinementEsc);
+  }, [suggestedRefinement]);
+
+  // Stabilize message action callbacks passed to MessageList and ChatMessage so typing in
+  // the composer or streaming tokens does not force full-thread re-renders
+  const messageCallbacksRef = useRef({
+    onRetry,
+    onSwitchProvider,
+    onRestorePrompt,
+    onRegenerate,
+    onGenerateAlternative,
+    onSwitchAlternative,
+    onStopGenerating,
+    onStartEdit,
+    onCancelEdit,
+    onEditResend
+  });
+  messageCallbacksRef.current = {
+    onRetry,
+    onSwitchProvider,
+    onRestorePrompt,
+    onRegenerate,
+    onGenerateAlternative,
+    onSwitchAlternative,
+    onStopGenerating,
+    onStartEdit,
+    onCancelEdit,
+    onEditResend
+  };
+
+  const stableOnRetry = useCallback((...args) => messageCallbacksRef.current.onRetry?.(...args), []);
+  const stableOnSwitchProvider = useCallback((...args) => messageCallbacksRef.current.onSwitchProvider?.(...args), []);
+  const stableOnRestorePrompt = useCallback((...args) => messageCallbacksRef.current.onRestorePrompt?.(...args), []);
+  const stableOnRegenerate = useCallback((...args) => messageCallbacksRef.current.onRegenerate?.(...args), []);
+  const stableOnGenerateAlternative = useCallback((...args) => messageCallbacksRef.current.onGenerateAlternative?.(...args), []);
+  const stableOnSwitchAlternative = useCallback((...args) => messageCallbacksRef.current.onSwitchAlternative?.(...args), []);
+  const stableOnStopGenerating = useCallback((...args) => messageCallbacksRef.current.onStopGenerating?.(...args), []);
+  const stableOnStartEdit = useCallback((...args) => messageCallbacksRef.current.onStartEdit?.(...args), []);
+  const stableOnCancelEdit = useCallback((...args) => messageCallbacksRef.current.onCancelEdit?.(...args), []);
+  const stableOnEditResend = useCallback((...args) => messageCallbacksRef.current.onEditResend?.(...args), []);
+
+  const messagesLengthRef = useRef(messages.length);
+  messagesLengthRef.current = messages.length;
 
   // Check if the most recent message ended with an invitation to continue a partitioned response
   const lastMessage = messages.length > 0 ? messages[messages.length - 1] : null;
@@ -605,24 +688,17 @@ export default function ChatArea({
     responseHasContinuationNotice(lastMessage.content);
 
   // Computes distance from bottom and updates floating button visibility
-  const updateScrollButtonVisibility = () => {
+  const updateScrollButtonVisibility = useCallback(() => {
     const scrollContainer = scrollViewportRef.current;
     if (!scrollContainer) return;
 
     const distanceFromBottom =
       scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight;
 
-    // Within 120px threshold is considered "at or near the bottom"
-    if (distanceFromBottom <= 120) {
-      isUserFollowingBottomRef.current = true;
-    } else {
-      isUserFollowingBottomRef.current = false;
-    }
-
-    // Show button only if there are messages and user is sufficiently far (> 120px) from bottom
-    const shouldShow = messages.length > 0 && distanceFromBottom > 120;
-    setShowScrollBottom(shouldShow);
-  };
+    // Show button only if there are messages and user is sufficiently far (> 110px) from bottom
+    const shouldShow = messagesLengthRef.current > 0 && distanceFromBottom > 110;
+    setShowScrollBottom((prev) => (prev === shouldShow ? prev : shouldShow));
+  }, []);
 
   // Smoothly scrolls viewport to bottom
   const handleScrollToBottom = () => {
@@ -630,33 +706,90 @@ export default function ChatArea({
     if (!scrollContainer) return;
 
     isUserFollowingBottomRef.current = true;
+    isAutoScrollingRef.current = true;
     scrollContainer.scrollTo({
       top: scrollContainer.scrollHeight,
       behavior: 'smooth'
     });
+    setTimeout(() => {
+      isAutoScrollingRef.current = false;
+      if (scrollViewportRef.current) {
+        lastScrollTopRef.current = scrollViewportRef.current.scrollTop;
+      }
+      updateScrollButtonVisibility();
+    }, 320);
   };
 
-  // Passive scroll event handler
+  // Passive scroll event handler that respects user upward scroll intent during streaming
   const handleScroll = () => {
+    const scrollContainer = scrollViewportRef.current;
+    if (!scrollContainer) return;
+
+    const currentScrollTop = scrollContainer.scrollTop;
+    const distanceFromBottom =
+      scrollContainer.scrollHeight - currentScrollTop - scrollContainer.clientHeight;
+
+    if (!isAutoScrollingRef.current) {
+      // If user scrolled upward by more than 5px, immediately stop forcing auto-scroll
+      if (currentScrollTop < lastScrollTopRef.current - 5) {
+        isUserFollowingBottomRef.current = false;
+      } else if (distanceFromBottom <= 56) {
+        // User scrolled back to the bottom
+        isUserFollowingBottomRef.current = true;
+      }
+    }
+
+    lastScrollTopRef.current = currentScrollTop;
     updateScrollButtonVisibility();
   };
 
-  // Window resize listener to keep button visibility updated
+  const handleViewportTouchStart = () => {
+    isTouchScrollingRef.current = true;
+  };
+
+  const handleViewportTouchEnd = () => {
+    isTouchScrollingRef.current = false;
+  };
+
+  // Window & visualViewport resize listener to keep button visibility updated and anchor bottom when mobile keyboard opens
   useEffect(() => {
     const handleResize = () => {
+      setIsCompactViewport(window.innerWidth < 768);
+      if (
+        isUserFollowingBottomRef.current &&
+        scrollViewportRef.current &&
+        messagesLengthRef.current > 0 &&
+        document.documentElement.classList.contains('is-keyboard-open')
+      ) {
+        isAutoScrollingRef.current = true;
+        scrollViewportRef.current.scrollTop = scrollViewportRef.current.scrollHeight;
+        lastScrollTopRef.current = scrollViewportRef.current.scrollTop;
+        requestAnimationFrame(() => {
+          isAutoScrollingRef.current = false;
+        });
+      }
       updateScrollButtonVisibility();
     };
     window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, [messages.length]);
+    const vv = window.visualViewport;
+    if (vv) {
+      vv.addEventListener('resize', handleResize);
+    }
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      if (vv) {
+        vv.removeEventListener('resize', handleResize);
+      }
+    };
+  }, [updateScrollButtonVisibility]);
 
   // Handle conversation switching / opening:
   // Starts each opened conversation at the top (scrollTop = 0)
   useEffect(() => {
     if (activeChatId !== prevActiveChatIdRef.current) {
-      const prevChatId = prevActiveChatIdRef.current;
       prevActiveChatIdRef.current = activeChatId;
       isUserFollowingBottomRef.current = false;
+      lastScrollTopRef.current = 0;
 
       if (activeChatId) {
         // An existing conversation was opened or switched to
@@ -687,10 +820,12 @@ export default function ChatArea({
         requestAnimationFrame(() => {
           if (scrollContainer && pendingTopScrollChatIdRef.current === activeChatId) {
             scrollContainer.scrollTop = 0;
+            lastScrollTopRef.current = 0;
           }
           requestAnimationFrame(() => {
             if (scrollContainer && pendingTopScrollChatIdRef.current === activeChatId) {
               scrollContainer.scrollTop = 0;
+              lastScrollTopRef.current = 0;
               pendingTopScrollChatIdRef.current = null;
               updateScrollButtonVisibility();
             }
@@ -709,27 +844,34 @@ export default function ChatArea({
     if (isNewMessage) {
       if (lastMessage?.sender === 'user' || lastMessage?.isStreaming) {
         isUserFollowingBottomRef.current = true;
+        isAutoScrollingRef.current = true;
         requestAnimationFrame(() => {
           if (scrollContainer) {
             scrollContainer.scrollTo({
               top: scrollContainer.scrollHeight,
               behavior: 'smooth'
             });
+            lastScrollTopRef.current = scrollContainer.scrollTop;
             updateScrollButtonVisibility();
           }
+          setTimeout(() => {
+            isAutoScrollingRef.current = false;
+          }, 260);
         });
         return;
       }
     }
 
-    // 3. AI response streaming: follow bottom ONLY if user is already at bottom or following
+    // 3. AI response streaming: follow bottom ONLY if user is actively following bottom
+    // and not currently dragging upward on a touch screen
     if (lastMessage?.isStreaming) {
-      const distanceFromBottom =
-        scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight;
-      const isNearBottom = distanceFromBottom < 140;
-
-      if (isUserFollowingBottomRef.current || isNearBottom) {
+      if (isUserFollowingBottomRef.current && !isTouchScrollingRef.current) {
+        isAutoScrollingRef.current = true;
         scrollContainer.scrollTop = scrollContainer.scrollHeight;
+        lastScrollTopRef.current = scrollContainer.scrollTop;
+        requestAnimationFrame(() => {
+          isAutoScrollingRef.current = false;
+        });
       }
       updateScrollButtonVisibility();
       return;
@@ -737,7 +879,7 @@ export default function ChatArea({
 
     // Normal re-renders: update button state without changing scroll position
     updateScrollButtonVisibility();
-  }, [messages, messagesLoading, activeChatId]);
+  }, [messages, messagesLoading, activeChatId, updateScrollButtonVisibility]);
 
   // Hook into upgraded speech recognition engine (Phase 5.2 audio capture, Phase 5.3 Whisper transcription, Phase 5.4 cross-browser & mobile reliability)
   const {
@@ -760,6 +902,9 @@ export default function ChatArea({
     supportedLanguages,
     audioLevel,
     audioFrequencies,
+    waveformBars,
+    recordingDuration,
+    formattedDuration,
     startListening,
     pauseListening,
     resumeListening,
@@ -782,8 +927,56 @@ export default function ChatArea({
   const activeLang =
     supportedLanguages.find((l) => l.code === selectedLanguage) || supportedLanguages[0];
 
-  const handleStopListening = () => {
-    stopListening();
+  // Screen reader announcements for dictation state changes
+  const [srAnnouncement, setSrAnnouncement] = useState('');
+
+  useEffect(() => {
+    if (dictationError) {
+      setSrAnnouncement(`Dictation error: ${dictationError}`);
+      return;
+    }
+    switch (recordingState) {
+      case 'requesting':
+        setSrAnnouncement('Requesting microphone permission');
+        break;
+      case 'listening':
+        setSrAnnouncement('Microphone recording active. Speak naturally.');
+        break;
+      case 'paused':
+        setSrAnnouncement('Dictation paused.');
+        break;
+      case 'stopping':
+        setSrAnnouncement('Stopping recording.');
+        break;
+      case 'transcribing':
+        setSrAnnouncement('Transcribing audio transcript.');
+        break;
+      case 'success':
+        setSrAnnouncement('Dictation transcript inserted into message composer. Text is ready to edit or send.');
+        break;
+      case 'cancelled':
+        setSrAnnouncement('Dictation cancelled. Audio discarded and previous text restored.');
+        break;
+      default:
+        break;
+    }
+  }, [recordingState, dictationError]);
+
+  // Cleanly abort any active microphone dictation session when switching conversations
+  useEffect(() => {
+    if (
+      recordingState === 'listening' ||
+      recordingState === 'paused' ||
+      recordingState === 'requesting' ||
+      recordingState === 'stopping' ||
+      recordingState === 'transcribing'
+    ) {
+      cancelListening();
+    }
+  }, [activeChatId, cancelListening]);
+
+  const handleStopListening = async () => {
+    await stopListening();
     requestAnimationFrame(() => {
       if (textareaRef.current) {
         textareaRef.current.focus();
@@ -807,20 +1000,25 @@ export default function ChatArea({
 
   const handleToggleListening = () => {
     if (recordingState === 'listening') {
-      handleStopListening();
+      void handleStopListening();
     } else if (recordingState === 'paused') {
       resumeListening();
     } else if (recordingState === 'requesting') {
       handleCancelListening();
-    } else if (recordingState === 'finalizing' || recordingState === 'transcribing') {
-      // Safe guard: ignore multi-tap while actively finalizing or transcribing
+    } else if (
+      recordingState === 'stopping' ||
+      recordingState === 'finalizing' ||
+      recordingState === 'transcribing' ||
+      recordingState === 'success'
+    ) {
+      // Safe guard: ignore multi-tap while actively stopping, transcribing, or finalizing
       return;
     } else {
       startListening();
     }
   };
 
-  // Close language menu when clicking outside
+  // Close language menu when clicking/tapping outside or pressing Escape
   useEffect(() => {
     if (!langMenuOpen) return;
     const handleClickOutside = (e) => {
@@ -828,21 +1026,58 @@ export default function ChatArea({
         setLangMenuOpen(false);
       }
     };
+    const handleEscape = (e) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        setLangMenuOpen(false);
+      }
+    };
     document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
+    document.addEventListener('touchstart', handleClickOutside, { passive: true });
+    document.addEventListener('keydown', handleEscape);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('touchstart', handleClickOutside);
+      document.removeEventListener('keydown', handleEscape);
+    };
   }, [langMenuOpen]);
+
+  // Deterministic multiline expansion hysteresis on mobile viewports so typing doesn't oscillate layout
+  useEffect(() => {
+    if (!inputValue) {
+      setIsExpandedInput(false);
+      return;
+    }
+    const hasNewline = inputValue.includes('\n');
+    const len = inputValue.length;
+    setIsExpandedInput((prev) => {
+      if (hasNewline || len >= 42) return true;
+      if (!hasNewline && len < 24) return false;
+      return prev;
+    });
+  }, [inputValue]);
 
   // Auto-resize textarea according to text length and follow speech stream
   useEffect(() => {
-    if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto';
-      const newHeight = Math.min(textareaRef.current.scrollHeight, 180);
-      textareaRef.current.style.height = `${Math.max(newHeight, 44)}px`;
-      if (recordingState === 'listening' || recordingState === 'paused') {
-        textareaRef.current.scrollTop = textareaRef.current.scrollHeight;
-      }
+    const el = textareaRef.current;
+    if (!el) return;
+    const baseHeight = isCompactViewport ? 38 : 36;
+    if (!inputValue) {
+      el.style.height = `${baseHeight}px`;
+      return;
     }
-  }, [inputValue, recordingState]);
+    el.style.height = 'auto';
+    const scrollHeight = el.scrollHeight;
+    const isKbOpen =
+      typeof document !== 'undefined' &&
+      document.documentElement.classList.contains('is-keyboard-open');
+    const maxHeight = isCompactViewport ? (isKbOpen ? 120 : 144) : 180;
+    const newHeight = Math.min(Math.max(scrollHeight, baseHeight), maxHeight);
+    el.style.height = `${newHeight}px`;
+    if (recordingState === 'listening' || recordingState === 'paused') {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [inputValue, recordingState, isExpandedInput, isCompactViewport]);
   // Keep refs to avoid stale closures in global keydown listener
   const inputValueRef = useRef(inputValue);
   useEffect(() => {
@@ -895,12 +1130,17 @@ export default function ChatArea({
 
         // If a button or link is focused, let it retain focus for standard accessibility navigation
         // unless it's an ordinary character key (letters, numbers, symbols)
+        const role = activeEl.getAttribute?.('role');
         const isInteractive =
           tagName === 'button' ||
           tagName === 'a' ||
-          activeEl.getAttribute?.('role') === 'button' ||
-          activeEl.getAttribute?.('role') === 'menuitem' ||
-          activeEl.getAttribute?.('role') === 'option';
+          role === 'button' ||
+          role === 'menuitem' ||
+          role === 'option' ||
+          role === 'radio' ||
+          role === 'tab' ||
+          role === 'switch' ||
+          role === 'checkbox';
 
         if (isInteractive && (e.key === 'Enter' || e.key === ' ' || e.key === 'Tab' || e.key === 'Escape')) {
           return;
@@ -910,7 +1150,7 @@ export default function ChatArea({
       // 6. Check if any modal or dialog is currently open
       if (
         document.querySelector(
-          '[role="dialog"], .modal-backdrop, .settings-modal-backdrop, .document-preview-overlay, .auth-modal-backdrop'
+          '[role="dialog"], [role="alertdialog"], .modal-backdrop, .settings-modal-backdrop, .document-preview-overlay, .auth-modal-backdrop'
         )
       ) {
         return;
@@ -938,7 +1178,7 @@ export default function ChatArea({
       try {
         textareaRef.current.style.height = 'auto';
         const newHeight = Math.min(textareaRef.current.scrollHeight, 180);
-        textareaRef.current.style.height = `${Math.max(newHeight, 44)}px`;
+        textareaRef.current.style.height = `${Math.max(newHeight, 36)}px`;
       } catch (_) {}
 
       // Focus the textarea and set cursor directly after the inserted character
@@ -951,21 +1191,38 @@ export default function ChatArea({
     window.addEventListener('keydown', handleGlobalKeyDown);
     return () => window.removeEventListener('keydown', handleGlobalKeyDown);
   }, []);
-
-  const handlePromptSelect = (promptText) => {
-    if (onInputChange) {
-      onInputChange(promptText);
+  const submitComposerMessage = async (textToSend) => {
+    if (!onSubmit || (!textToSend.trim() && attachments.length === 0) || isLoading) {
+      return;
     }
-    if (textareaRef.current) {
-      textareaRef.current.focus();
-      try {
-        const len = (promptText || '').length;
-        textareaRef.current.setSelectionRange(len, len);
-      } catch (_) {}
+    const currentAttachments = [...attachments];
+    setPreviewingComposerAttachment(null);
+    setAttachments([]);
+    try {
+      const result = await onSubmit(currentAttachments, textToSend !== inputValue ? textToSend : null);
+      if (result === false && currentAttachments.length > 0) {
+        setAttachments((prev) => (prev.length === 0 ? currentAttachments : prev));
+      }
+    } catch (_) {
+      if (currentAttachments.length > 0) {
+        setAttachments((prev) => (prev.length === 0 ? currentAttachments : prev));
+      }
     }
   };
 
-  const handleKeyDown = (e) => {
+  const handleKeyDown = async (e) => {
+    if (e.key === 'Escape' && langMenuOpen) {
+      e.preventDefault();
+      setLangMenuOpen(false);
+      return;
+    }
+
+    if (e.key === 'Escape' && isRecordingActive) {
+      e.preventDefault();
+      handleCancelListening();
+      return;
+    }
+
     if (e.key === 'Escape' && isLoading && onStopGenerating) {
       e.preventDefault();
       onStopGenerating();
@@ -988,45 +1245,29 @@ export default function ChatArea({
       e.preventDefault();
       let textToSend = inputValue;
       if (isListening || isPaused || isRequesting) {
-        if (
-          interimTranscript &&
-          interimTranscript.trim() &&
-          !inputValue.toLowerCase().includes(interimTranscript.trim().toLowerCase())
-        ) {
-          textToSend = combineComposerText(inputValue, interimTranscript.trim());
+        const completed = await stopListening();
+        if (typeof completed === 'string' && completed.trim()) {
+          textToSend = completed;
         }
-        stopListening();
       }
       clearLastSessionTranscript();
       setSuggestedRefinement(null);
-      if (onSubmit && (textToSend.trim() || attachments.length > 0) && !isLoading) {
-        const currentAttachments = [...attachments];
-        setAttachments([]);
-        onSubmit(currentAttachments, textToSend !== inputValue ? textToSend : null);
-      }
+      void submitComposerMessage(textToSend);
     }
   };
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
     let textToSend = inputValue;
     if (isListening || isPaused || isRequesting) {
-      if (
-        interimTranscript &&
-        interimTranscript.trim() &&
-        !inputValue.toLowerCase().includes(interimTranscript.trim().toLowerCase())
-      ) {
-        textToSend = combineComposerText(inputValue, interimTranscript.trim());
+      const completed = await stopListening();
+      if (typeof completed === 'string' && completed.trim()) {
+        textToSend = completed;
       }
-      stopListening();
     }
     clearLastSessionTranscript();
     setSuggestedRefinement(null);
-    if (onSubmit && (textToSend.trim() || attachments.length > 0) && !isLoading) {
-      const currentAttachments = [...attachments];
-      setAttachments([]);
-      onSubmit(currentAttachments, textToSend !== inputValue ? textToSend : null);
-    }
+    void submitComposerMessage(textToSend);
   };
 
   // Optional AI Transcript Refinement Handler (Phase 4 & Phase 6.2)
@@ -1138,13 +1379,53 @@ Transcript:
 
   const hasContent = inputValue.trim().length > 0 || attachments.length > 0;
   const hasMessages = messages.length > 0;
-  // Dictation dock is active when actively requesting, listening, paused, finalizing, or transcribing
+  // Dictation dock is active when actively requesting, listening, paused, stopping, finalizing, transcribing, success, or cancelled
   const isRecordingActive =
     recordingState === 'listening' ||
     recordingState === 'paused' ||
     recordingState === 'requesting' ||
+    recordingState === 'stopping' ||
     recordingState === 'finalizing' ||
-    recordingState === 'transcribing';
+    recordingState === 'transcribing' ||
+    recordingState === 'success' ||
+    recordingState === 'cancelled';
+
+  const normalComposerPlaceholder = isCompactViewport
+    ? activeMode === 'coding'
+      ? 'Ask a coding question...'
+      : activeMode === 'writing'
+      ? 'Draft or polish text...'
+      : activeMode === 'learning'
+      ? 'Ask to explain a topic...'
+      : 'Message Orvix...'
+    : activeMode === 'coding'
+    ? 'Ask a coding question, debug an error, or request code...'
+    : activeMode === 'writing'
+    ? 'Draft an email, polish prose, or rewrite content...'
+    : activeMode === 'learning'
+    ? 'Ask to explain a concept, break down a topic, or quiz you...'
+    : 'Message Orvix...';
+
+  // Single source of truth for composer placeholder:
+  // On mobile when the expanded Recording panel is active, keep the composer displaying the normal prompt
+  // so the composer does NOT render a competing "Listening — speak or..." state underneath the Recording panel.
+  const composerPlaceholder = isLoading
+    ? isCompactViewport
+      ? 'Generating response...'
+      : 'Generating response — press Esc to stop...'
+    : isCompactViewport && isRecordingActive
+    ? normalComposerPlaceholder
+    : isListening
+    ? isCompactViewport
+      ? 'Listening — speak or type...'
+      : 'Listening — speak naturally or type...'
+    : isPaused
+    ? isCompactViewport
+      ? 'Paused — resume or type...'
+      : 'Dictation paused — resume or type...'
+    : isRequesting
+    ? 'Connecting microphone...'
+    : normalComposerPlaceholder;
 
   return (
     <main
@@ -1160,14 +1441,14 @@ Transcript:
         ref={scrollViewportRef}
         className="chat-scroll-viewport"
         onScroll={handleScroll}
+        onTouchStart={handleViewportTouchStart}
+        onTouchEnd={handleViewportTouchEnd}
+        onTouchCancel={handleViewportTouchEnd}
       >
         <div className="chat-content-constrained">
           {isNewChat && !hasMessages ? (
             <WelcomeScreen
-              onSelectPrompt={handlePromptSelect}
               username={username}
-              activeMode={activeMode}
-              onSelectMode={onSelectMode}
             />
           ) : messagesLoading && !hasMessages ? (
             <div className="messages-loading-state" role="status" aria-label="Loading conversation">
@@ -1178,17 +1459,17 @@ Transcript:
             <MessageList
               messages={messages}
               isLoading={isLoading}
-              onRetry={onRetry}
-              onSwitchProvider={onSwitchProvider}
-              onRestorePrompt={onRestorePrompt}
-              onRegenerate={onRegenerate}
-              onGenerateAlternative={onGenerateAlternative}
-              onSwitchAlternative={onSwitchAlternative}
-              onStopGenerating={onStopGenerating}
-              onEditResend={onEditResend}
+              onRetry={onRetry ? stableOnRetry : undefined}
+              onSwitchProvider={onSwitchProvider ? stableOnSwitchProvider : undefined}
+              onRestorePrompt={onRestorePrompt ? stableOnRestorePrompt : undefined}
+              onRegenerate={onRegenerate ? stableOnRegenerate : undefined}
+              onGenerateAlternative={onGenerateAlternative ? stableOnGenerateAlternative : undefined}
+              onSwitchAlternative={onSwitchAlternative ? stableOnSwitchAlternative : undefined}
+              onStopGenerating={onStopGenerating ? stableOnStopGenerating : undefined}
+              onEditResend={onEditResend ? stableOnEditResend : undefined}
               editingMessageId={editingMessageId}
-              onStartEdit={onStartEdit}
-              onCancelEdit={onCancelEdit}
+              onStartEdit={onStartEdit ? stableOnStartEdit : undefined}
+              onCancelEdit={onCancelEdit ? stableOnCancelEdit : undefined}
               showTimestamps={showTimestamps}
               selectedProvider={selectedProvider}
               activeMode={activeMode}
@@ -1198,19 +1479,22 @@ Transcript:
       </div>
 
       {/* Message Composer Dock */}
-      <div className="chat-composer-dock">
+      <div className={`chat-composer-dock ${isRecordingActive ? 'is-recording-active' : ''}`}>
         <div className="chat-composer-inner">
           {/* ChatGPT-style Floating Scroll-to-Bottom Button */}
           {showScrollBottom && (
             <div className="scroll-to-bottom-dock">
               <button
                 type="button"
-                className="scroll-to-bottom-btn"
+                className={`scroll-to-bottom-btn ${lastMessage?.isStreaming ? 'has-streaming-activity' : ''}`}
                 onClick={handleScrollToBottom}
-                aria-label="Scroll to bottom"
-                title="Scroll to bottom"
+                aria-label={lastMessage?.isStreaming ? 'Scroll to streaming response' : 'Scroll to newest message'}
+                title={lastMessage?.isStreaming ? 'Scroll to streaming response' : 'Scroll to newest message'}
               >
                 <ArrowDown size={18} aria-hidden="true" />
+                {lastMessage?.isStreaming && (
+                  <span className="scroll-btn-activity-dot" aria-hidden="true" />
+                )}
               </button>
             </div>
           )}
@@ -1273,16 +1557,19 @@ Transcript:
 
           {/* Voice Dictation High-Accuracy / Fallback Notification (Phase 5.3) */}
           {transcriptionNotice && !isRecordingActive && (
-            <div className={`composer-dictation-notice ${transcriptionNotice.type}`} role="status">
-              <div className="dictation-notice-content">
+            <div
+              className={`composer-dictation-notice notice-${transcriptionNotice.type} ${transcriptionNotice.type}`}
+              role="status"
+            >
+              <div className="notice-left dictation-notice-content">
                 {transcriptionNotice.type === 'success' ? (
                   <Sparkles size={13} className="notice-icon success" aria-hidden="true" />
                 ) : (
                   <AlertCircle size={13} className="notice-icon fallback" aria-hidden="true" />
                 )}
-                <span>{transcriptionNotice.message}</span>
+                <span className="notice-text">{transcriptionNotice.message}</span>
               </div>
-              <div className="dictation-notice-actions">
+              <div className="notice-actions dictation-notice-actions">
                 {transcriptionNotice.canRetry && hasRecordedAudio && (
                   <button
                     type="button"
@@ -1305,48 +1592,60 @@ Transcript:
             </div>
           )}
 
-          {/* Professional Active Dictation Strip */}
+          {/* Visually-hidden live region for screen-reader dictation announcements */}
+          <div
+            className="sr-only"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+          >
+            {srAnnouncement}
+          </div>
+
+          {/* Modern Recording & Waveform Dictation Bar */}
           {isRecordingActive && (
             <div
               className={`composer-listening-bar state-${recordingState}`}
-              role="status"
-              aria-live="polite"
+              role="region"
+              aria-label="Voice dictation controls"
             >
               <div className="listening-left-group">
                 <div className="listening-indicator-content">
                   <div className={`listening-mic-badge ${recordingState}`} aria-hidden="true">
-                    {recordingState === 'requesting' || recordingState === 'transcribing' || recordingState === 'finalizing' ? (
+                    {recordingState === 'requesting' ||
+                    recordingState === 'stopping' ||
+                    recordingState === 'transcribing' ||
+                    recordingState === 'finalizing' ? (
                       <Loader2 size={13} className="spin-icon" />
+                    ) : recordingState === 'listening' ? (
+                      <span className="recording-dot-pulse" />
+                    ) : recordingState === 'success' ? (
+                      <Check size={13} strokeWidth={2.5} className="badge-icon success" />
+                    ) : recordingState === 'cancelled' ? (
+                      <X size={13} className="badge-icon cancelled" />
                     ) : (
                       <Mic size={13} />
                     )}
-                  </div>
-                  <div
-                    className="listening-soundwave"
-                    aria-hidden="true"
-                    title={isListening ? `Microphone audio level: ${audioLevel}%` : 'Connecting microphone'}
-                  >
-                    {audioFrequencies.map((freq, idx) => (
-                      <span
-                        key={idx}
-                        className={`soundwave-bar dynamic ${isListening ? 'active' : ''}`}
-                        style={{
-                          height: isListening ? `${Math.max(5, Math.round(freq * 18))}px` : '4px',
-                          opacity: isListening ? Math.max(0.4, Math.min(1, freq * 1.2)) : 0.35
-                        }}
-                      />
-                    ))}
                   </div>
                   <span className="listening-text">
                     {recordingState === 'requesting'
                       ? 'Connecting...'
                       : recordingState === 'paused'
                       ? 'Paused'
+                      : recordingState === 'stopping'
+                      ? 'Stopping...'
                       : recordingState === 'transcribing'
-                      ? 'Whisper refining...'
+                      ? 'Transcribing...'
                       : recordingState === 'finalizing'
                       ? 'Finishing...'
-                      : 'Dictating...'}
+                      : recordingState === 'success'
+                      ? 'Transcript ready'
+                      : recordingState === 'cancelled'
+                      ? 'Cancelled'
+                      : 'Recording'}
+                  </span>
+                  <span className="listening-timer" aria-label={`Recording duration: ${formattedDuration}`}>
+                    {formattedDuration}
                   </span>
                 </div>
 
@@ -1357,8 +1656,9 @@ Transcript:
                     className="dictation-lang-btn"
                     onClick={() => setLangMenuOpen((prev) => !prev)}
                     title={`Dictation language: ${activeLang.label}. Click to switch.`}
-                    aria-label="Select dictation language"
+                    aria-label={`Select dictation language, currently ${activeLang.label}`}
                     aria-expanded={langMenuOpen}
+                    aria-haspopup="menu"
                   >
                     <span className="lang-flag">{activeLang.flag}</span>
                     <span className="lang-code">{activeLang.code.split('-')[0].toUpperCase()}</span>
@@ -1366,7 +1666,7 @@ Transcript:
                   </button>
 
                   {langMenuOpen && (
-                    <div className="dictation-lang-dropdown" role="menu">
+                    <div className="dictation-lang-dropdown" role="menu" aria-label="Recognition Language">
                       <div className="lang-dropdown-header">Recognition Language</div>
                       {supportedLanguages.map((lang) => (
                         <button
@@ -1392,40 +1692,49 @@ Transcript:
                 </div>
               </div>
 
-              {/* Interim Transcript Live Preview */}
-              <div className="listening-preview-area" title={interimTranscript || 'Live speech preview'}>
-                {interimTranscript ? (
-                  <span className="live-speech-bubble">"{interimTranscript}"</span>
-                ) : (
-                  <span className="live-speech-placeholder">
-                    {recordingState === 'requesting'
-                      ? 'Connecting to microphone...'
-                      : recordingState === 'paused'
-                      ? 'Speech paused'
-                      : recordingState === 'transcribing'
-                      ? 'Transcribing audio with Whisper Large v3...'
-                      : recordingState === 'finalizing'
-                      ? 'Finishing...'
-                      : engineMode === 'direct-audio'
-                      ? 'Recording audio (Direct Whisper mode)... Tap Done when finished'
-                      : 'Speak to dictate...'}
-                  </span>
-                )}
+              {/* Real Waveform Visualizer (driven by Web Audio API frequency spectrum) */}
+              <div
+                className="listening-waveform-area"
+                aria-hidden="true"
+                title={isListening ? `Microphone audio level: ${audioLevel}%` : 'Microphone audio visualizer'}
+              >
+                <div className="waveform-visualizer">
+                  {waveformBars.map((barVal, idx) => (
+                    <span
+                      key={idx}
+                      className={`waveform-bar ${isListening ? 'active' : ''}`}
+                      style={{
+                        height: isListening ? `${Math.max(4, Math.round(barVal * 24))}px` : '4px',
+                        opacity: isListening ? Math.max(0.35, Math.min(1, barVal * 1.5)) : 0.25
+                      }}
+                    />
+                  ))}
+                </div>
               </div>
 
-              {/* Action Buttons: Pause/Resume, Stop, Cancel (✕) */}
+              {/* Action Buttons: Pause/Resume, Stop, Cancel */}
               <div className="listening-actions-group">
-                {recordingState === 'transcribing' ? (
+                {recordingState === 'stopping' || recordingState === 'transcribing' || recordingState === 'finalizing' ? (
                   <button
                     type="button"
-                    className="dictation-strip-btn cancel-btn text-btn"
-                    onClick={keepLiveTranscript}
-                    title="Keep live transcript and cancel Whisper refinement"
-                    aria-label="Keep live transcript and cancel Whisper refinement"
+                    className="dictation-strip-btn cancel-btn"
+                    onClick={handleCancelListening}
+                    title="Cancel transcription and discard audio"
+                    aria-label="Cancel transcription and discard audio"
                   >
-                    <span className="btn-label">Keep live</span>
-                    <X size={12} />
+                    <X size={13} className="btn-icon" aria-hidden="true" />
+                    <span className="btn-label">Cancel</span>
                   </button>
+                ) : recordingState === 'success' ? (
+                  <div className="dictation-status-pill success" aria-hidden="true">
+                    <Check size={12} strokeWidth={2.5} className="btn-icon" />
+                    <span className="btn-label">Inserted</span>
+                  </div>
+                ) : recordingState === 'cancelled' ? (
+                  <div className="dictation-status-pill cancelled" aria-hidden="true">
+                    <X size={12} className="btn-icon" />
+                    <span className="btn-label">Discarded</span>
+                  </div>
                 ) : (
                   <>
                     {recordingState === 'listening' ? (
@@ -1433,10 +1742,10 @@ Transcript:
                         type="button"
                         className="dictation-strip-btn pause-btn"
                         onClick={pauseListening}
-                        title="Pause dictation"
-                        aria-label="Pause dictation"
+                        title="Pause recording"
+                        aria-label="Pause recording"
                       >
-                        <Pause size={12} />
+                        <Pause size={12} className="btn-icon" aria-hidden="true" />
                         <span className="btn-label">Pause</span>
                       </button>
                     ) : recordingState === 'paused' ? (
@@ -1444,10 +1753,10 @@ Transcript:
                         type="button"
                         className="dictation-strip-btn resume-btn"
                         onClick={resumeListening}
-                        title="Resume dictation"
-                        aria-label="Resume dictation"
+                        title="Resume recording"
+                        aria-label="Resume recording"
                       >
-                        <Play size={12} fill="currentColor" />
+                        <Play size={12} fill="currentColor" className="btn-icon" aria-hidden="true" />
                         <span className="btn-label">Resume</span>
                       </button>
                     ) : null}
@@ -1456,22 +1765,22 @@ Transcript:
                       type="button"
                       className="dictation-strip-btn stop-btn"
                       onClick={handleStopListening}
-                      title="Finish dictation and refine with Whisper"
-                      aria-label="Finish dictation and refine with Whisper"
+                      title="Stop recording and insert transcript into composer"
+                      aria-label="Stop recording and insert transcript into composer"
                     >
-                      <Check size={14} strokeWidth={2.5} />
-                      <span className="btn-label">Done</span>
+                      <Square size={11} fill="currentColor" className="btn-icon" aria-hidden="true" />
+                      <span className="btn-label">Stop</span>
                     </button>
 
                     <button
                       type="button"
                       className="dictation-strip-btn cancel-btn"
                       onClick={handleCancelListening}
-                      title="Cancel dictation (discard session)"
-                      aria-label="Cancel dictation"
+                      title="Cancel recording (discard audio and keep existing text)"
+                      aria-label="Cancel recording and discard audio"
                     >
-                      <X size={14} />
-                      <span className="btn-label-sr">Cancel</span>
+                      <X size={13} className="btn-icon" aria-hidden="true" />
+                      <span className="btn-label">Cancel</span>
                     </button>
                   </>
                 )}
@@ -1484,9 +1793,9 @@ Transcript:
             <div className="transcript-cleanup-banner" role="region" aria-label="Transcript helper">
               <div className="cleanup-banner-left">
                 <Sparkles size={13} className="cleanup-icon" />
-                <span className="cleanup-hint">Dictated speech recorded:</span>
+                <span className="cleanup-hint">Dictated speech:</span>
                 <span className="cleanup-snippet">
-                  "{lastSessionTranscript.length > 46 ? lastSessionTranscript.slice(0, 46) + '...' : lastSessionTranscript}"
+                  "{lastSessionTranscript.length > 52 ? lastSessionTranscript.slice(0, 52) + '...' : lastSessionTranscript}"
                 </span>
               </div>
               <div className="cleanup-banner-actions">
@@ -1495,14 +1804,14 @@ Transcript:
                   className="cleanup-action-trigger"
                   onClick={handleImproveTranscript}
                   disabled={isCleaningTranscript}
-                  title="Use AI to polish punctuation and capitalization without changing words or translating"
+                  title="Polish punctuation and capitalization without changing words"
                 >
                   {isCleaningTranscript ? (
                     <Loader2 size={12} className="spin-icon" />
                   ) : (
                     <Sparkles size={12} />
                   )}
-                  <span>{isCleaningTranscript ? 'Polishing...' : 'Improve transcript'}</span>
+                  <span>{isCleaningTranscript ? 'Polishing...' : 'Polish text'}</span>
                 </button>
                 <button
                   type="button"
@@ -1611,7 +1920,7 @@ Transcript:
             <div className="composer-drop-banner" role="status" aria-live="polite">
               <div className="composer-drop-content">
                 <Paperclip size={15} className="composer-drop-icon" aria-hidden="true" />
-                <span className="composer-drop-text">Drop file to attach</span>
+                <span className="composer-drop-text">Drop file or image to attach</span>
               </div>
             </div>
           )}
@@ -1619,7 +1928,7 @@ Transcript:
           <form
             onSubmit={handleSubmit}
             onPaste={handlePaste}
-            className={`composer-form ${isDraggingOver ? 'is-drag-over' : ''}`}
+            className={`composer-form ${isDraggingOver ? 'is-drag-over' : ''} ${isRecordingActive && !isCompactViewport ? 'is-recording' : ''} ${isExpandedInput ? 'is-expanded' : ''}`}
             aria-label="Message composer"
           >
             {/* Native file input strictly supporting one document or image at a time */}
@@ -1634,19 +1943,16 @@ Transcript:
               aria-hidden="true"
             />
 
-            {/* Selected attachment preview strip with explicit "One attachment maximum per message" badge */}
+            {/* Selected attachment preview strip */}
             {attachments.length > 0 && (
-              <div className="composer-attachments-preview" role="region" aria-label="Attached file or image">
-                <div className="attachment-limit-banner">
-                  <Paperclip size={12} className="attachment-limit-icon" aria-hidden="true" />
-                  <span className="attachment-limit-text">One attachment maximum per message</span>
-                </div>
+              <div className="composer-attachments-preview" role="region" aria-label="Selected attachment">
                 {attachments.map((att) =>
                   att.isImage ? (
                     <div
                       key={att.id}
-                      className="composer-attachment-chip composer-image-chip"
-                      title={`${att.name} (${att.formattedSize})`}
+                      className="composer-attachment-chip composer-image-chip is-previewable"
+                      title={`Click to preview ${att.name} (${att.extension || 'IMG'} • ${att.formattedSize})`}
+                      onClick={() => setPreviewingComposerAttachment(att)}
                     >
                       <div className="composer-image-thumb-wrap">
                         {att.previewUrl ? (
@@ -1675,36 +1981,76 @@ Transcript:
                         <span className="attachment-chip-name" title={att.name}>
                           {att.name}
                         </span>
-                        <span className="attachment-chip-size">{att.formattedSize}</span>
+                        <div className="attachment-chip-submeta">
+                          <span className="attachment-chip-badge">{att.extension || 'IMG'}</span>
+                          <span className="attachment-chip-size">{att.formattedSize}</span>
+                        </div>
                       </div>
-                      <button
-                        type="button"
-                        className="attachment-chip-remove"
-                        onClick={() => handleRemoveAttachment(att.id)}
-                        title={`Remove ${att.name}`}
-                        aria-label={`Remove ${att.name}`}
-                      >
-                        <X size={12} />
-                      </button>
+                      <div className="composer-chip-actions">
+                        <button
+                          type="button"
+                          className="attachment-chip-preview"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setPreviewingComposerAttachment(att);
+                          }}
+                          title={`Preview ${att.name}`}
+                          aria-label={`Preview attachment ${att.name}`}
+                        >
+                          <Eye size={14} />
+                        </button>
+                        <button
+                          type="button"
+                          className="attachment-chip-remove"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleRemoveAttachment(att.id);
+                          }}
+                          title={`Remove ${att.name}`}
+                          aria-label={`Remove attachment ${att.name}`}
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
                     </div>
                   ) : (
                     <div
                       key={att.id}
-                      className="composer-attachment-chip"
-                      title={`${att.name} (${att.formattedSize})`}
+                      className="composer-attachment-chip is-previewable"
+                      title={`Click to preview ${att.name} (${att.extension || 'FILE'} • ${att.formattedSize})`}
+                      onClick={() => setPreviewingComposerAttachment(att)}
                     >
                       <span className="attachment-chip-badge">{att.extension || 'FILE'}</span>
-                      <span className="attachment-chip-name">{att.name}</span>
+                      <span className="attachment-chip-name" title={att.name}>
+                        {att.name}
+                      </span>
                       <span className="attachment-chip-size">{att.formattedSize}</span>
-                      <button
-                        type="button"
-                        className="attachment-chip-remove"
-                        onClick={() => handleRemoveAttachment(att.id)}
-                        title={`Remove ${att.name}`}
-                        aria-label={`Remove ${att.name}`}
-                      >
-                        <X size={12} />
-                      </button>
+                      <div className="composer-chip-actions">
+                        <button
+                          type="button"
+                          className="attachment-chip-preview"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setPreviewingComposerAttachment(att);
+                          }}
+                          title={`Preview ${att.name}`}
+                          aria-label={`Preview attachment ${att.name}`}
+                        >
+                          <Eye size={14} />
+                        </button>
+                        <button
+                          type="button"
+                          className="attachment-chip-remove"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleRemoveAttachment(att.id);
+                          }}
+                          title={`Remove ${att.name}`}
+                          aria-label={`Remove attachment ${att.name}`}
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
                     </div>
                   )
                 )}
@@ -1721,10 +2067,14 @@ Transcript:
                 onClick={handleAttachClick}
                 title={
                   attachments.length > 0
-                    ? 'Only one attachment can be added per message. Click to view notification.'
-                    : 'Attach document or image — One attachment maximum per message (PDF, DOCX, TXT, PPTX, JPG, PNG, etc.)'
+                    ? `Attached: ${attachments[0].name} (1 file max per message)`
+                    : 'Attach file or image (PDF, DOCX, TXT, CSV, PNG, JPG — max 25MB)'
                 }
-                ariaLabel="Attach document or image (One attachment maximum per message)"
+                ariaLabel={
+                  attachments.length > 0
+                    ? `Attachment selected: ${attachments[0].name}. Maximum one attachment per message.`
+                    : 'Attach document or image'
+                }
                 className={`composer-attach-btn ${attachments.length > 0 ? 'has-attachment' : ''}`}
                 icon={<Paperclip size={18} />}
               />
@@ -1732,39 +2082,23 @@ Transcript:
               <textarea
                 ref={textareaRef}
                 className="composer-textarea"
-                placeholder={
-                  isListening
-                    ? 'Listening... Speak naturally (tap Done when finished)'
-                    : isPaused
-                    ? 'Dictation paused — speak or type...'
-                    : isRequesting
-                    ? 'Connecting microphone...'
-                    : isLoading
-                    ? 'Orvix is responding...'
-                    : activeMode === 'coding'
-                    ? 'Ask a coding question, debug an error, or request code...'
-                    : activeMode === 'writing'
-                    ? 'Draft an email, polish prose, or rewrite content...'
-                    : activeMode === 'learning'
-                    ? 'Ask to explain a concept, break down a topic, or quiz you...'
-                    : 'Ask Orvix anything...'
-                }
+                placeholder={composerPlaceholder}
                 value={inputValue}
                 rows={1}
                 onChange={(e) => onInputChange && onInputChange(e.target.value)}
+                onFocus={() => {
+                  if (scrollViewportRef.current && messagesLengthRef.current > 0) {
+                    const sc = scrollViewportRef.current;
+                    const dist = sc.scrollHeight - sc.scrollTop - sc.clientHeight;
+                    if (dist <= 96) {
+                      isUserFollowingBottomRef.current = true;
+                    }
+                  }
+                }}
                 onKeyDown={handleKeyDown}
                 onPaste={handlePaste}
-                aria-label="Message input text"
+                aria-label="Message input"
               />
-
-              {/* Real-time live speech hearing indicator inside composer */}
-              {isRecordingActive && interimTranscript && (
-                <div className="composer-live-speech-pill" role="status" aria-live="polite">
-                  <span className="live-speech-pulse-dot" aria-hidden="true" />
-                  <span className="live-speech-tag">Hearing:</span>
-                  <span className="live-speech-words">"{interimTranscript}"</span>
-                </div>
-              )}
 
               <div className="composer-actions">
                 {/* Recognition Language Selector (pre-recording) */}
@@ -1774,9 +2108,10 @@ Transcript:
                       type="button"
                       className="dictation-lang-btn composer-lang-btn"
                       onClick={() => setLangMenuOpen((prev) => !prev)}
-                      title={`Dictation language: ${activeLang.label}. Click to switch.`}
+                      title={`Dictation language: ${activeLang.label}. Click to change.`}
                       aria-label={`Dictation language: ${activeLang.label}`}
                       aria-expanded={langMenuOpen}
+                      aria-haspopup="menu"
                     >
                       <span className="lang-flag">{activeLang.flag}</span>
                       <span className="lang-code">{activeLang.code.split('-')[0].toUpperCase()}</span>
@@ -1784,8 +2119,8 @@ Transcript:
                     </button>
 
                     {langMenuOpen && (
-                      <div className="dictation-lang-dropdown" role="menu">
-                        <div className="lang-dropdown-header">Recognition Language</div>
+                      <div className="dictation-lang-dropdown" role="menu" aria-label="Dictation recognition language">
+                        <div className="lang-dropdown-header">Dictation Language</div>
                         {supportedLanguages.map((lang) => (
                           <button
                             key={lang.code}
@@ -1795,6 +2130,9 @@ Transcript:
                             onClick={() => {
                               setSelectedLanguage(lang.code);
                               setLangMenuOpen(false);
+                              if (textareaRef.current) {
+                                textareaRef.current.focus();
+                              }
                             }}
                           >
                             <span className="lang-opt-flag">{lang.flag}</span>
@@ -1810,81 +2148,85 @@ Transcript:
                   </div>
                 )}
 
-                {/* Voice Dictation Microphone Button */}
-                <Button
-                  type="button"
-                  variant={isListening ? 'primary' : (isRequesting || isTranscribing) ? 'outline' : 'ghost'}
-                  size="icon-round"
-                  disabled={isLoading || isTranscribing || isFinalizing}
-                  onClick={handleToggleListening}
-                  title={
-                    !isSupported
-                      ? 'Microphone recording is not supported in this browser environment.'
-                      : isTranscribing
-                      ? 'Enhancing transcript with Whisper Large v3...'
-                      : isListening
-                      ? engineMode === 'direct-audio'
-                        ? 'Finish audio recording and transcribe with Whisper'
-                        : 'Finish dictation and refine with Whisper'
-                      : isRequesting
-                      ? 'Connecting microphone... Click to cancel'
-                      : isPaused
-                      ? 'Resume listening (Voice dictation paused)'
-                      : engineMode === 'direct-audio'
-                      ? `Record voice message (${activeLang.label}) — Transcribed by Whisper`
-                      : `Dictate message (${activeLang.label})`
-                  }
-                  ariaLabel={
-                    !isSupported
-                      ? 'Voice dictation not supported'
-                      : isTranscribing
-                      ? 'Enhancing transcript with Whisper'
-                      : isListening
-                      ? 'Finish voice dictation'
-                      : isRequesting
-                      ? 'Connecting microphone'
-                      : isPaused
-                      ? 'Resume dictation'
-                      : engineMode === 'direct-audio'
-                      ? 'Start voice recording for Whisper transcription'
-                      : 'Start voice dictation'
-                  }
-                  className={`composer-mic-btn ${isListening ? 'listening' : isPaused ? 'paused' : isRequesting ? 'requesting' : isTranscribing ? 'transcribing' : ''}`}
-                  icon={
-                    isListening ? (
-                      <Square size={13} fill="currentColor" />
-                    ) : (isRequesting || isTranscribing) ? (
-                      <Loader2 size={16} className="spin-icon" />
-                    ) : isPaused ? (
-                      <Play size={13} fill="currentColor" />
-                    ) : (
-                      <Mic size={18} />
-                    )
-                  }
-                />
+                {/* Voice Dictation Microphone Button (on mobile, suppressed during active recording to prevent duplicate controls) */}
+                {(!isRecordingActive || !isCompactViewport) && (
+                  <Button
+                    type="button"
+                    variant={isListening ? 'primary' : (isRequesting || isTranscribing || recordingState === 'stopping') ? 'outline' : 'ghost'}
+                    size="icon-round"
+                    disabled={isLoading || isTranscribing || isFinalizing || recordingState === 'stopping' || recordingState === 'success'}
+                    onClick={handleToggleListening}
+                    title={
+                      !isSupported
+                        ? 'Voice dictation is not supported in this browser.'
+                        : isTranscribing || recordingState === 'stopping'
+                        ? 'Processing dictation...'
+                        : isListening
+                        ? 'Stop dictation and insert transcript'
+                        : isRequesting
+                        ? 'Connecting microphone... Click to cancel'
+                        : isPaused
+                        ? 'Resume voice dictation'
+                        : `Voice dictation (${activeLang.label})`
+                    }
+                    ariaLabel={
+                      !isSupported
+                        ? 'Voice dictation not supported'
+                        : isTranscribing || recordingState === 'stopping'
+                        ? 'Processing dictation'
+                        : isListening
+                        ? 'Stop dictation'
+                        : isRequesting
+                        ? 'Connecting microphone'
+                        : isPaused
+                        ? 'Resume dictation'
+                        : 'Start voice dictation'
+                    }
+                    className={`composer-mic-btn ${isListening ? 'listening' : isPaused ? 'paused' : isRequesting ? 'requesting' : isTranscribing || recordingState === 'stopping' ? 'transcribing' : ''}`}
+                    icon={
+                      isListening ? (
+                        <Square size={13} fill="currentColor" />
+                      ) : (isRequesting || isTranscribing || recordingState === 'stopping') ? (
+                        <Loader2 size={16} className="spin-icon" />
+                      ) : isPaused ? (
+                        <Play size={13} fill="currentColor" />
+                      ) : (
+                        <Mic size={18} />
+                      )
+                    }
+                  />
+                )}
 
                 {/* Message Submission or Stop Generating Button */}
                 {isLoading ? (
                   <Button
                     type="button"
-                    variant="outline"
-                    size="icon-round"
+                    variant="danger"
+                    size="sm"
                     onClick={onStopGenerating}
                     title="Stop generating response (Esc)"
                     ariaLabel="Stop generating response"
                     className="composer-stop-btn"
-                    icon={<Square size={13} fill="currentColor" />}
-                  />
+                    icon={<Square size={11} fill="currentColor" />}
+                  >
+                    <span className="composer-stop-label">Stop</span>
+                  </Button>
                 ) : (
                   <Button
                     type="submit"
                     variant={hasContent ? 'primary' : 'ghost'}
                     size="icon-round"
                     disabled={!hasContent}
-                    title={enterToSend ? 'Send message (Enter)' : 'Send message (⌘/Ctrl+Enter)'}
+                    title={
+                      !hasContent
+                        ? 'Type a message or attach a file to send'
+                        : enterToSend
+                        ? 'Send message (Enter)'
+                        : 'Send message (Ctrl+Enter / ⌘+Enter)'
+                    }
                     ariaLabel="Send message"
-                    className="composer-send-btn"
-                    icon={<ArrowUp size={18} />}
+                    className={`composer-send-btn ${hasContent ? 'is-ready' : 'is-empty'}`}
+                    icon={<ArrowUp size={18} strokeWidth={2.25} />}
                   />
                 )}
               </div>
@@ -1893,12 +2235,18 @@ Transcript:
 
           <p className="composer-footnote">
             {getProviderFootnote(selectedProvider, webllmModelId)}
-            {engineMode === 'direct-audio'
-              ? ' • Dictation powered by direct audio capture with Whisper Large v3 server transcription.'
-              : ' • Dictation combines live browser speech with Whisper Large v3 refinement via server API.'}
           </p>
         </div>
       </div>
+
+      {/* Pre-Send Composer Attachment Preview Modal */}
+      {previewingComposerAttachment && (
+        <DocumentPreviewModal
+          isOpen={Boolean(previewingComposerAttachment)}
+          onClose={() => setPreviewingComposerAttachment(null)}
+          attachment={previewingComposerAttachment}
+        />
+      )}
     </main>
   );
 }

@@ -37,6 +37,21 @@ import {
 } from './src/services/multiPartResponseService.js';
 // @ts-ignore - Context-aware spoken transcript polisher
 import { polishSpokenTranscript } from './src/utils/speechTextCleaner.js';
+import {
+  connectToDatabase,
+  getMongoStatus,
+  closeDatabase,
+  isMongoConfigured,
+  getDatabaseName
+} from './src/db/mongodb.ts';
+import {
+  setupBackendMongoIndexes,
+  getBackendMongoSummary,
+  validateUserId,
+  validateConversationId
+} from './src/services/backendMongoService.ts';
+
+
 
 export interface DocumentData {
   fileId?: string;
@@ -1010,9 +1025,60 @@ app.get(['/api/config', '/config'], (_req, res) => {
     ollamaConfigured: true,
     ollamaSupported: true,
     whisperConfigured: Boolean(groqKey && groqKey !== 'YOUR_GROQ_API_KEY') || Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY'),
-    whisperProvider: Boolean(groqKey && groqKey !== 'YOUR_GROQ_API_KEY') ? 'groq' : (Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY') ? 'gemini' : null)
+    whisperProvider: Boolean(groqKey && groqKey !== 'YOUR_GROQ_API_KEY') ? 'groq' : (Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY') ? 'gemini' : null),
+    mongodbConfigured: isMongoConfigured(),
+    mongodbDatabase: getDatabaseName()
   });
 });
+
+// API MongoDB Atlas Diagnostic & Connection Status
+app.get(['/api/db/status', '/api/mongodb/status'], async (req, res) => {
+  if (req.query.connect === 'true' && isMongoConfigured()) {
+    await connectToDatabase().catch(() => {});
+  }
+  const status = await getMongoStatus();
+  const summary = await getBackendMongoSummary();
+  res.json({
+    status: status.isConnected ? 'connected' : (status.isConfigured ? 'disconnected' : 'unconfigured'),
+    ...status,
+    readiness: summary.collections,
+    authBoundary: summary.authBoundary
+  });
+});
+
+// API MongoDB Atlas Full Readiness Summary
+app.get(['/api/db/summary', '/api/mongodb/summary'], async (_req, res) => {
+  const summary = await getBackendMongoSummary();
+  res.json(summary);
+});
+
+// User-Data Protection Boundary (Phase 2 Step 4 -> Phase 3 Boundary)
+// Client-supplied userIds cannot be trusted without cryptographic verification.
+// Public unauthenticated requests to read/modify user-scoped documents are blocked
+// until Phase 3 implements server-side token authentication.
+app.all(
+  [
+    '/api/users',
+    '/api/users/:userId',
+    '/api/conversations',
+    '/api/conversations/:id',
+    '/api/messages',
+    '/api/messages/:id',
+    '/api/user-settings',
+    '/api/user-settings/:userId'
+  ],
+  (req, res) => {
+    res.status(501).json({
+      error: 'Direct user-data access via client-supplied ID is disabled to prevent unauthorized data access.',
+      message:
+        'Cryptographic server-side identity verification will be introduced in Phase 3. Existing client Firestore operations remain active.',
+      phase: 'Phase 2 Step 4: Express Backend Integration',
+      code: 'AUTH_PENDING_PHASE_3',
+      endpoint: req.originalUrl,
+      method: req.method
+    });
+  }
+);
 
 /* ==========================================================================
    Controlled Temporary File Upload & Storage Management Architecture
@@ -2066,7 +2132,7 @@ function mapBcp47ToIso639(bcp47Tag?: string | null): string | undefined {
 
 // Default Whisper Context Prompt (Section 4: Technical vocabulary conditioning without hardcoded word replacements)
 const DEFAULT_WHISPER_CONTEXT_PROMPT =
-  'Orvix, AI conversation assistant. Technical vocabulary: JavaScript, TypeScript, React, Node.js, Python, palindrome, algorithms, data structures, async await, promises, functions, objects, arrays, CSS, HTML, API, JSON, programming terminology, code.';
+  'Orvix, AI conversation assistant. Technical vocabulary: JavaScript, TypeScript, React, Node.js, Python, palindrome, algorithms, data structures, async await, promises, functions, arrow functions, var, const, let, objects, arrays, callbacks, ECMAScript, CSS, HTML, API, JSON, programming terminology, code.';
 
 app.post(['/api/transcribe', '/transcribe'], (req, res) => {
   transcribeUploadMiddleware.any()(req as any, res as any, async (err: any) => {
@@ -2140,7 +2206,7 @@ app.post(['/api/transcribe', '/transcribe'], (req, res) => {
           const refinePrompt = `You are a high-accuracy speech-to-text transcript polisher for AI conversation and programming.
 TASK:
 Refine the provided spoken transcript verbatim.
-Preserve exact words, speaker intent, and technical vocabulary (e.g. Orvix, JavaScript, TypeScript, React, Node.js, Python, palindrome, algorithms, async/await, promises, functions, objects, arrays, code).
+Preserve exact words, speaker intent, and technical vocabulary (e.g. Orvix, JavaScript, TypeScript, React, Node.js, Python, palindrome, algorithms, async/await, promises, functions, arrow functions, var, const, let, objects, arrays, callbacks, ECMAScript, code).
 Fix verbal punctuation ("period" -> ".", "comma" -> ",", "question mark" -> "?"), sentence capitalization, and obvious phonetic slips.
 ${isoLang ? `Spoken language: ${isoLang}.` : ''}
 Output ONLY the refined transcript. No quotes, no markdown fences, no explanatory commentary.
@@ -2165,7 +2231,7 @@ Spoken transcript:
                 setTimeout(() => reject(new Error('Refine timeout')), 6000)
               );
               const genPromise = ai.models.generateContent({
-                model: 'gemini-3.8-flash',
+                model: 'gemini-2.5-flash',
                 contents: [{ role: 'user', parts: [{ text: refinePrompt }] }]
               });
               const geminiRes = await Promise.race([genPromise, timeoutPromise]);
@@ -2349,12 +2415,12 @@ Spoken transcript:
 
         const geminiPrompt = `You are a high-accuracy speech transcription engine.
 Transcribe the speech in this audio recording verbatim.
-Preserve exact words, technical terminology (e.g. Orvix, JavaScript, TypeScript, React, palindrome, algorithms, data structures, async await, promises, functions, objects, arrays, code), and punctuation.
+Preserve exact words, technical terminology (e.g. Orvix, JavaScript, TypeScript, React, palindrome, algorithms, data structures, async await, promises, functions, arrow functions, var, const, let, objects, arrays, callbacks, ECMAScript, code), and punctuation.
 ${isoLang ? `The spoken language is: ${isoLang}.` : ''}
 Output ONLY the transcription text. Do not summarize, do not translate, do not add introductory commentary or timestamps.`;
 
         const geminiRes = await ai.models.generateContent({
-          model: 'gemini-3.5-transcribe',
+          model: 'gemini-2.5-flash',
           contents: [
             {
               role: 'user',
@@ -2377,7 +2443,7 @@ Output ONLY the transcription text. Do not summarize, do not translate, do not a
           text,
           language: isoLang || 'en',
           duration: 0,
-          model: 'gemini-3.5-transcribe',
+          model: 'gemini-2.5-flash',
           provider: 'gemini',
           highAccuracy: true
         });
@@ -2385,7 +2451,7 @@ Output ONLY the transcription text. Do not summarize, do not translate, do not a
         logAIDiagnostic({
           category: 'provider API error',
           provider: 'gemini',
-          model: 'gemini-3.5-transcribe',
+          model: 'gemini-2.5-flash',
           phase: 'dispatch',
           sanitizedMessage: geminiErr?.message || 'Gemini audio transcription failed'
         });
@@ -4935,6 +5001,30 @@ async function startServer() {
   const httpServer = app.listen(Number(PORT), '0.0.0.0', () => {
     console.log(`Orvix server running on http://0.0.0.0:${PORT}`);
   });
+
+  // Connect to MongoDB Atlas in background if configured, without blocking server boot
+  if (isMongoConfigured()) {
+    connectToDatabase()
+      .then(async (db) => {
+        if (db) {
+          await setupBackendMongoIndexes();
+          console.log('[MongoDB] Collection indexes verified successfully.');
+        }
+      })
+      .catch((err) => {
+        console.warn('[MongoDB] Non-fatal background connection warning:', err?.message || err);
+      });
+  } else {
+    console.log('[MongoDB] MONGODB_URI not configured. Database connection is dormant.');
+  }
+
+  // Graceful shutdown hooks
+  const shutdown = async () => {
+    await closeDatabase();
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 
   // Eliminate artificial HTTP timeouts to allow long-running streams (60s, 90s, 5m+)
   httpServer.timeout = 0;
