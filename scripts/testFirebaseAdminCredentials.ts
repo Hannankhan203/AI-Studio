@@ -219,7 +219,7 @@ async function runTests() {
     // -------------------------------------------------------------------------
     // 6. Security & Secret Redaction (No Key Leaks)
     // -------------------------------------------------------------------------
-    console.log('\n--- [6/6] Testing Secret Redaction & Log Safety ---');
+    console.log('\n--- [6/10] Testing Secret Redaction & Log Safety ---');
 
     await fullResetFirebaseAdminForTesting();
     const malformedFile = path.join(tempDir, 'malformed-key.json');
@@ -240,10 +240,95 @@ async function runTests() {
       !errorWithKey.includes('MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC6rZ9vY1Vn5J9D')
     );
 
+    // -------------------------------------------------------------------------
+    // 7. GOOGLE_APPLICATION_CREDENTIALS as Inline JSON String
+    // -------------------------------------------------------------------------
+    console.log('\n--- [7/10] Testing GOOGLE_APPLICATION_CREDENTIALS as Inline JSON ---');
+
+    await fullResetFirebaseAdminForTesting();
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = JSON.stringify(validKeyObj);
+    delete process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
+
+    const inlineApp = initializeFirebaseAdmin();
+    assert('Inline JSON in GOOGLE_APPLICATION_CREDENTIALS initializes successfully', inlineApp !== null);
+    assert('isFirebaseAdminConfigured() returns true for inline JSON', isFirebaseAdminConfigured());
+    const inlineDiag = getFirebaseAdminDiagnostic();
+    assert('Diagnostic confirms google_application_credentials source', inlineDiag.credentialSource === 'google_application_credentials');
+    assert('Diagnostic confirms project ID from inline JSON', inlineDiag.projectId === 'test-orvix-project');
+
+    // -------------------------------------------------------------------------
+    // 8. FIREBASE_SERVICE_ACCOUNT_KEY as File Path
+    // -------------------------------------------------------------------------
+    console.log('\n--- [8/10] Testing FIREBASE_SERVICE_ACCOUNT_KEY as File Path ---');
+
+    await fullResetFirebaseAdminForTesting();
+    delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
+    process.env.FIREBASE_SERVICE_ACCOUNT_KEY = validCredFile;
+
+    const filePathApp = initializeFirebaseAdmin();
+    assert('File path in FIREBASE_SERVICE_ACCOUNT_KEY initializes successfully', filePathApp !== null);
+    assert('isFirebaseAdminConfigured() returns true for file path in FIREBASE_SERVICE_ACCOUNT_KEY', isFirebaseAdminConfigured());
+    const filePathDiag = getFirebaseAdminDiagnostic();
+    assert('Diagnostic confirms service_account_key source', filePathDiag.credentialSource === 'service_account_key');
+
+    // -------------------------------------------------------------------------
+    // 9. Discrete Credentials (FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY)
+    // -------------------------------------------------------------------------
+    console.log('\n--- [9/10] Testing Discrete Environment Variables ---');
+
+    await fullResetFirebaseAdminForTesting();
+    delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
+    delete process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
+    process.env.FIREBASE_PROJECT_ID = 'test-discrete-project';
+    process.env.FIREBASE_CLIENT_EMAIL = 'discrete-admin@test-discrete-project.iam.gserviceaccount.com';
+    process.env.FIREBASE_PRIVATE_KEY = dummyPrivateKey;
+
+    const discreteApp = initializeFirebaseAdmin();
+    assert('Discrete credentials initialize successfully', discreteApp !== null);
+    assert('isFirebaseAdminConfigured() returns true for discrete credentials', isFirebaseAdminConfigured());
+    const discreteDiag = getFirebaseAdminDiagnostic();
+    assert('Diagnostic confirms service_account_fields source', discreteDiag.credentialSource === 'service_account_fields');
+    assert('Diagnostic confirms discrete project ID', discreteDiag.projectId === 'test-discrete-project');
+
+    // -------------------------------------------------------------------------
+    // 10. Dotenv Override Verification
+    // -------------------------------------------------------------------------
+    console.log('\n--- [10/10] Testing Dotenv Override of Empty Environment Variables ---');
+
+    await fullResetFirebaseAdminForTesting();
+    delete process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
+    delete process.env.FIREBASE_CLIENT_EMAIL;
+    delete process.env.FIREBASE_PRIVATE_KEY;
+    delete process.env.FIREBASE_PROJECT_ID;
+
+    // Simulate pre-existing empty string in environment
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = '';
+    assert('Pre-condition: GOOGLE_APPLICATION_CREDENTIALS is empty string', process.env.GOOGLE_APPLICATION_CREDENTIALS === '');
+
+    // Write a temporary .env in tempDir
+    const testEnvPath = path.join(tempDir, '.env');
+    fs.writeFileSync(testEnvPath, `GOOGLE_APPLICATION_CREDENTIALS="${validCredFile}"\n`);
+
+    // Use dotenv.config with override: true
+    const dotenv = await import('dotenv');
+    dotenv.default.config({ path: testEnvPath, override: true });
+
+    assert(
+      'Override replaces empty environment variable with file path from .env',
+      process.env.GOOGLE_APPLICATION_CREDENTIALS === validCredFile
+    );
+
+    const overrideApp = initializeFirebaseAdmin();
+    assert('App initializes successfully after override from .env', overrideApp !== null);
+    assert('isFirebaseAdminConfigured() returns true after override', isFirebaseAdminConfigured());
+
     // Clean up
     await fullResetFirebaseAdminForTesting();
     delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
     delete process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
+    delete process.env.FIREBASE_PROJECT_ID;
+    delete process.env.FIREBASE_CLIENT_EMAIL;
+    delete process.env.FIREBASE_PRIVATE_KEY;
     delete process.env.VITE_FIREBASE_PROJECT_ID;
 
     try {

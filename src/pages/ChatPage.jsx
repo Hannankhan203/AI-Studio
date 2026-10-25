@@ -75,7 +75,7 @@ export default function ChatPage() {
     currentUser?.isAnonymous ||
     String(currentUser.uid).startsWith('guest-')
   );
-  const isCloudEnabled = isFirebaseConfigured() && !isGuestUser;
+  const isCloudEnabled = !isGuestUser;
 
   const [isOffline, setIsOffline] = useState(() => !isBrowserOnline());
   const [offlineBannerDismissed, setOfflineBannerDismissed] = useState(false);

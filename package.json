@@ -18,6 +18,8 @@
     "test:admin-creds": "TESTING=true tsx scripts/testFirebaseAdminCredentials.ts",
     "test:mongo-api": "TESTING=true tsx scripts/testAuthenticatedMongoApi.ts",
     "test:profile": "TESTING=true tsx scripts/testUserProfileMigration.ts",
+    "test:settings": "TESTING=true tsx scripts/testUserSettingsMigration.ts",
+    "test:conversation": "TESTING=true tsx scripts/testConversationMigration.ts",
     "test": "npm run lint && node scripts/auditOfflineReliability.js"
   },
   "dependencies": {

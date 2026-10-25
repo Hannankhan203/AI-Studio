@@ -79,6 +79,15 @@ export async function createConversation(input: CreateConversationInput): Promis
   const cleanId = (input.id && input.id.trim()) ? input.id.trim() : new ObjectId().toHexString();
   const now = input.createdAt || new Date();
 
+  if (input.id && input.id.trim()) {
+    const existing = await col.findOne({ _id: cleanId });
+    if (existing) {
+      if (existing.userId === input.userId.trim()) {
+        return existing;
+      }
+    }
+  }
+
   const doc: ConversationDocument = {
     _id: cleanId,
     id: cleanId,

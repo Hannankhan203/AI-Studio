@@ -1,6 +1,6 @@
-import 'dotenv/config';
-import express from 'express';
 import dotenv from 'dotenv';
+dotenv.config({ override: true });
+import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
@@ -53,7 +53,8 @@ import {
 } from './src/services/backendMongoService.ts';
 import {
   initializeFirebaseAdmin,
-  isFirebaseAdminConfigured
+  isFirebaseAdminConfigured,
+  getFirebaseAdminDiagnostic
 } from './src/services/firebaseAdminService.ts';
 import {
   requireAuth,
@@ -1068,11 +1069,11 @@ app.get(['/api/db/summary', '/api/mongodb/summary'], async (_req, res) => {
   res.json(summary);
 });
 
-// Authenticated MongoDB User-Data API Router (Phase 3 Step 2)
-// Derives user identity exclusively from cryptographically verified req.user.uid
-// Enforces ownership checks on every user, conversation, message, and settings operation
-app.use('/api', mongoApiRouter);
-
+// Safe Firebase Admin Diagnostic Status Endpoint
+// Returns configuration source, project ID match, and non-sensitive diagnostic error without exposing keys
+app.get(['/api/auth/status', '/api/auth/diagnostic'], (_req, res) => {
+  res.json(getFirebaseAdminDiagnostic());
+});
 
 // Dedicated Firebase Auth Token Verification Check (Phase 3 Step 1)
 // Verifies Bearer ID token cryptographically and returns authenticated user identity
@@ -1088,6 +1089,11 @@ app.get('/api/auth/verify', requireAuth, (req, res) => {
     }
   });
 });
+
+// Authenticated MongoDB User-Data API Router (Phase 3 Step 2)
+// Derives user identity exclusively from cryptographically verified req.user.uid
+// Enforces ownership checks on every user, conversation, message, and settings operation
+app.use('/api', mongoApiRouter);
 
 
 /* ==========================================================================

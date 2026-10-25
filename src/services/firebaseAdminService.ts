@@ -33,17 +33,45 @@ import { getAuth, type Auth, type DecodedIdToken } from 'firebase-admin/auth';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 // Ensure environment variables from .env are loaded into process.env upon module import
-try {
-  dotenv.config();
-} catch (_) {}
+export function loadEnvironmentVariables(): void {
+  try {
+    const candidates = [
+      path.resolve(process.cwd(), '.env'),
+      path.resolve(process.cwd(), '.env.local'),
+      path.resolve(process.cwd(), '.env.development'),
+      path.resolve(__dirname, '../../.env'),
+      path.resolve(__dirname, '../.env'),
+      path.resolve(__dirname, '.env')
+    ];
+
+    let loaded = false;
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) {
+        dotenv.config({ path: candidate, override: true });
+        loaded = true;
+      }
+    }
+
+    if (!loaded) {
+      dotenv.config({ override: true });
+    }
+  } catch (_) {}
+}
+
+loadEnvironmentVariables();
 
 export type FirebaseCredentialSource =
   | 'service_account_key'
   | 'google_application_credentials'
   | 'application_default'
+  | 'service_account_fields'
   | 'mock_verifier'
   | 'none';
 
@@ -164,7 +192,24 @@ export function resolveCredentialFilePath(rawPath: string): string {
     return path.normalize(cleaned);
   }
 
-  return path.resolve(process.cwd(), cleaned);
+  // Check if file exists relative to cwd first
+  const cwdResolved = path.resolve(process.cwd(), cleaned);
+  if (fs.existsSync(cwdResolved)) {
+    return cwdResolved;
+  }
+
+  // Check relative to project root or __dirname
+  const rootResolved = path.resolve(__dirname, '../../', cleaned);
+  if (fs.existsSync(rootResolved)) {
+    return rootResolved;
+  }
+
+  const parentResolved = path.resolve(__dirname, '../', cleaned);
+  if (fs.existsSync(parentResolved)) {
+    return parentResolved;
+  }
+
+  return cwdResolved;
 }
 
 /**
@@ -177,12 +222,8 @@ export function initializeFirebaseAdmin(): App | null {
     return state.app;
   }
 
-  // Reload dotenv if no credentials currently detected in process.env
-  if (!process.env.GOOGLE_APPLICATION_CREDENTIALS && !process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
-    try {
-      dotenv.config();
-    } catch (_) {}
-  }
+  // Always refresh environment variables from .env to pick up newly added credentials
+  loadEnvironmentVariables();
 
   // Check if Firebase Admin app has already been initialized on the global instance
   const existingApps = getApps();
@@ -197,38 +238,100 @@ export function initializeFirebaseAdmin(): App | null {
   try {
     // -------------------------------------------------------------------------
     // Strategy 1: Explicit Service Account Key in FIREBASE_SERVICE_ACCOUNT_KEY
+    // Supports inline JSON, Base64 JSON, or file path to JSON
     // -------------------------------------------------------------------------
     const serviceAccountEnv = process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
     if (serviceAccountEnv && serviceAccountEnv.trim()) {
-      try {
-        const certObj = parseServiceAccountKey(serviceAccountEnv);
-        if (certObj) {
-          state.app = initializeApp({
-            credential: cert(certObj),
-            projectId: certObj.projectId
-          });
-          state.auth = getAuth(state.app);
-          state.isConfigured = true;
-          state.credentialSource = 'service_account_key';
-          state.projectId = certObj.projectId || null;
-          state.initError = null;
-          console.log(`[Firebase Admin] Successfully initialized with service account for project: "${state.projectId}".`);
-          checkProjectIdMatch(state.projectId);
-          return state.app;
+      const trimmed = serviceAccountEnv.trim().replace(/^["']|["']$/g, '');
+      let certObj: ServiceAccount | null = null;
+
+      // Check if it's a file path pointing to an existing file
+      if ((trimmed.endsWith('.json') || trimmed.startsWith('./') || trimmed.startsWith('/') || trimmed.startsWith('~/')) && !trimmed.startsWith('{')) {
+        const filePath = resolveCredentialFilePath(trimmed);
+        if (fs.existsSync(filePath)) {
+          try {
+            const content = fs.readFileSync(filePath, 'utf8');
+            certObj = parseServiceAccountKey(content);
+          } catch (readErr: any) {
+            state.initError = `Failed to read file from FIREBASE_SERVICE_ACCOUNT_KEY: ${sanitizeError(readErr)}`;
+            console.warn(`[Firebase Admin] Configuration diagnostic: ${state.initError}`);
+          }
         }
-      } catch (err: any) {
-        const keyMsg = `Failed to parse FIREBASE_SERVICE_ACCOUNT_KEY: ${sanitizeError(err)}`;
-        state.initError = keyMsg;
-        console.warn(`[Firebase Admin] Configuration diagnostic: ${keyMsg}`);
+      }
+
+      if (!certObj) {
+        try {
+          certObj = parseServiceAccountKey(trimmed);
+        } catch (err: any) {
+          const keyMsg = `Failed to parse FIREBASE_SERVICE_ACCOUNT_KEY: ${sanitizeError(err)}`;
+          state.initError = keyMsg;
+          console.warn(`[Firebase Admin] Configuration diagnostic: ${keyMsg}`);
+        }
+      }
+
+      if (certObj) {
+        state.app = initializeApp({
+          credential: cert(certObj),
+          projectId: certObj.projectId
+        });
+        state.auth = getAuth(state.app);
+        state.isConfigured = true;
+        state.credentialSource = 'service_account_key';
+        state.projectId = certObj.projectId || null;
+        state.initError = null;
+        console.log(`[Firebase Admin] Successfully initialized with service account for project: "${state.projectId}".`);
+        checkProjectIdMatch(state.projectId);
+        return state.app;
       }
     }
 
     // -------------------------------------------------------------------------
-    // Strategy 2: Google Application Credentials File Path (GOOGLE_APPLICATION_CREDENTIALS)
+    // Strategy 2: Google Application Credentials (GOOGLE_APPLICATION_CREDENTIALS)
+    // Supports:
+    // - File path (relative or absolute, surrounding quotes, ~/ expansion)
+    // - Inline JSON string or Base64-encoded JSON string
     // -------------------------------------------------------------------------
     const rawGoogleCredsPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
     if (rawGoogleCredsPath && typeof rawGoogleCredsPath === 'string' && rawGoogleCredsPath.trim()) {
       const cleanInputPath = rawGoogleCredsPath.trim().replace(/^["']|["']$/g, '');
+
+      // Check if GOOGLE_APPLICATION_CREDENTIALS was passed as inline JSON or Base64 JSON
+      let inlineCertObj: ServiceAccount | null = null;
+      if (cleanInputPath.startsWith('{') || (!cleanInputPath.includes('/') && !cleanInputPath.includes('\\') && cleanInputPath.length > 100)) {
+        try {
+          inlineCertObj = parseServiceAccountKey(cleanInputPath);
+        } catch (_) {
+          // Fall through to treat as file path
+        }
+      }
+
+      if (inlineCertObj) {
+        try {
+          state.app = initializeApp({
+            credential: cert(inlineCertObj),
+            projectId: inlineCertObj.projectId
+          });
+          state.auth = getAuth(state.app);
+          state.isConfigured = true;
+          state.credentialSource = 'google_application_credentials';
+          state.projectId = inlineCertObj.projectId || null;
+          state.initError = null;
+          console.log(`[Firebase Admin] Successfully initialized with service account from GOOGLE_APPLICATION_CREDENTIALS (inline JSON) for project: "${state.projectId}".`);
+          checkProjectIdMatch(state.projectId);
+          return state.app;
+        } catch (initErr: any) {
+          const initMsg = `Failed to initialize Firebase Admin with inline JSON from GOOGLE_APPLICATION_CREDENTIALS: ${sanitizeError(initErr)}`;
+          state.isConfigured = false;
+          state.app = null;
+          state.auth = null;
+          state.credentialSource = 'none';
+          state.initError = initMsg;
+          console.warn(`[Firebase Admin] Configuration diagnostic: ${initMsg}`);
+          return null;
+        }
+      }
+
+      // Treat as file path
       const resolvedPath = resolveCredentialFilePath(cleanInputPath);
 
       // Diagnostic check: File Existence
@@ -340,6 +443,45 @@ export function initializeFirebaseAdmin(): App | null {
     }
 
     // -------------------------------------------------------------------------
+    // Strategy 2b: Discrete Environment Variables (FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY)
+    // -------------------------------------------------------------------------
+    const clientEmail = process.env.FIREBASE_CLIENT_EMAIL || process.env.GOOGLE_CLIENT_EMAIL;
+    const privateKeyRaw = process.env.FIREBASE_PRIVATE_KEY || process.env.GOOGLE_PRIVATE_KEY;
+    const discreteProjectId =
+      process.env.FIREBASE_PROJECT_ID ||
+      process.env.VITE_FIREBASE_PROJECT_ID ||
+      process.env.GOOGLE_CLOUD_PROJECT;
+
+    if (clientEmail && clientEmail.trim() && privateKeyRaw && privateKeyRaw.trim()) {
+      try {
+        const privateKey = privateKeyRaw.trim().replace(/^["']|["']$/g, '').replace(/\\n/g, '\n');
+        const projId = discreteProjectId?.trim().replace(/^["']|["']$/g, '') || undefined;
+        const certObj: ServiceAccount = {
+          projectId: projId,
+          clientEmail: clientEmail.trim().replace(/^["']|["']$/g, ''),
+          privateKey
+        };
+
+        state.app = initializeApp({
+          credential: cert(certObj),
+          ...(projId && projId !== 'YOUR_FIREBASE_PROJECT_ID' ? { projectId: projId } : {})
+        });
+        state.auth = getAuth(state.app);
+        state.isConfigured = true;
+        state.credentialSource = 'service_account_fields';
+        state.projectId = projId || null;
+        state.initError = null;
+        console.log(`[Firebase Admin] Successfully initialized with discrete service account fields for project: "${state.projectId || 'default'}".`);
+        checkProjectIdMatch(state.projectId);
+        return state.app;
+      } catch (discreteErr: any) {
+        const discMsg = `Failed to initialize Firebase Admin with discrete credentials (FIREBASE_CLIENT_EMAIL/FIREBASE_PRIVATE_KEY): ${sanitizeError(discreteErr)}`;
+        state.initError = discMsg;
+        console.warn(`[Firebase Admin] Configuration diagnostic: ${discMsg}`);
+      }
+    }
+
+    // -------------------------------------------------------------------------
     // Strategy 3: Application Default Credentials via Cloud Environment Project ID
     // -------------------------------------------------------------------------
     const targetProjectId =
@@ -373,9 +515,11 @@ export function initializeFirebaseAdmin(): App | null {
     state.auth = null;
     state.credentialSource = 'none';
     if (!state.initError) {
-      state.initError = 'No Firebase service account credentials found in environment (FIREBASE_SERVICE_ACCOUNT_KEY or GOOGLE_APPLICATION_CREDENTIALS).';
+      state.initError = 'No Firebase service account credentials found in environment (GOOGLE_APPLICATION_CREDENTIALS, FIREBASE_SERVICE_ACCOUNT_KEY, or FIREBASE_CLIENT_EMAIL/PRIVATE_KEY).';
+      console.log('[Firebase Admin] Notice: Firebase Admin SDK is unconfigured. Server-side token verification will reject tokens until configured.');
+    } else {
+      console.warn(`[Firebase Admin] Notice: Firebase Admin SDK is unconfigured (${state.initError}). Server-side token verification will reject tokens until configured.`);
     }
-    console.log('[Firebase Admin] Notice: Firebase Admin SDK is unconfigured. Server-side token verification will reject tokens until configured.');
     return null;
   } catch (err: any) {
     const errorMsg = sanitizeError(err);
