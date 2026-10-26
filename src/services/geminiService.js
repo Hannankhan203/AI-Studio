@@ -99,7 +99,7 @@ export async function sendGeminiMessage({
 
   return {
     text: data.text,
-    modelUsed: data.modelUsed || 'gemini-3.8-flash'
+    modelUsed: data.modelUsed || 'gemini-3.1-flash-lite'
   };
 }
 
@@ -165,7 +165,7 @@ export async function streamGeminiMessage({
     const decoder = new TextDecoder();
     let buffer = '';
     let accumulated = '';
-    let modelUsed = 'gemini-3.8-flash';
+    let modelUsed = 'gemini-3.1-flash-lite';
 
     while (true) {
       const { done, value } = await reader.read();
@@ -216,7 +216,7 @@ export async function streamGeminiMessage({
   onChunk?.(data.text, data.text);
   return {
     text: data.text,
-    modelUsed: data.modelUsed || 'gemini-3.8-flash'
+    modelUsed: data.modelUsed || 'gemini-3.1-flash-lite'
   };
 }
 

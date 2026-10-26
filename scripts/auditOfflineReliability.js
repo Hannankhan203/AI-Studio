@@ -37,12 +37,39 @@ import {
   polishSpokenTranscript
 } from '../src/utils/speechTextCleaner.js';
 
+import {
+  prepareDocumentContext,
+  generateSimulatedDocumentResponse,
+  isVisionCapableProvider,
+  isImageAttachment,
+  PROVIDER_PROFILES
+} from '../src/services/documentContextService.js';
+
+import {
+  validateImageBuffer,
+  normalizeOcrText,
+  detectReadableText,
+  extractImageText
+} from '../src/services/imageOcrService.js';
+
 console.log('--- Starting Orvix Offline Reliability Audit ---');
 
 let passedTests = 0;
 function test(name, fn) {
   try {
-    fn();
+    const result = fn();
+    if (result && typeof result.then === 'function') {
+      return result
+        .then(() => {
+          console.log(`  ✓ ${name}`);
+          passedTests++;
+        })
+        .catch((err) => {
+          console.error(`  ✗ FAIL: ${name}`);
+          console.error(err);
+          process.exit(1);
+        });
+    }
     console.log(`  ✓ ${name}`);
     passedTests++;
   } catch (err) {
@@ -367,6 +394,394 @@ test('Truncation detection triggers audio fallback when substantial speech durat
 
   // No audio captured -> cannot fallback
   assert.strictEqual(isTruncated('ECMAScript', 8, false), false);
+});
+
+// ----------------------------------------------------------------------------
+// 6. Phase 2A: Image OCR & Vision Multimodal Dispatch Regression Tests
+// ----------------------------------------------------------------------------
+test('isVisionCapableProvider correctly identifies vision-capable models vs text-only models', () => {
+  // Gemini is vision-capable
+  assert.strictEqual(isVisionCapableProvider('gemini'), true);
+  assert.strictEqual(isVisionCapableProvider('GEMINI'), true);
+  assert.strictEqual(isVisionCapableProvider('gemini', 'gemini-3.8-flash'), true);
+  assert.strictEqual(isVisionCapableProvider('gemini', 'gemini-flash-latest'), true);
+
+  // All other providers are text-only
+  assert.strictEqual(isVisionCapableProvider('groq'), false);
+  assert.strictEqual(isVisionCapableProvider('openrouter'), false);
+  assert.strictEqual(isVisionCapableProvider('cloudflare'), false);
+  assert.strictEqual(isVisionCapableProvider('ollama'), false);
+  assert.strictEqual(isVisionCapableProvider('webllm'), false);
+  assert.strictEqual(isVisionCapableProvider(''), false);
+  assert.strictEqual(isVisionCapableProvider(null), false);
+
+  // PROVIDER_PROFILES reflects vision capability accurately
+  assert.strictEqual(PROVIDER_PROFILES.gemini.supportsVision, true);
+  assert.strictEqual(PROVIDER_PROFILES.groq.supportsVision, false);
+  assert.strictEqual(PROVIDER_PROFILES.openrouter.supportsVision, false);
+  assert.strictEqual(PROVIDER_PROFILES.cloudflare.supportsVision, false);
+  assert.strictEqual(PROVIDER_PROFILES.ollama.supportsVision, false);
+  assert.strictEqual(PROVIDER_PROFILES.webllm.supportsVision, false);
+});
+
+test('Phase 2A Acceptance Test 1: A photograph without text reaches Gemini multimodal request without premature rejection', () => {
+  const photoDoc = {
+    fileId: 'photo-1',
+    originalName: 'nature_photo.jpg',
+    filename: 'nature_photo.jpg',
+    format: 'JPG',
+    mimeType: 'image/jpeg',
+    status: 'ready',
+    success: true,
+    isImage: true,
+    hasText: false,
+    text: '',
+    totalCharacters: 0,
+    totalWords: 0
+  };
+
+  const geminiPrep = prepareDocumentContext('What animals are in this picture?', [photoDoc], {
+    provider: 'gemini'
+  });
+
+  // Must NOT prematurely reject with directAnswer
+  assert.strictEqual(geminiPrep.directAnswer, undefined, 'Gemini must not receive premature directAnswer rejection');
+  assert.strictEqual(geminiPrep.isVision, true, 'isVision must be true for Gemini');
+  assert.ok(geminiPrep.formattedContext.includes('nature_photo.jpg'), 'Filename must be present in formattedContext');
+  assert.ok(
+    geminiPrep.formattedContext.includes('Multimodal visual analysis') ||
+    geminiPrep.formattedContext.includes('visual contents'),
+    'Context must indicate multimodal visual analysis is active'
+  );
+
+  // Simulated response in demo mode must describe visual analysis, not reject
+  const simulatedResp = generateSimulatedDocumentResponse('What animals are in this picture?', geminiPrep);
+  assert.ok(!simulatedResp.includes('No readable text detected in this image.'), 'Demo response must not reject without text');
+  assert.ok(simulatedResp.includes('Visual Analysis'), 'Demo response must provide visual analysis');
+});
+
+test('Phase 2A Acceptance Test 2: An image containing text retains its existing OCR text and AI processing pathway', () => {
+  const receiptDoc = {
+    fileId: 'receipt-1',
+    originalName: 'coffee_receipt.png',
+    filename: 'coffee_receipt.png',
+    format: 'PNG',
+    mimeType: 'image/png',
+    status: 'ready',
+    success: true,
+    isImage: true,
+    hasText: true,
+    text: 'BLUE BOTTLE COFFEE\nEspresso Blend $4.50\nSubtotal: $4.50\nTotal: $4.88',
+    totalCharacters: 68,
+    totalWords: 10,
+    lineCount: 4
+  };
+
+  // For Gemini: OCR text is included in formattedContext AND directAnswer is undefined
+  const geminiPrep = prepareDocumentContext('What was the total on the receipt?', [receiptDoc], {
+    provider: 'gemini'
+  });
+  assert.strictEqual(geminiPrep.directAnswer, undefined);
+  assert.ok(geminiPrep.formattedContext.includes('BLUE BOTTLE COFFEE'));
+  assert.ok(geminiPrep.formattedContext.includes('Total: $4.88'));
+  assert.ok(geminiPrep.formattedContext.includes('[Extracted OCR Text from Image "coffee_receipt.png"]'));
+
+  // For Groq (text-only): OCR text is also included in formattedContext AND directAnswer is undefined
+  const groqPrep = prepareDocumentContext('What was the total on the receipt?', [receiptDoc], {
+    provider: 'groq'
+  });
+  assert.strictEqual(groqPrep.directAnswer, undefined);
+  assert.ok(groqPrep.formattedContext.includes('BLUE BOTTLE COFFEE'));
+  assert.ok(groqPrep.formattedContext.includes('Total: $4.88'));
+});
+
+test('Phase 2A Acceptance Test 3: OCR failure does not prevent Gemini from analyzing a valid image', () => {
+  const failedOcrImage = {
+    fileId: 'failed-ocr-1',
+    originalName: 'diagram.png',
+    filename: 'diagram.png',
+    format: 'PNG',
+    mimeType: 'image/png',
+    status: 'error',
+    success: false,
+    isImage: true,
+    hasText: false,
+    text: '',
+    error: 'Offline image text extraction is unavailable because the local OCR engine could not be initialized.',
+    totalCharacters: 0,
+    totalWords: 0
+  };
+
+  // For Gemini: directAnswer must NOT block visual inspection
+  const geminiPrep = prepareDocumentContext('Explain this diagram', [failedOcrImage], {
+    provider: 'gemini'
+  });
+  assert.strictEqual(geminiPrep.directAnswer, undefined, 'OCR failure must not block Gemini visual analysis');
+  assert.ok(geminiPrep.formattedContext.includes('OCR FAILED'), 'Context must distinguish OCR failure');
+  assert.ok(geminiPrep.formattedContext.includes('multimodal vision model'), 'Context must note multimodal vision fallback');
+
+  // For text-only providers (Groq): OCR failure DOES produce directAnswer explanation to prevent hallucination
+  const groqPrep = prepareDocumentContext('Explain this diagram', [failedOcrImage], {
+    provider: 'groq'
+  });
+  assert.ok(groqPrep.directAnswer, 'Text-only model must receive directAnswer on OCR failure');
+  assert.ok(groqPrep.directAnswer.includes('Offline image text extraction is unavailable'));
+});
+
+test('Phase 2A Acceptance Test 4: Text-only models receive appropriate no-text notice and no raw image payload', () => {
+  const photoDoc = {
+    fileId: 'photo-no-text',
+    originalName: 'sunset.jpg',
+    filename: 'sunset.jpg',
+    format: 'JPG',
+    mimeType: 'image/jpeg',
+    status: 'ready',
+    success: true,
+    isImage: true,
+    hasText: false,
+    text: '',
+    totalCharacters: 0,
+    totalWords: 0
+  };
+
+  const textProviders = ['groq', 'openrouter', 'cloudflare', 'ollama', 'webllm'];
+  for (const prov of textProviders) {
+    const prep = prepareDocumentContext('What is in this picture?', [photoDoc], {
+      provider: prov
+    });
+    assert.strictEqual(
+      prep.directAnswer,
+      'No readable text detected in this image.',
+      `Provider ${prov} must receive exact no-text directAnswer`
+    );
+    assert.strictEqual(prep.isVision, false, `Provider ${prov} must have isVision false`);
+  }
+});
+
+test('Phase 2A Acceptance Test 5: Existing non-image document behavior remains completely unchanged', () => {
+  // Empty text file
+  const emptyDoc = {
+    fileId: 'empty-1',
+    originalName: 'notes.txt',
+    filename: 'notes.txt',
+    format: 'TXT',
+    status: 'empty',
+    success: true,
+    text: '',
+    totalCharacters: 0,
+    totalWords: 0
+  };
+  const emptyPrepGemini = prepareDocumentContext('Summarize notes', [emptyDoc], { provider: 'gemini' });
+  const emptyPrepGroq = prepareDocumentContext('Summarize notes', [emptyDoc], { provider: 'groq' });
+  assert.ok(emptyPrepGemini.directAnswer?.includes('empty (contains 0 bytes'));
+  assert.strictEqual(emptyPrepGemini.directAnswer, emptyPrepGroq.directAnswer);
+
+  // Encrypted PDF
+  const encDoc = {
+    fileId: 'enc-1',
+    originalName: 'secret.pdf',
+    filename: 'secret.pdf',
+    format: 'PDF',
+    status: 'encrypted',
+    success: false,
+    text: '',
+    totalCharacters: 0,
+    totalWords: 0
+  };
+  const encPrepGemini = prepareDocumentContext('Read secret', [encDoc], { provider: 'gemini' });
+  assert.ok(encPrepGemini.directAnswer?.includes('is encrypted or password-protected'));
+
+  // Out of bounds PDF page
+  const pdfDoc = {
+    fileId: 'pdf-1',
+    originalName: 'report.pdf',
+    filename: 'report.pdf',
+    format: 'PDF',
+    status: 'ready',
+    success: true,
+    pageCount: 3,
+    pages: [
+      { pageNumber: 1, text: 'Page 1 content' },
+      { pageNumber: 2, text: 'Page 2 content' },
+      { pageNumber: 3, text: 'Page 3 content' }
+    ],
+    text: 'Page 1 content\nPage 2 content\nPage 3 content',
+    totalCharacters: 42,
+    totalWords: 9
+  };
+  const oobPrep = prepareDocumentContext('Explain page 99 of report.pdf', [pdfDoc], { provider: 'gemini' });
+  assert.ok(oobPrep.directAnswer?.includes('Requested page 99 does not exist in this document.'));
+});
+
+// ----------------------------------------------------------------------------
+// 7. Phase 2B: Image OCR Reliability for Readable Writing & Buffer Integrity
+// ----------------------------------------------------------------------------
+test('Phase 2B Test 1: normalizeOcrText preserves multiline layouts, numbers, currency, and punctuation', () => {
+  const formText = [
+    'INVOICE #9821-B',
+    'Date: 2026-03-15 | Customer ID: C-4401',
+    '----------------------------------------',
+    'Item Description        Qty    Unit     Total',
+    '1. Web App Security      1   $350.00   $350.00',
+    '2. Database Migration    2   $100.00   $200.00',
+    '----------------------------------------',
+    'Subtotal: $550.00',
+    'Tax (8.25%): $45.38',
+    'Total Due: $595.38 [PAID IN FULL]',
+    '',
+    'Notes / Remarks:',
+    '* Guaranteed 99.9% uptime SLA.',
+    '* Support contact: support@example.com (Ext: 402)'
+  ].join('\r\n');
+
+  const normalized = normalizeOcrText(formText);
+  assert.ok(normalized.includes('INVOICE #9821-B'), 'Must preserve invoice heading');
+  assert.ok(normalized.includes('$595.38 [PAID IN FULL]'), 'Must preserve currency and bracketed status');
+  assert.ok(normalized.includes('Tax (8.25%): $45.38'), 'Must preserve parentheses and percentages');
+  assert.ok(normalized.includes('support@example.com (Ext: 402)'), 'Must preserve email and extension');
+  assert.strictEqual(normalized.split('\n').length, 14, 'Must preserve exact multiline line breaks');
+  assert.strictEqual(detectReadableText(normalized, 95), true, 'Form text must be detected as readable text');
+});
+
+test('Phase 2B Test 2: normalizeOcrText preserves code snippets, indentations, and technical symbols', () => {
+  const codeSnippet = [
+    'export async function fetchUser(id: string): Promise<User | null> {',
+    '  if (!id || id.trim().length === 0) return null;',
+    '  const url = `https://api.example.com/v1/users/${encodeURIComponent(id)}`;',
+    '  const res = await fetch(url, { headers: { "Accept": "application/json" } });',
+    '  return res.ok ? await res.json() : null;',
+    '}'
+  ].join('\n');
+
+  const normalized = normalizeOcrText(codeSnippet);
+  assert.ok(normalized.includes('Promise<User | null>'), 'Must preserve TypeScript generics');
+  assert.ok(normalized.includes('`https://api.example.com/v1/users/${encodeURIComponent(id)}`'), 'Must preserve template literals');
+  assert.ok(normalized.includes('"Accept": "application/json"'), 'Must preserve quotes and colons');
+  assert.strictEqual(detectReadableText(normalized, 90), true, 'Code snippet must be detected as readable text');
+});
+
+test('Phase 2B Test 3: detectReadableText distinguishes readable signs/notes from sparse speckles and noise', () => {
+  // Signs and short notes
+  assert.strictEqual(detectReadableText('STOP', 85), true, 'Sign text must be readable');
+  assert.strictEqual(detectReadableText('ROOM 101', 80), true, 'Room numbers must be readable');
+  assert.strictEqual(detectReadableText('GATE 4B', 75), true, 'Alphanumeric gate must be readable');
+  assert.strictEqual(detectReadableText('Exit 24A', 90), true, 'Highway exit must be readable');
+
+  // Noise / speckles / lone artifacts
+  assert.strictEqual(detectReadableText('', 0), false, 'Empty string is not readable');
+  assert.strictEqual(detectReadableText('   \n  \t ', 0), false, 'Whitespace is not readable');
+  assert.strictEqual(detectReadableText('...', 30), false, 'Dots only are not readable');
+  assert.strictEqual(detectReadableText('~', 15), false, 'Tilde only is not readable');
+  assert.strictEqual(detectReadableText('`', 10), false, 'Backtick only is not readable');
+  assert.strictEqual(detectReadableText('x', 20), false, 'Single speckle char with low confidence (<40) is treated as noise');
+});
+
+test('Phase 2B Test 4: validateImageBuffer accurately validates image signatures and catches corrupted buffers', () => {
+  // Valid PNG
+  const validPng = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
+  assert.strictEqual(validateImageBuffer(validPng).valid, true);
+  assert.strictEqual(validateImageBuffer(validPng).format, 'PNG');
+
+  // Valid JPEG
+  const validJpg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
+  assert.strictEqual(validateImageBuffer(validJpg).valid, true);
+  assert.strictEqual(validateImageBuffer(validJpg).format, 'JPEG');
+
+  // Valid BMP
+  const validBmp = Buffer.from([0x42, 0x4d, 0x36, 0x00, 0x00, 0x00]);
+  assert.strictEqual(validateImageBuffer(validBmp).valid, true);
+  assert.strictEqual(validateImageBuffer(validBmp).format, 'BMP');
+
+  // Valid GIF
+  const validGif = Buffer.from('GIF89a\x01\x00\x01\x00');
+  assert.strictEqual(validateImageBuffer(validGif).valid, true);
+  assert.strictEqual(validateImageBuffer(validGif).format, 'GIF');
+
+  // Corrupted / malformed payload (e.g. truncated or random binary)
+  const corruptPayload = Buffer.from('Not an image file at all! Just raw plain text.');
+  const corruptResult = validateImageBuffer(corruptPayload);
+  assert.strictEqual(corruptResult.valid, false);
+  assert.ok(corruptResult.error.includes('Corrupted or unreadable image file'));
+
+  // Truncated buffer (<4 bytes)
+  const tinyBuffer = Buffer.from([0x89, 0x50]);
+  assert.strictEqual(validateImageBuffer(tinyBuffer).valid, false);
+  assert.ok(validateImageBuffer(tinyBuffer).error.includes('too small or truncated'));
+});
+
+await test('Phase 2B Test 5: extractImageText safely reports corrupted buffers with status error and clear message', async () => {
+  const corruptBuffer = Buffer.from('Fake image content that is completely invalid');
+  const result = await extractImageText(corruptBuffer, 'corrupted.png', '.png', 'image/png');
+  assert.strictEqual(result.status, 'error', 'Must return status error on corrupted image');
+  assert.strictEqual(result.success, false);
+  assert.strictEqual(result.hasText, false);
+  assert.ok(result.error.includes('Corrupted or unreadable image file'), 'Must report corrupted header');
+});
+
+test('Phase 2B Test 6: Status NO_TEXT_DETECTED preserves Phase 2A Gemini visual routing and text-only directAnswer', () => {
+  const noTextDoc = {
+    fileId: 'photo-doc-1',
+    originalName: 'landscape.png',
+    filename: 'landscape.png',
+    format: 'PNG',
+    mimeType: 'image/png',
+    status: 'NO_TEXT_DETECTED',
+    success: true,
+    isImage: true,
+    hasText: false,
+    text: '',
+    totalCharacters: 0,
+    totalWords: 0
+  };
+
+  // Gemini: must NOT be blocked by directAnswer
+  const geminiContext = prepareDocumentContext('What landmark is in this landscape?', [noTextDoc], {
+    provider: 'gemini'
+  });
+  assert.strictEqual(geminiContext.directAnswer, undefined, 'NO_TEXT_DETECTED must never block Gemini');
+  assert.strictEqual(geminiContext.isVision, true, 'isVision must be true for Gemini');
+  assert.ok(geminiContext.formattedContext.includes('NO TEXT DETECTED'));
+  assert.ok(geminiContext.formattedContext.includes('Multimodal visual analysis will inspect'));
+
+  // Text-only provider (Groq): receives directAnswer explaining no text detected
+  const groqContext = prepareDocumentContext('What landmark is in this landscape?', [noTextDoc], {
+    provider: 'groq'
+  });
+  assert.strictEqual(groqContext.directAnswer, 'No readable text detected in this image.');
+  assert.strictEqual(groqContext.isVision, false);
+});
+
+test('Phase 2B Test 7: Readable extracted text with punctuation and numbers is delivered to both Gemini and text-only models', () => {
+  const ocrText = 'Invoice #10492\nDate: 2026-03-15\nTotal: $450.00';
+  const readableDoc = {
+    fileId: 'invoice-doc-1',
+    originalName: 'invoice.png',
+    filename: 'invoice.png',
+    format: 'PNG',
+    mimeType: 'image/png',
+    status: 'ready',
+    success: true,
+    isImage: true,
+    hasText: true,
+    text: ocrText,
+    totalCharacters: ocrText.length,
+    totalWords: 5,
+    lineCount: 3
+  };
+
+  const geminiContext = prepareDocumentContext('Summarize this invoice', [readableDoc], {
+    provider: 'gemini'
+  });
+  assert.strictEqual(geminiContext.directAnswer, undefined);
+  assert.ok(geminiContext.formattedContext.includes('Invoice #10492'));
+  assert.ok(geminiContext.formattedContext.includes('Total: $450.00'));
+
+  const groqContext = prepareDocumentContext('Summarize this invoice', [readableDoc], {
+    provider: 'groq'
+  });
+  assert.strictEqual(groqContext.directAnswer, undefined);
+  assert.ok(groqContext.formattedContext.includes('Invoice #10492'));
+  assert.ok(groqContext.formattedContext.includes('Total: $450.00'));
 });
 
 console.log(`\nAll ${passedTests} offline reliability tests passed successfully!`);

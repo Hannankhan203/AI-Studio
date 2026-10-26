@@ -215,8 +215,18 @@ export async function getWorker(timeoutMs = OCR_WORKER_TIMEOUT_MS) {
             rejectFn(err);
           }
         }
-      }).then((w) => {
+      }).then(async (w) => {
         candidateWorker = w;
+        try {
+          await w.setParameters({
+            preserve_interword_spaces: '1',
+            tessjs_create_hocr: '0',
+            tessjs_create_tsv: '0',
+            tessjs_create_box: '0',
+            tessjs_create_unlv: '0',
+            tessjs_create_osd: '0'
+          });
+        } catch (_) {}
         return w;
       });
 
@@ -301,11 +311,112 @@ export function generateSummaryPreview(text) {
  * @param {string} rawText
  * @returns {string}
  */
+/**
+ * Validates that an image buffer begins with a recognized, valid image container signature.
+ * Prevents feeding malformed or non-image payloads to cloud vision or Leptonica WASM.
+ *
+ * @param {Buffer} buffer
+ * @param {string} [ext] - Optional extension hint (e.g. '.png')
+ * @returns {{ valid: boolean, format?: string, error?: string }}
+ */
+export function validateImageBuffer(buffer, ext = '') {
+  if (!Buffer.isBuffer(buffer)) {
+    return { valid: false, error: 'Expected image data as a Buffer.' };
+  }
+
+  if (buffer.length < 4) {
+    return { valid: false, error: 'Image file is too small or truncated (< 4 bytes).' };
+  }
+
+  // 1. JPEG: 0xFF, 0xD8, 0xFF
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return { valid: true, format: 'JPEG' };
+  }
+
+  // 2. PNG: 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A
+  if (
+    buffer.length >= 8 &&
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47 &&
+    buffer[4] === 0x0d &&
+    buffer[5] === 0x0a &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0x0a
+  ) {
+    return { valid: true, format: 'PNG' };
+  }
+
+  // 3. GIF: GIF87a or GIF89a
+  if (
+    buffer.length >= 6 &&
+    buffer[0] === 0x47 &&
+    buffer[1] === 0x49 &&
+    buffer[2] === 0x46 &&
+    buffer[3] === 0x38 &&
+    (buffer[4] === 0x37 || buffer[4] === 0x39) &&
+    buffer[5] === 0x61
+  ) {
+    return { valid: true, format: 'GIF' };
+  }
+
+  // 4. WebP: RIFF....WEBP
+  if (
+    buffer.length >= 12 &&
+    buffer.toString('ascii', 0, 4) === 'RIFF' &&
+    buffer.toString('ascii', 8, 12) === 'WEBP'
+  ) {
+    return { valid: true, format: 'WEBP' };
+  }
+
+  // 5. BMP: 'BM'
+  if (buffer.length >= 2 && buffer[0] === 0x42 && buffer[1] === 0x4d) {
+    return { valid: true, format: 'BMP' };
+  }
+
+  // 6. TIFF: II*\0 or MM\0*
+  if (
+    buffer.length >= 4 &&
+    ((buffer[0] === 0x49 && buffer[1] === 0x49 && buffer[2] === 0x2a && buffer[3] === 0x00) ||
+      (buffer[0] === 0x4d && buffer[1] === 0x4d && buffer[2] === 0x00 && buffer[3] === 0x2a))
+  ) {
+    return { valid: true, format: 'TIFF' };
+  }
+
+  // 7. HEIC / HEIF: ISOBMFF ftyp box
+  if (buffer.length >= 12 && buffer.toString('ascii', 4, 8) === 'ftyp') {
+    return { valid: true, format: 'HEIC' };
+  }
+
+  return {
+    valid: false,
+    error: 'Corrupted or unreadable image file: invalid image header signature (expected JPEG, PNG, WebP, GIF, BMP, or TIFF).'
+  };
+}
+
+/**
+ * Normalizes raw OCR text:
+ * - Unifies newline variations (\r\n -> \n)
+ * - Converts form-feed (\f) to paragraph breaks
+ * - Removes non-printable control characters except tab and newline
+ * - Strips zero-width characters and soft hyphens
+ * - Trims trailing whitespace on each line
+ * - Collapses 3+ consecutive newlines into 2 (preserves paragraphs)
+ * - Trims leading and trailing whitespace
+ *
+ * @param {string} rawText
+ * @returns {string}
+ */
 export function normalizeOcrText(rawText) {
   if (!rawText || typeof rawText !== 'string') return '';
 
-  // Standardize line endings
-  let text = rawText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  // Standardize line endings and form-feed page/section breaks
+  let text = rawText
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/\f/g, '\n\n')
+    .replace(/[\u200B\uFEFF\u00AD]/g, '');
 
   // Strip non-printable ASCII control codes (retain \t and \n)
   text = text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
@@ -339,8 +450,8 @@ export function detectReadableText(text, confidence = 0) {
     return false;
   }
 
-  // If only 1 alphanumeric character was detected with very low confidence, treat as noise
-  if (alphanumericChars.length === 1 && confidence < 40) {
+  // If only 1 alphanumeric character was detected with low confidence, treat as noise
+  if (alphanumericChars.length === 1 && confidence > 0 && confidence < 40) {
     return false;
   }
 
@@ -627,7 +738,31 @@ export async function extractImageText(
     };
   }
 
-  // 3. PRIORITY 1: Gemini Vision AI when online and configured
+  // 3. Validate image buffer header signature
+  const bufferValidation = validateImageBuffer(imageBuffer, normalizedExt);
+  if (!bufferValidation.valid) {
+    return {
+      fileId,
+      filename: displayFilename,
+      originalName,
+      format: formatName,
+      mimeType,
+      sizeBytes: imageSize,
+      dimensions,
+      status: 'error',
+      success: false,
+      isImage: true,
+      hasText: false,
+      text: '',
+      totalCharacters: 0,
+      totalWords: 0,
+      error: bufferValidation.error || 'Corrupted or unreadable image file: invalid image header signature.',
+      message: bufferValidation.error || 'Corrupted or unreadable image file: invalid image header signature.',
+      extractedAt: nowIso
+    };
+  }
+
+  // 4. PRIORITY 1: Gemini Vision AI when online and configured
   // Skipped immediately when client reports offline/preferLocal so zero cloud calls are made offline.
   const geminiKey = apiKey || process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY;
   if (!isOfflineHint && geminiKey && geminiKey !== 'MY_GEMINI_API_KEY') {
@@ -666,7 +801,7 @@ export async function extractImageText(
             mimeType,
             sizeBytes: imageSize,
             dimensions,
-            status: 'ready',
+            status: 'NO_TEXT_DETECTED',
             success: true,
             isImage: true,
             hasText: false,
@@ -687,7 +822,7 @@ export async function extractImageText(
     }
   }
 
-  // 4. PRIORITY 2: Local Tesseract.js OCR using strictly bundled local assets (100% offline)
+  // 5. PRIORITY 2: Local Tesseract.js OCR using strictly bundled local assets (100% offline)
   return new Promise((resolve) => {
     ocrQueue = ocrQueue
       .catch(() => {})
@@ -758,7 +893,7 @@ export async function extractImageText(
             mimeType,
             sizeBytes: imageSize,
             dimensions,
-            status: 'ready',
+            status: 'NO_TEXT_DETECTED',
             success: true,
             isImage: true,
             hasText: false,
@@ -784,9 +919,16 @@ export async function extractImageText(
             ocrErr?.code === 'LOCAL_OCR_INIT_FAILED' ||
             String(ocrErr?.message || '').includes(LOCAL_OCR_INIT_ERROR_MESSAGE);
 
-          const clearErrorMessage = isInitFailure
-            ? LOCAL_OCR_INIT_ERROR_MESSAGE
-            : `${LOCAL_OCR_INIT_ERROR_MESSAGE} (${ocrErr?.message || 'Recognition failed'})`;
+          const isTimeout = String(ocrErr?.message || '').includes('timed out');
+
+          let clearErrorMessage = LOCAL_OCR_INIT_ERROR_MESSAGE;
+          if (isInitFailure) {
+            clearErrorMessage = LOCAL_OCR_INIT_ERROR_MESSAGE;
+          } else if (isTimeout) {
+            clearErrorMessage = ocrErr?.message || `Local OCR recognition timed out (${Math.round(OCR_RECOGNIZE_TIMEOUT_MS / 1000)}s limit).`;
+          } else {
+            clearErrorMessage = `Local OCR recognition failed: ${ocrErr?.message || 'Recognition failed'}`;
+          }
 
           return resolve({
             fileId,
