@@ -54,18 +54,20 @@ export function loadEnvironmentVariables(): void {
     let loaded = false;
     for (const candidate of candidates) {
       if (fs.existsSync(candidate)) {
-        dotenv.config({ path: candidate, override: true });
+        dotenv.config({ path: candidate, override: false });
         loaded = true;
       }
     }
 
     if (!loaded) {
-      dotenv.config({ override: true });
+      dotenv.config({ override: false });
     }
   } catch (_) {}
 }
 
-loadEnvironmentVariables();
+if (process.env.TESTING !== 'true') {
+  loadEnvironmentVariables();
+}
 
 export type FirebaseCredentialSource =
   | 'service_account_key'
@@ -223,7 +225,10 @@ export function initializeFirebaseAdmin(): App | null {
   }
 
   // Always refresh environment variables from .env to pick up newly added credentials
-  loadEnvironmentVariables();
+  // (Skip during isolated test runs so in-memory test env overrides are not clobbered by .env on disk)
+  if (process.env.TESTING !== 'true') {
+    loadEnvironmentVariables();
+  }
 
   // Check if Firebase Admin app has already been initialized on the global instance
   const existingApps = getApps();

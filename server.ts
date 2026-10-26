@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-dotenv.config({ override: true });
+dotenv.config({ override: false });
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
