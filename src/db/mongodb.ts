@@ -122,7 +122,12 @@ export async function connectToDatabase(): Promise<Db | null> {
 
   state.connectionPromise = (async () => {
     try {
-      console.log(`[MongoDB] Connecting to Atlas database: "${targetDbName}"...`);
+      if (state.client) {
+        try {
+          await state.client.close();
+        } catch (_) {}
+        state.client = null;
+      }
 
       const client = new MongoClient(uri, getMongoClientOptions());
 

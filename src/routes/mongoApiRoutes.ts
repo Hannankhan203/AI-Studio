@@ -50,7 +50,11 @@ import {
   verifyMessageOwnership,
   canPinConversation
 } from '../services/backendMongoService.ts';
-import { MongoNotConnectedError } from '../db/mongodb.ts';
+import {
+  MongoNotConnectedError,
+  connectToDatabase,
+  isMongoConfigured
+} from '../db/mongodb.ts';
 
 const router = Router();
 
@@ -91,9 +95,28 @@ function handleMongoApiError(
   res.status(500).json({ error: fallbackMessage, code: fallbackCode });
 }
 
-// Apply requireAuth strictly to MongoDB user-data prefixes so unrelated /api/* routes
+/**
+ * Serverless Connection Lifecycle Middleware:
+ * Ensures MongoDB Atlas connection is established before processing user-data routes in serverless environments.
+ * - Reuses existing warm connection instantly (zero overhead on warm instances)
+ * - Connects asynchronously if uninitialized and MONGODB_URI is configured
+ * - Bounded and non-blocking if unconfigured or failed: getDatabase() will throw
+ *   MongoNotConnectedError which handleMongoApiError maps directly to 503 DATABASE_UNAVAILABLE.
+ */
+async function ensureMongoConnection(_req: Request, _res: Response, next: () => void) {
+  if (isMongoConfigured()) {
+    try {
+      await connectToDatabase();
+    } catch (_) {
+      // Ignored here so repository getDatabase() throws explicit MongoNotConnectedError
+    }
+  }
+  next();
+}
+
+// Apply requireAuth and ensureMongoConnection strictly to MongoDB user-data prefixes so unrelated /api/* routes
 // (e.g. /api/chat, /api/upload, /api/transcribe) mounted after mongoApiRouter pass through cleanly.
-router.use(MONGO_USER_DATA_PREFIXES, requireAuth);
+router.use(MONGO_USER_DATA_PREFIXES, requireAuth, ensureMongoConnection);
 
 /* ==========================================================================
    1. USER PROFILE ENDPOINTS

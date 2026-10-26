@@ -27,6 +27,7 @@
     "test:legacy-discovery": "TESTING=true tsx scripts/testLegacyConversationDiscovery.ts",
     "test:token-refresh": "TESTING=true tsx scripts/testAuthenticatedTokenRefresh.ts",
     "test:no-fallback": "TESTING=true tsx scripts/testDatabaseNoFallback.ts",
+    "test:serverless": "tsx scripts/testVercelServerlessRouting.ts",
     "test": "npm run lint && node scripts/auditOfflineReliability.js"
   },
   "dependencies": {
@@ -65,5 +66,12 @@
     "tsx": "^4.21.0",
     "typescript": "^7.0.2",
     "vite-plugin-pwa": "^2.0.0"
+  },
+  "overrides": {
+    "firebase-admin": {
+      "jwks-rsa": {
+        "jose": "4.15.9"
+      }
+    }
   }
 }
