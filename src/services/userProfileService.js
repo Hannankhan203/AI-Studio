@@ -83,51 +83,18 @@ export function validateUsername(username) {
   return { isValid: true, sanitized };
 }
 
-/**
- * Helper to resolve the API endpoint URL in both browser and test/server environments.
- * @param {string} endpointPath
- * @returns {string}
- */
-function getApiEndpoint(endpointPath) {
-  if (typeof window !== 'undefined' && typeof window.document !== 'undefined') {
-    return endpointPath;
-  }
-  const base = (typeof process !== 'undefined' && process.env?.TEST_API_BASE) || 'http://localhost:3000';
-  return `${base}${endpointPath}`;
-}
-
-let customTokenProvider = null;
-
-/**
- * Testing hook allowing unit tests to supply mocked Firebase ID tokens.
- * @param {(() => Promise<string|null>)|null} provider
- */
-export function setAuthTokenProviderForTesting(provider) {
-  customTokenProvider = provider;
-}
-
-/**
- * Helper to securely obtain current user's Firebase ID token.
- * @param {boolean} [forceRefresh=false]
- * @returns {Promise<string|null>}
- */
-async function resolveAuthToken(forceRefresh = false) {
-  if (customTokenProvider) {
-    return customTokenProvider();
-  }
-  try {
-    if (typeof getIdToken === 'function') {
-      const token = await getIdToken(forceRefresh);
-      if (token) return token;
-    }
-    if (auth?.currentUser?.getIdToken) {
-      return await auth.currentUser.getIdToken(forceRefresh);
-    }
-  } catch (err) {
-    console.warn('Could not resolve Firebase ID token:', err?.message || err);
-  }
-  return null;
-}
+export {
+  setAuthTokenProviderForTesting,
+  resolveAuthToken,
+  getApiEndpoint,
+  authorizedApiFetch
+} from './mongoApiClient.js';
+import {
+  setAuthTokenProviderForTesting,
+  resolveAuthToken,
+  getApiEndpoint,
+  authorizedApiFetch
+} from './mongoApiClient.js';
 
 /**
  * Fetches the user's persistent profile document from MongoDB via Express API (with local offline cache).
@@ -144,12 +111,6 @@ export async function getUserProfile(userId) {
     return cached;
   }
 
-  const token = await resolveAuthToken();
-  // If no auth token is available (e.g. unauthenticated session), fall back to cache
-  if (!token) {
-    return cached;
-  }
-
   try {
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     let timer = null;
@@ -157,35 +118,35 @@ export async function getUserProfile(userId) {
       timer = setTimeout(() => controller.abort(), 4000);
     }
 
-    const endpoint = getApiEndpoint('/api/users/me');
-    const response = await fetch(endpoint, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Accept': 'application/json'
-      },
-      signal: controller ? controller.signal : undefined
-    }).finally(() => {
+    const { res: response } = await authorizedApiFetch(
+      '/api/users/me',
+      {
+        method: 'GET',
+        signal: controller ? controller.signal : undefined
+      }
+    ).finally(() => {
       if (timer) clearTimeout(timer);
     });
 
-    if (response.ok) {
-      const data = await response.json();
-      if (data?.user) {
-        const profile = {
-          uid: data.user.uid || userId,
-          username: data.user.username || '',
-          email: data.user.email || ''
-        };
-        saveCachedUserProfile(userId, profile);
-        return profile;
+    if (response) {
+      if (response.ok) {
+        const data = await response.json();
+        if (data?.user) {
+          const profile = {
+            uid: data.user.uid || userId,
+            username: data.user.username || '',
+            email: data.user.email || ''
+          };
+          saveCachedUserProfile(userId, profile);
+          return profile;
+        }
+      } else if (response.status === 404) {
+        // User is authenticated in Firebase but no profile document exists yet in MongoDB.
+        // Return cached if available, else null so caller can create one or fallback to displayName.
+        return cached || null;
+      } else {
+        console.warn(`[UserProfileService] Profile fetch returned HTTP ${response.status}`);
       }
-    } else if (response.status === 404) {
-      // User is authenticated in Firebase but no profile document exists yet in MongoDB.
-      // Return cached if available, else null so caller can create one or fallback to displayName.
-      return cached || null;
-    } else {
-      console.warn(`[UserProfileService] Profile fetch returned HTTP ${response.status}`);
     }
   } catch (err) {
     console.warn('Could not retrieve user profile from backend API, using local cache if available:', err?.message || err);
@@ -241,29 +202,24 @@ export async function saveUserProfile(userId, { username, email = '' }) {
     return;
   }
 
-  // 5. Retrieve verified Firebase ID token for authenticated API request
-  const token = await resolveAuthToken();
-  if (!token) {
-    // If user is not yet fully authenticated with a valid token, local cache and auth displayName are saved
-    return;
-  }
-
-  // 6. Persist to MongoDB via Express API (PUT /api/users/me)
+  // 5. Persist to MongoDB via Express API (PUT /api/users/me)
   // Identity is derived exclusively from the verified token on the server
   try {
-    const endpoint = getApiEndpoint('/api/users/me');
-    const response = await fetch(endpoint, {
+    const { res: response, token } = await authorizedApiFetch('/api/users/me', {
       method: 'PUT',
       headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`,
-        'Accept': 'application/json'
+        'Content-Type': 'application/json'
       },
       body: JSON.stringify({
         username: sanitized,
         email: effectiveEmail
       })
     });
+
+    if (!token || !response) {
+      // If user is not yet fully authenticated with a valid token, local cache and auth displayName are saved
+      return;
+    }
 
     if (response.ok) {
       const data = await response.json();

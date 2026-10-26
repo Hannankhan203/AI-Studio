@@ -338,42 +338,112 @@ function createInMemoryCollection(name: string) {
   };
 }
 
-let inMemoryFallbackDb: Db | null = null;
-let loggedFallbackNotice = false;
+/**
+ * Error thrown when a MongoDB persistence operation is requested
+ * but MongoDB is not connected or MONGODB_URI is unconfigured.
+ */
+export class MongoNotConnectedError extends Error {
+  code: string;
+  statusCode: number;
 
-function getInMemoryFallbackDatabase(): Db {
-  if (!inMemoryFallbackDb) {
-    const collections = new Map<string, any>();
-    inMemoryFallbackDb = {
-      databaseName: getDatabaseName(),
-      collection: (name: string) => {
-        if (!collections.has(name)) {
-          collections.set(name, createInMemoryCollection(name));
-        }
-        return collections.get(name);
-      },
-      command: async () => ({ ok: 1 }),
-      listCollections: () => ({
-        toArray: async () => Array.from(collections.keys()).map((name) => ({ name }))
-      })
-    } as unknown as Db;
+  constructor(message?: string) {
+    super(
+      message ||
+        'MongoDB Atlas database is not connected. A real MongoDB connection is required for persistent operations.'
+    );
+    this.name = 'MongoNotConnectedError';
+    this.code = 'DATABASE_NOT_CONNECTED';
+    this.statusCode = 503;
   }
-  if (!loggedFallbackNotice) {
-    loggedFallbackNotice = true;
-    console.warn('[AI Studio] MongoDB not connected — using in-memory fallback store (ephemeral).');
+}
+
+function createInMemoryDatabaseInstance(): Db {
+  const collections = new Map<string, any>();
+  return {
+    databaseName: getDatabaseName(),
+    collection: (name: string) => {
+      if (!collections.has(name)) {
+        collections.set(name, createInMemoryCollection(name));
+      }
+      return collections.get(name);
+    },
+    command: async () => ({ ok: 1 }),
+    listCollections: () => ({
+      toArray: async () => Array.from(collections.keys()).map((name) => ({ name }))
+    })
+  } as unknown as Db;
+}
+
+let testModeInMemoryDb: Db | null = null;
+let testModeInMemoryEnabled = false;
+
+/**
+ * TEST HOOK ONLY: Explicitly enables an in-memory mock database for isolated tests.
+ * STRICT SAFETY: This function throws an error if called when process.env.TESTING !== 'true'.
+ * Under NO circumstances can this be activated in production or normal runtime.
+ */
+export function enableInMemoryTestDatabase(): Db {
+  if (process.env.TESTING !== 'true') {
+    throw new Error(
+      '[CRITICAL] enableInMemoryTestDatabase() can only be called when process.env.TESTING === "true". ' +
+        'In-memory persistence is strictly forbidden in production.'
+    );
   }
-  return inMemoryFallbackDb;
+  if (!testModeInMemoryDb) {
+    testModeInMemoryDb = createInMemoryDatabaseInstance();
+  }
+  testModeInMemoryEnabled = true;
+  state.db = testModeInMemoryDb;
+  state.isConnected = true;
+  state.lastError = null;
+  return testModeInMemoryDb;
 }
 
 /**
- * Returns the currently active Db instance, falling back to an in-memory mock Db
- * when external MongoDB TCP connections are unconfigured or unavailable.
+ * TEST HOOK ONLY: Resets test database mocks and restores strict connection requirements.
+ */
+export function resetTestDatabase(): void {
+  testModeInMemoryEnabled = false;
+  testModeInMemoryDb = null;
+  state.db = null;
+  state.isConnected = false;
+  state.isConnecting = false;
+  state.lastError = null;
+  state.connectionPromise = null;
+}
+
+/**
+ * Returns the currently active Db instance.
+ *
+ * PRODUCTION SAFETY INVARIANT (Phase 3 Step 3.4D-1):
+ * Real MongoDB connection is REQUIRED in production.
+ * This function NEVER silently falls back to an in-memory database in production or normal runtime.
+ * If MongoDB is not connected, it throws an explicit MongoNotConnectedError.
+ *
+ * An in-memory database may only be used when explicit test mode (process.env.TESTING === 'true')
+ * has explicitly injected a mock or opted into enableInMemoryTestDatabase().
  */
 export function getDatabase(): Db {
   if (state.db && state.isConnected) {
     return state.db;
   }
-  return getInMemoryFallbackDatabase();
+
+  // If in explicit test mode AND test in-memory fallback was explicitly opted into
+  if (process.env.TESTING === 'true' && testModeInMemoryEnabled && testModeInMemoryDb) {
+    return testModeInMemoryDb;
+  }
+
+  // PRODUCTION / NORMAL RUNTIME: Fail explicitly. No silent in-memory fallback.
+  const reason = state.lastError
+    ? state.lastError
+    : isMongoConfigured()
+      ? 'MongoDB connection has not been established or was lost.'
+      : 'MONGODB_URI is not configured in environment variables.';
+
+  throw new MongoNotConnectedError(
+    `Database connection required: MongoDB is not connected (${reason}). ` +
+      'In-memory fallback is strictly disabled to prevent silent data loss.'
+  );
 }
 
 /**
@@ -450,9 +520,16 @@ export async function closeDatabase(): Promise<void> {
 /**
  * TEST HOOK: Sets an in-memory mock Db instance for isolated unit tests
  * when testing environments do not have a live MongoDB Atlas connection string.
+ * Strictly permitted ONLY when process.env.TESTING === 'true'.
  */
 export function setMockDatabaseForTesting(mockDb: any | null): void {
   if (mockDb) {
+    if (process.env.TESTING !== 'true') {
+      throw new Error(
+        '[CRITICAL] setMockDatabaseForTesting can only be called when process.env.TESTING === "true". ' +
+          'Test mocking is strictly forbidden in production.'
+      );
+    }
     state.db = mockDb;
     state.isConnected = true;
     state.lastError = null;

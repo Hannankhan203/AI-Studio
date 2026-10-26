@@ -45,7 +45,19 @@ const FIRESTORE_OP_TIMEOUT_MS = 4500;
 const activeSyncPromises = new Map();
 const activeSubscriptions = new Map();
 
-let customTokenProvider = null;
+export {
+  setAuthTokenProviderForTesting,
+  resolveAuthToken,
+  getApiEndpoint,
+  authorizedApiFetch
+} from './mongoApiClient.js';
+import {
+  setAuthTokenProviderForTesting,
+  resolveAuthToken,
+  getApiEndpoint,
+  authorizedApiFetch
+} from './mongoApiClient.js';
+
 let customLegacyFirestoreLoader = null;
 let customLegacyFirestoreChatsLoader = null;
 let customLegacyFirestoreDeleteHandler = null;
@@ -53,14 +65,6 @@ let customFirestoreOpTimeoutMs = null;
 
 function getFirestoreTimeoutMs() {
   return customFirestoreOpTimeoutMs || FIRESTORE_OP_TIMEOUT_MS;
-}
-
-/**
- * Testing hook allowing unit and integration tests to supply mocked Firebase ID tokens.
- * @param {((forceRefresh?: boolean) => Promise<string|null>)|null} provider
- */
-export function setAuthTokenProviderForTesting(provider) {
-  customTokenProvider = provider;
 }
 
 /**
@@ -96,78 +100,6 @@ export function setFirestoreTimeoutMsForTesting(timeoutMs) {
     typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0
       ? timeoutMs
       : null;
-}
-
-/**
- * Helper to securely obtain current user's Firebase ID token.
- * @param {boolean} [forceRefresh=false]
- * @returns {Promise<string|null>}
- */
-export async function resolveAuthToken(forceRefresh = false) {
-  if (customTokenProvider) {
-    return customTokenProvider(forceRefresh);
-  }
-  try {
-    if (typeof getIdToken === 'function') {
-      const token = await getIdToken(forceRefresh);
-      if (token) return token;
-    }
-    if (auth?.currentUser?.getIdToken) {
-      return await auth.currentUser.getIdToken(forceRefresh);
-    }
-  } catch (err) {
-    console.warn('Could not resolve Firebase ID token:', err?.message || err);
-  }
-  return null;
-}
-
-/**
- * Performs an authenticated fetch against the Express/MongoDB API using Bearer ID token,
- * retrying once with a force-refreshed token if the server responds with 401.
- * @param {string} endpointPath
- * @param {RequestInit} [options]
- * @returns {Promise<{ res: Response | null, token: string | null }>}
- */
-async function authorizedApiFetch(endpointPath, options = {}) {
-  let token = await resolveAuthToken(false);
-  if (!token) {
-    return { res: null, token: null };
-  }
-
-  const endpoint = getApiEndpoint(endpointPath);
-  const execute = (bearerToken) =>
-    fetch(endpoint, {
-      ...options,
-      headers: {
-        ...(options.headers || {}),
-        'Authorization': `Bearer ${bearerToken}`,
-        'Accept': 'application/json'
-      }
-    });
-
-  let res = await execute(token);
-  if (res.status === 401) {
-    const refreshed = await resolveAuthToken(true);
-    if (refreshed && refreshed !== token) {
-      token = refreshed;
-      res = await execute(token);
-    }
-  }
-
-  return { res, token };
-}
-
-/**
- * Helper to resolve the API endpoint URL in both browser and test/server environments.
- * @param {string} endpointPath
- * @returns {string}
- */
-export function getApiEndpoint(endpointPath) {
-  if (typeof window !== 'undefined' && typeof window.document !== 'undefined') {
-    return endpointPath;
-  }
-  const base = (typeof process !== 'undefined' && process.env?.TEST_API_BASE) || 'http://localhost:3000';
-  return `${base}${endpointPath}`;
 }
 
 /**
@@ -848,24 +780,20 @@ export async function createChatDocument(userId, initialTitle = 'New Conversatio
   }
 
   try {
-    const token = await resolveAuthToken();
-    if (token) {
-      const endpoint = getApiEndpoint('/api/conversations');
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
-        body: JSON.stringify({
-          id: chatId,
-          title: initialTitle,
-          mode: cleanMode,
-          isPinned: false
-        })
-      });
+    const { res } = await authorizedApiFetch('/api/conversations', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        id: chatId,
+        title: initialTitle,
+        mode: cleanMode,
+        isPinned: false
+      })
+    });
 
+    if (res) {
       if (!res.ok) {
         const errorData = await res.json().catch(() => ({}));
         throw new Error(errorData.error || `Failed to create conversation (${res.status})`);
@@ -928,19 +856,18 @@ export async function updateChatMode(userId, chatId, mode) {
   }
 
   try {
-    const token = await resolveAuthToken();
-    if (token) {
-      const endpoint = getApiEndpoint(`/api/conversations/${encodeURIComponent(chatId)}`);
-      const res = await fetch(endpoint, {
+    const { res } = await authorizedApiFetch(
+      `/api/conversations/${encodeURIComponent(chatId)}`,
+      {
         method: 'PATCH',
         headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({ mode: cleanMode })
-      });
+      }
+    );
 
+    if (res) {
       if (res.status === 404 && existingLocalChat?.storageSource === 'legacy-firestore') {
         const promoted = await ensureParentConversationInMongo(
           { ...existingLocalChat, mode: cleanMode },
@@ -1173,19 +1100,18 @@ export async function renameConversation(userId, chatId, newTitle) {
   }
 
   try {
-    const token = await resolveAuthToken();
-    if (token) {
-      const endpoint = getApiEndpoint(`/api/conversations/${encodeURIComponent(chatId)}`);
-      const res = await fetch(endpoint, {
+    const { res } = await authorizedApiFetch(
+      `/api/conversations/${encodeURIComponent(chatId)}`,
+      {
         method: 'PATCH',
         headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({ title: sanitized })
-      });
+      }
+    );
 
+    if (res) {
       if (res.status === 404 && existingLocalChat?.storageSource === 'legacy-firestore') {
         const promoted = await ensureParentConversationInMongo(
           { ...existingLocalChat, title: sanitized },
@@ -1261,28 +1187,24 @@ export async function toggleChatPinned(userId, chatId, isPinned) {
   }
 
   try {
-    const token = await resolveAuthToken();
-    if (token) {
-      const endpoint = getApiEndpoint(`/api/conversations/${encodeURIComponent(chatId)}`);
-      let res = await fetch(endpoint, {
+    let { res } = await authorizedApiFetch(
+      `/api/conversations/${encodeURIComponent(chatId)}`,
+      {
         method: 'PATCH',
         headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({ isPinned: Boolean(isPinned) })
-      });
+      }
+    );
 
+    if (res) {
       let promotedFromLegacy = false;
       if (res.status === 404 && existingLocalChat?.storageSource === 'legacy-firestore') {
-        const createEndpoint = getApiEndpoint('/api/conversations');
-        res = await fetch(createEndpoint, {
+        const createRes = await authorizedApiFetch('/api/conversations', {
           method: 'POST',
           headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
+            'Content-Type': 'application/json'
           },
           body: JSON.stringify({
             id: chatId,
@@ -1291,7 +1213,10 @@ export async function toggleChatPinned(userId, chatId, isPinned) {
             isPinned: Boolean(isPinned)
           })
         });
-        promotedFromLegacy = res.ok;
+        if (createRes.res) {
+          res = createRes.res;
+          promotedFromLegacy = res.ok;
+        }
       }
 
       if (!res.ok) {
@@ -1378,21 +1303,16 @@ export async function deleteConversation(userId, chatId) {
   }
 
   try {
-    const token = await resolveAuthToken();
-    if (token) {
-      const endpoint = getApiEndpoint(`/api/conversations/${encodeURIComponent(chatId)}`);
-      const res = await fetch(endpoint, {
-        method: 'DELETE',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Accept': 'application/json'
-        }
-      });
-
-      if (!res.ok && res.status !== 404) {
-        const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.error || `Failed to delete conversation (${res.status})`);
+    const { res } = await authorizedApiFetch(
+      `/api/conversations/${encodeURIComponent(chatId)}`,
+      {
+        method: 'DELETE'
       }
+    );
+
+    if (res && !res.ok && res.status !== 404) {
+      const errorData = await res.json().catch(() => ({}));
+      throw new Error(errorData.error || `Failed to delete conversation (${res.status})`);
     }
   } catch (err) {
     if (isOfflineOrNetworkError(err)) {

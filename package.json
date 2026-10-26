@@ -25,6 +25,8 @@
     "test:stop-lifecycle": "TESTING=true tsx scripts/testStopResponseLifecycle.ts",
     "test:sidebar-a11y": "TESTING=true tsx scripts/testSidebarAccessibility.ts",
     "test:legacy-discovery": "TESTING=true tsx scripts/testLegacyConversationDiscovery.ts",
+    "test:token-refresh": "TESTING=true tsx scripts/testAuthenticatedTokenRefresh.ts",
+    "test:no-fallback": "TESTING=true tsx scripts/testDatabaseNoFallback.ts",
     "test": "npm run lint && node scripts/auditOfflineReliability.js"
   },
   "dependencies": {

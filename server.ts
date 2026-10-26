@@ -4994,20 +4994,24 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
   }
 });
 
-// Database offline route-level fallback error middleware
+// Database offline route-level error middleware (Phase 3 Step 3.4D-1)
+// Fails explicitly with HTTP 503 instead of silently returning mock empty objects or arrays
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
   if (
     err?.name === 'MongooseError' ||
     err?.name === 'MongoNetworkError' ||
     err?.name === 'MongoServerSelectionError' ||
+    err?.name === 'MongoNotConnectedError' ||
+    err?.code === 'DATABASE_NOT_CONNECTED' ||
     err?.message?.includes('buffering timed out') ||
-    err?.message?.includes('MongoDB is not connected')
+    err?.message?.includes('MongoDB is not connected') ||
+    err?.message?.includes('Database connection required')
   ) {
-    console.warn('[AI Studio] Database offline — returning mock empty response');
-    if (req.method === 'GET') {
-      return res.json(req.path.endsWith('s') || req.path.endsWith('s/') ? [] : {});
-    }
-    return res.status(503).json({ error: 'Service temporarily unavailable (database offline)' });
+    console.warn('[MongoDB] Database offline/unavailable error caught in middleware:', err?.message || err);
+    return res.status(503).json({
+      error: 'Service temporarily unavailable (database offline)',
+      code: 'DATABASE_UNAVAILABLE'
+    });
   }
   next(err);
 });

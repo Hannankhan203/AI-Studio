@@ -50,6 +50,7 @@ import {
   verifyMessageOwnership,
   canPinConversation
 } from '../services/backendMongoService.ts';
+import { MongoNotConnectedError } from '../db/mongodb.ts';
 
 const router = Router();
 
@@ -59,6 +60,36 @@ export const MONGO_USER_DATA_PREFIXES = [
   '/messages',
   '/user-settings'
 ];
+
+/**
+ * Normalizes MongoDB database errors to ensure explicit HTTP 503 DATABASE_UNAVAILABLE responses
+ * when MongoDB Atlas is disconnected or unconfigured, preventing silent in-memory fallbacks or fake successes.
+ */
+function handleMongoApiError(
+  res: Response,
+  err: any,
+  actionDesc: string,
+  fallbackMessage: string,
+  fallbackCode = 'INTERNAL_ERROR'
+) {
+  if (
+    err instanceof MongoNotConnectedError ||
+    err?.name === 'MongoNotConnectedError' ||
+    err?.code === 'DATABASE_NOT_CONNECTED' ||
+    err?.name === 'MongoNetworkError' ||
+    err?.name === 'MongoServerSelectionError' ||
+    err?.message?.includes('Database connection required') ||
+    err?.message?.includes('MongoDB is not connected')
+  ) {
+    res.status(503).json({
+      error: 'Database service is temporarily unavailable. Persistent operations require an active MongoDB connection.',
+      code: 'DATABASE_UNAVAILABLE'
+    });
+    return;
+  }
+  console.error(`[API ${actionDesc}] Error:`, err?.message || err);
+  res.status(500).json({ error: fallbackMessage, code: fallbackCode });
+}
 
 // Apply requireAuth strictly to MongoDB user-data prefixes so unrelated /api/* routes
 // (e.g. /api/chat, /api/upload, /api/transcribe) mounted after mongoApiRouter pass through cleanly.
@@ -99,8 +130,7 @@ router.get(['/users/me', '/users/:userId'], async (req: Request, res: Response) 
 
     res.json({ user });
   } catch (err: any) {
-    console.error('[API /users] Error fetching user profile:', err?.message || err);
-    res.status(500).json({ error: 'Internal server error while retrieving user profile.', code: 'INTERNAL_ERROR' });
+    handleMongoApiError(res, err, '/users', 'Internal server error while retrieving user profile.');
   }
 });
 
@@ -148,8 +178,7 @@ router.all(['/users', '/users/me', '/users/:userId'], async (req: Request, res: 
 
     res.json({ user });
   } catch (err: any) {
-    console.error('[API /users] Error updating profile:', err?.message || err);
-    res.status(500).json({ error: 'Internal server error while saving user profile.', code: 'INTERNAL_ERROR' });
+    handleMongoApiError(res, err, '/users', 'Internal server error while saving user profile.');
   }
 });
 
@@ -176,8 +205,7 @@ router.get('/conversations', async (req: Request, res: Response) => {
 
     res.json({ conversations });
   } catch (err: any) {
-    console.error('[API /conversations] Error listing conversations:', err?.message || err);
-    res.status(500).json({ error: 'Failed to retrieve conversations.', code: 'INTERNAL_ERROR' });
+    handleMongoApiError(res, err, '/conversations', 'Failed to retrieve conversations.');
   }
 });
 
@@ -231,8 +259,7 @@ router.post('/conversations', async (req: Request, res: Response) => {
       });
       return;
     }
-    console.error('[API /conversations] Error creating conversation:', err?.message || err);
-    res.status(500).json({ error: 'Failed to create conversation.', code: 'INTERNAL_ERROR' });
+    handleMongoApiError(res, err, '/conversations', 'Failed to create conversation.');
   }
 });
 
@@ -266,8 +293,7 @@ router.get('/conversations/:id', async (req: Request, res: Response) => {
 
     res.json({ conversation: check.conversation });
   } catch (err: any) {
-    console.error('[API /conversations/:id] Error fetching conversation:', err?.message || err);
-    res.status(500).json({ error: 'Failed to fetch conversation.', code: 'INTERNAL_ERROR' });
+    handleMongoApiError(res, err, '/conversations/:id', 'Failed to fetch conversation.');
   }
 });
 
@@ -336,8 +362,7 @@ router.all('/conversations/:id', async (req: Request, res: Response, next) => {
     const updated = await updateConversation(check.conversation!._id, patch);
     res.json({ conversation: updated });
   } catch (err: any) {
-    console.error('[API /conversations/:id] Error updating conversation:', err?.message || err);
-    res.status(500).json({ error: 'Failed to update conversation.', code: 'INTERNAL_ERROR' });
+    handleMongoApiError(res, err, '/conversations/:id', 'Failed to update conversation.');
   }
 });
 
@@ -380,8 +405,7 @@ router.delete('/conversations/:id', async (req: Request, res: Response) => {
       deletedMessagesCount
     });
   } catch (err: any) {
-    console.error('[API /conversations/:id] Error deleting conversation:', err?.message || err);
-    res.status(500).json({ error: 'Failed to delete conversation.', code: 'INTERNAL_ERROR' });
+    handleMongoApiError(res, err, '/conversations/:id', 'Failed to delete conversation.');
   }
 });
 
@@ -436,8 +460,7 @@ router.get('/messages', async (req: Request, res: Response) => {
 
     res.json({ messages });
   } catch (err: any) {
-    console.error('[API /messages] Error listing messages:', err?.message || err);
-    res.status(500).json({ error: 'Failed to retrieve messages.', code: 'INTERNAL_ERROR' });
+    handleMongoApiError(res, err, '/messages', 'Failed to retrieve messages.');
   }
 });
 
@@ -511,8 +534,7 @@ router.post('/messages', async (req: Request, res: Response) => {
       });
       return;
     }
-    console.error('[API /messages] Error creating message:', err?.message || err);
-    res.status(500).json({ error: 'Failed to create message.', code: 'INTERNAL_ERROR' });
+    handleMongoApiError(res, err, '/messages', 'Failed to create message.');
   }
 });
 
@@ -569,8 +591,7 @@ router.delete('/messages', async (req: Request, res: Response) => {
     const deletedCount = await deleteMessagesByIds(check.conversation!._id, messageIds);
     res.json({ success: true, deletedCount });
   } catch (err: any) {
-    console.error('[API /messages batch delete] Error:', err?.message || err);
-    res.status(500).json({ error: 'Failed to delete messages.', code: 'INTERNAL_ERROR' });
+    handleMongoApiError(res, err, '/messages batch delete', 'Failed to delete messages.');
   }
 });
 
@@ -598,8 +619,7 @@ router.get('/messages/:id', async (req: Request, res: Response) => {
 
     res.json({ message: check.message });
   } catch (err: any) {
-    console.error('[API /messages/:id] Error fetching message:', err?.message || err);
-    res.status(500).json({ error: 'Failed to retrieve message.', code: 'INTERNAL_ERROR' });
+    handleMongoApiError(res, err, '/messages/:id', 'Failed to retrieve message.');
   }
 });
 
@@ -636,8 +656,7 @@ router.all('/messages/:id', async (req: Request, res: Response, next) => {
     const updated = await updateMessage(check.message!._id, allowedPatch);
     res.json({ message: updated });
   } catch (err: any) {
-    console.error('[API /messages/:id] Error updating message:', err?.message || err);
-    res.status(500).json({ error: 'Failed to update message.', code: 'INTERNAL_ERROR' });
+    handleMongoApiError(res, err, '/messages/:id', 'Failed to update message.');
   }
 });
 
@@ -666,8 +685,7 @@ router.delete('/messages/:id', async (req: Request, res: Response) => {
     await deleteMessage(check.message!._id);
     res.json({ success: true, deletedMessageId: check.message!._id });
   } catch (err: any) {
-    console.error('[API /messages/:id] Error deleting message:', err?.message || err);
-    res.status(500).json({ error: 'Failed to delete message.', code: 'INTERNAL_ERROR' });
+    handleMongoApiError(res, err, '/messages/:id', 'Failed to delete message.');
   }
 });
 
@@ -697,8 +715,7 @@ router.get(['/user-settings', '/user-settings/me', '/user-settings/:userId'], as
     const settings = await getUserSettings(authUid);
     res.json({ settings: settings || getDefaultUserSettings(authUid) });
   } catch (err: any) {
-    console.error('[API /user-settings] Error fetching settings:', err?.message || err);
-    res.status(500).json({ error: 'Failed to retrieve user settings.', code: 'INTERNAL_ERROR' });
+    handleMongoApiError(res, err, '/user-settings', 'Failed to retrieve user settings.');
   }
 });
 
@@ -731,8 +748,7 @@ router.all(['/user-settings', '/user-settings/me', '/user-settings/:userId'], as
     const updated = await upsertUserSettings(authUid, cleanSettings);
     res.json({ settings: updated });
   } catch (err: any) {
-    console.error('[API /user-settings] Error saving settings:', err?.message || err);
-    res.status(500).json({ error: 'Failed to save user settings.', code: 'INTERNAL_ERROR' });
+    handleMongoApiError(res, err, '/user-settings', 'Failed to save user settings.');
   }
 });
 

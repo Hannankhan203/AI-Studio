@@ -140,51 +140,18 @@ export function resolveEffectiveTheme(theme) {
   return 'dark';
 }
 
-/**
- * Helper to resolve the API endpoint URL in both browser and test/server environments.
- * @param {string} endpointPath
- * @returns {string}
- */
-function getApiEndpoint(endpointPath) {
-  if (typeof window !== 'undefined' && typeof window.document !== 'undefined') {
-    return endpointPath;
-  }
-  const base = (typeof process !== 'undefined' && process.env?.TEST_API_BASE) || 'http://localhost:3000';
-  return `${base}${endpointPath}`;
-}
-
-let customTokenProvider = null;
-
-/**
- * Testing hook allowing unit and integration tests to supply mocked Firebase ID tokens.
- * @param {(() => Promise<string|null>)|null} provider
- */
-export function setAuthTokenProviderForTesting(provider) {
-  customTokenProvider = provider;
-}
-
-/**
- * Helper to securely obtain current user's Firebase ID token.
- * @param {boolean} [forceRefresh=false]
- * @returns {Promise<string|null>}
- */
-async function resolveAuthToken(forceRefresh = false) {
-  if (customTokenProvider) {
-    return customTokenProvider();
-  }
-  try {
-    if (typeof getIdToken === 'function') {
-      const token = await getIdToken(forceRefresh);
-      if (token) return token;
-    }
-    if (auth?.currentUser?.getIdToken) {
-      return await auth.currentUser.getIdToken(forceRefresh);
-    }
-  } catch (err) {
-    console.warn('Could not resolve Firebase ID token:', err?.message || err);
-  }
-  return null;
-}
+export {
+  setAuthTokenProviderForTesting,
+  resolveAuthToken,
+  getApiEndpoint,
+  authorizedApiFetch
+} from './mongoApiClient.js';
+import {
+  setAuthTokenProviderForTesting,
+  resolveAuthToken,
+  getApiEndpoint,
+  authorizedApiFetch
+} from './mongoApiClient.js';
 
 /**
  * Loads preferences for the given user ID (or guest).
@@ -212,27 +179,24 @@ export async function loadSettings(userId = null) {
 
   // 2. For registered users who are online, fetch from authenticated MongoDB API (/api/user-settings/me)
   if (isRegisteredUser && isBrowserOnline()) {
-    const token = await resolveAuthToken();
-    if (token) {
-      try {
-        const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-        let timer = null;
-        if (controller) {
-          timer = setTimeout(() => controller.abort(), 4000);
-        }
+    try {
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      let timer = null;
+      if (controller) {
+        timer = setTimeout(() => controller.abort(), 4000);
+      }
 
-        const endpoint = getApiEndpoint('/api/user-settings/me');
-        const response = await fetch(endpoint, {
+      const { res: response } = await authorizedApiFetch(
+        '/api/user-settings/me',
+        {
           method: 'GET',
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Accept': 'application/json'
-          },
           signal: controller ? controller.signal : undefined
-        }).finally(() => {
-          if (timer) clearTimeout(timer);
-        });
+        }
+      ).finally(() => {
+        if (timer) clearTimeout(timer);
+      });
 
+      if (response) {
         if (response.ok) {
           const data = await response.json();
           if (data?.settings) {
@@ -253,9 +217,9 @@ export async function loadSettings(userId = null) {
         } else {
           console.warn(`[UserSettingsService] Settings fetch returned HTTP ${response.status}`);
         }
-      } catch (err) {
-        console.warn('Could not fetch settings from MongoDB API, using local cache:', err?.message || err);
       }
+    } catch (err) {
+      console.warn('Could not fetch settings from MongoDB API, using local cache:', err?.message || err);
     }
   }
 
@@ -315,26 +279,24 @@ export async function saveSettings(userId = null, partialSettings = {}, currentS
     return sanitized;
   }
 
-  // 4. Retrieve verified Firebase ID token for authenticated API request
-  const token = await resolveAuthToken();
-  if (!token) {
-    // If not yet authenticated with token, settings remain safely stored locally
-    return sanitized;
-  }
-
   // 5. Persist to MongoDB via Express API (POST /api/user-settings/me)
   // Identity is derived exclusively from the verified token on the server
   try {
-    const endpoint = getApiEndpoint('/api/user-settings/me');
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`,
-        'Accept': 'application/json'
-      },
-      body: JSON.stringify(sanitized)
-    });
+    const { res: response, token } = await authorizedApiFetch(
+      '/api/user-settings/me',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(sanitized)
+      }
+    );
+
+    if (!token || !response) {
+      // If not yet authenticated with token, settings remain safely stored locally
+      return sanitized;
+    }
 
     if (response.ok) {
       const data = await response.json();

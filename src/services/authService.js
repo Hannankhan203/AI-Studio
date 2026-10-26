@@ -123,3 +123,11 @@ export async function getIdToken(forceRefresh = false) {
   }
 }
 
+export {
+  authorizedApiFetch,
+  resolveAuthToken,
+  getApiEndpoint,
+  setAuthTokenProviderForTesting
+} from './mongoApiClient.js';
+
+
