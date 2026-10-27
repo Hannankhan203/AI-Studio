@@ -48,8 +48,25 @@ import {
 // @ts-ignore - Shared provider configuration and model identifier validator
 import {
   validateServerModelForProvider,
+  validateGroqTranscriptionModel,
+  GROQ_FALLBACK_CHAT_MODELS,
   getProviderDisplayName
 } from './src/services/providerModelSanitizer.js';
+
+function getGroqApiBaseUrl(): string {
+  const customBase = (process.env.ORVIX_GROQ_BASE_URL || '').trim().replace(/\/+$/, '');
+  return customBase || 'https://api.groq.com/openai/v1';
+}
+
+function getOpenRouterApiBaseUrl(): string {
+  const customBase = (process.env.ORVIX_OPENROUTER_BASE_URL || '').trim().replace(/\/+$/, '');
+  return customBase || 'https://openrouter.ai/api/v1';
+}
+
+function getCloudflareApiBaseUrl(): string {
+  const customBase = (process.env.ORVIX_CLOUDFLARE_BASE_URL || '').trim().replace(/\/+$/, '');
+  return customBase || 'https://api.cloudflare.com/client/v4';
+}
 
 export interface DocumentData {
   fileId?: string;
@@ -2454,21 +2471,25 @@ app.post(['/api/transcribe', '/transcribe'], (req, res) => {
     }
 
     // Transcription model validation (separate audio transcription models from chat-completion models)
-    const VALID_GROQ_TRANSCRIPTION_MODELS = ['whisper-large-v3-turbo', 'whisper-large-v3'];
-    const requestedTranscriptionModel = req.body?.model ? String(req.body.model).trim() : '';
-    const selectedTranscriptionModel = requestedTranscriptionModel || 'whisper-large-v3-turbo';
-
-    if (requestedTranscriptionModel && !VALID_GROQ_TRANSCRIPTION_MODELS.includes(requestedTranscriptionModel)) {
+    const modelValidation = validateGroqTranscriptionModel(req.body?.model);
+    if (!modelValidation.valid) {
       return res.status(400).json({
         success: false,
-        error: `Model '${requestedTranscriptionModel}' is not a valid audio transcription model. Valid models are: ${VALID_GROQ_TRANSCRIPTION_MODELS.join(', ')}.`,
-        code: 'INVALID_TRANSCRIPTION_MODEL',
+        error: modelValidation.error,
+        code: modelValidation.code || 'INVALID_TRANSCRIPTION_MODEL',
+        status: 'INVALID_ARGUMENT',
+        provider: 'groq',
+        retryable: false,
         fallbackAvailable: false
       });
     }
+    const selectedTranscriptionModel = modelValidation.model;
 
     // Minimum audio payload size check if no transcript is provided
-    const hasAudioPayload = Boolean(audioFile && audioFile.buffer && audioFile.buffer.length >= 100);
+    const isTranscriptOnlyRequest = String(req.body?.transcriptOnly || '').toLowerCase() === 'true';
+    const hasAudioPayload = Boolean(
+      !isTranscriptOnlyRequest && audioFile && audioFile.buffer && audioFile.buffer.length >= 100
+    );
     if (!incomingTranscript && !hasAudioPayload) {
       return res.status(400).json({
         success: false,
@@ -2499,6 +2520,8 @@ app.post(['/api/transcribe', '/transcribe'], (req, res) => {
         else if (mime.includes('ogg')) fileExt = '.ogg';
         else if (mime.includes('wav')) fileExt = '.wav';
         else if (mime.includes('mpeg') || mime.includes('mp3')) fileExt = '.mp3';
+        else if (mime.includes('aac')) fileExt = '.aac';
+        else if (mime.includes('flac')) fileExt = '.flac';
 
         const safeFilename = audioFile.originalname && audioFile.originalname.includes('.')
           ? audioFile.originalname
@@ -2518,7 +2541,7 @@ app.post(['/api/transcribe', '/transcribe'], (req, res) => {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 35000); // 35s max timeout
 
-        const groqRes = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+        const groqRes = await fetch(`${getGroqApiBaseUrl()}/audio/transcriptions`, {
           method: 'POST',
           headers: {
             Authorization: `Bearer ${groqKey}`
@@ -2544,25 +2567,79 @@ app.post(['/api/transcribe', '/transcribe'], (req, res) => {
 
         const errStatus = groqRes.status;
         const errText = await groqRes.text().catch(() => '');
+        let upstreamErrMsg = '';
+        try {
+          const parsedErr = JSON.parse(errText);
+          if (typeof parsedErr?.error === 'string') {
+            upstreamErrMsg = parsedErr.error;
+          } else if (typeof parsedErr?.error?.message === 'string') {
+            upstreamErrMsg = parsedErr.error.message;
+          }
+        } catch (_) {
+          upstreamErrMsg = errText.slice(0, 200).trim();
+        }
+
         logAIDiagnostic({
           category: 'provider API error',
           provider: 'groq',
           model: selectedTranscriptionModel,
           phase: 'dispatch',
           upstreamStatus: errStatus,
-          sanitizedMessage: `Groq Whisper failed: ${errText.slice(0, 200)}`
+          sanitizedMessage: `Groq Whisper failed: ${(upstreamErrMsg || errText).slice(0, 200)}`
         });
 
-        // If Groq rate-limited (429) or unavailable (503), attempt Gemini audio fallback if available
+        // Non-retryable authentication / permission / invalid-request / invalid-model failures
+        if (errStatus === 401 || errStatus === 403) {
+          return res.status(errStatus).json({
+            success: false,
+            error:
+              upstreamErrMsg ||
+              (errStatus === 401
+                ? 'Groq API key is invalid or unauthorized for audio transcription.'
+                : 'Groq API key does not have permission for audio transcription.'),
+            code: errStatus === 401 ? 'UNAUTHENTICATED' : 'PERMISSION_DENIED',
+            status: errStatus === 401 ? 'UNAUTHENTICATED' : 'PERMISSION_DENIED',
+            provider: 'groq',
+            model: selectedTranscriptionModel,
+            statusCode: errStatus,
+            retryable: false,
+            fallbackAvailable: false
+          });
+        }
+
+        if (errStatus === 400 || errStatus === 404 || errStatus === 413 || errStatus === 415 || errStatus === 422) {
+          const isModelErr = errStatus === 404 || /model/i.test(upstreamErrMsg);
+          return res.status(errStatus === 404 ? 404 : 400).json({
+            success: false,
+            error:
+              upstreamErrMsg ||
+              (isModelErr
+                ? `Groq transcription model '${selectedTranscriptionModel}' was not found or is unsupported.`
+                : 'Groq Whisper rejected the audio transcription request.'),
+            code: isModelErr ? 'INVALID_TRANSCRIPTION_MODEL' : 'INVALID_AUDIO_REQUEST',
+            status: errStatus === 404 ? 'NOT_FOUND' : 'INVALID_ARGUMENT',
+            provider: 'groq',
+            model: selectedTranscriptionModel,
+            statusCode: errStatus,
+            retryable: false,
+            fallbackAvailable: false
+          });
+        }
+
+        // If Groq rate-limited (429) or unavailable (5xx), attempt Gemini audio fallback only if available
         if (!hasGemini) {
           const isRateLimit = errStatus === 429;
-          return res.status(errStatus >= 500 || errStatus === 429 ? 503 : 400).json({
+          return res.status(isRateLimit ? 429 : 503).json({
             success: false,
             error: isRateLimit
               ? 'Groq Whisper rate limit exceeded. Native speech transcript retained.'
-              : 'Groq Whisper service encountered an error. Native speech transcript retained.',
+              : upstreamErrMsg || 'Groq Whisper service encountered an error. Native speech transcript retained.',
             code: isRateLimit ? 'RATE_LIMIT_EXCEEDED' : 'PROVIDER_ERROR',
+            status: isRateLimit ? 'RESOURCE_EXHAUSTED' : 'UNAVAILABLE',
+            provider: 'groq',
+            model: selectedTranscriptionModel,
             statusCode: errStatus,
+            retryable: true,
             fallbackAvailable: true
           });
         }
@@ -2582,7 +2659,11 @@ app.post(['/api/transcribe', '/transcribe'], (req, res) => {
               ? 'Whisper transcription timed out. Native speech transcript retained.'
               : 'Network error connecting to Whisper service. Native speech transcript retained.',
             code: groqErr?.name === 'AbortError' ? 'TRANSCRIPTION_TIMEOUT' : 'NETWORK_ERROR',
+            status: groqErr?.name === 'AbortError' ? 'DEADLINE_EXCEEDED' : 'UNAVAILABLE',
+            provider: 'groq',
+            model: selectedTranscriptionModel,
             statusCode: 504,
+            retryable: true,
             fallbackAvailable: true
           });
         }
@@ -2659,100 +2740,9 @@ Output ONLY the transcription text. Do not summarize, do not translate, do not a
       }
     }
 
-    // High-accuracy transcript refinement path for mobile native-live dictation:
-    // When no audio payload is provided, but incomingTranscript is provided
+    // Deterministic local transcript polisher when only a live browser speech transcript was supplied.
+    // Never substitute a Groq chat-completion call for an audio transcription result.
     if (incomingTranscript) {
-      if (hasGemini || hasGroq) {
-        try {
-          const refinePrompt = `You are a high-accuracy speech-to-text transcript polisher for AI conversation and programming.
-TASK:
-Refine the provided spoken transcript verbatim.
-Preserve exact words, speaker intent, and technical vocabulary (e.g. Orvix, JavaScript, TypeScript, React, Node.js, Python, palindrome, algorithms, async/await, promises, functions, arrow functions, var, const, let, objects, arrays, callbacks, ECMAScript, code).
-Fix verbal punctuation ("period" -> ".", "comma" -> ",", "question mark" -> "?"), sentence capitalization, and obvious phonetic slips.
-${isoLang ? `Spoken language: ${isoLang}.` : ''}
-Output ONLY the refined transcript. No quotes, no markdown fences, no explanatory commentary.
-
-Spoken transcript:
-"${incomingTranscript}"`;
-
-          let refinedText = '';
-          let polisherModelUsed = 'local-polisher';
-          let polisherProviderUsed = 'local';
-
-          if (hasGemini) {
-            try {
-              const ai = new GoogleGenAI({
-                apiKey: geminiKey,
-                httpOptions: {
-                  headers: {
-                    'User-Agent': 'aistudio-build'
-                  }
-                }
-              });
-              const timeoutPromise = new Promise<never>((_, reject) =>
-                setTimeout(() => reject(new Error('Refine timeout')), 6000)
-              );
-              const genPromise = ai.models.generateContent({
-                model: 'gemini-2.5-flash',
-                contents: [{ role: 'user', parts: [{ text: refinePrompt }] }]
-              });
-              const geminiRes = await Promise.race([genPromise, timeoutPromise]);
-              refinedText = (geminiRes?.text || '').trim();
-              polisherModelUsed = 'gemini-2.5-flash';
-              polisherProviderUsed = 'gemini';
-            } catch (gErr) {
-              console.warn('[Transcribe] Gemini refine error, falling back to Groq or local polisher:', gErr);
-            }
-          }
-
-          if (!refinedText && hasGroq) {
-            try {
-              const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-                method: 'POST',
-                headers: {
-                  Authorization: `Bearer ${groqKey}`,
-                  'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                  model: 'openai/gpt-oss-120b',
-                  messages: [{ role: 'user', content: refinePrompt }],
-                  temperature: 0.1,
-                  max_tokens: 1024
-                })
-              });
-              if (groqRes.ok) {
-                const data: any = await groqRes.json();
-                refinedText = (data?.choices?.[0]?.message?.content || '').trim();
-                polisherModelUsed = data?.model || 'openai/gpt-oss-120b';
-                polisherProviderUsed = 'groq';
-              }
-            } catch (grErr) {
-              console.warn('[Transcribe] Groq refine error:', grErr);
-            }
-          }
-
-          if (refinedText) {
-            if (refinedText.startsWith('```')) {
-              refinedText = refinedText.replace(/^```[a-zA-Z0-9_-]*\n?/i, '').replace(/\n?```$/i, '').trim();
-            }
-            refinedText = refinedText.replace(/^["'«»“](.*)["'«»”]$/s, '$1').trim();
-
-            return res.status(200).json({
-              success: true,
-              text: refinedText,
-              language: isoLang || 'en',
-              duration: 0,
-              model: polisherModelUsed,
-              provider: polisherProviderUsed,
-              highAccuracy: true
-            });
-          }
-        } catch (refineErr) {
-          console.warn('[Transcribe] AI transcript refinement failed, using local polisher:', refineErr);
-        }
-      }
-
-      // Fast, deterministic local speech polisher fallback
       const cleanRefined = polishSpokenTranscript(incomingTranscript);
       return res.status(200).json({
         success: true,
@@ -2761,7 +2751,7 @@ Spoken transcript:
         duration: 0,
         model: 'local-polisher',
         provider: 'local',
-        highAccuracy: true
+        highAccuracy: false
       });
     }
 
@@ -3767,7 +3757,9 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
       const GROQ_ACTIVE_MODEL = 'openai/gpt-oss-120b';
       const requestedGroqModel = validatedClientModel || GROQ_ACTIVE_MODEL;
-      const groqFallbackCandidates = ['openai/gpt-oss-120b', 'llama-3.1-8b-instant'];
+      const groqFallbackCandidates: string[] = Array.isArray(GROQ_FALLBACK_CHAT_MODELS)
+        ? [...GROQ_FALLBACK_CHAT_MODELS]
+        : ['openai/gpt-oss-120b', 'llama-3.1-8b-instant'];
       const uniqueGroqPlanModels = [requestedGroqModel];
       for (const cand of groqFallbackCandidates) {
         if (!uniqueGroqPlanModels.includes(cand)) {
@@ -3778,6 +3770,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         model: m,
         attemptNum: idx + 1
       }));
+      const groqChatEndpoint = `${getGroqApiBaseUrl()}/chat/completions`;
 
       let groqMaxTokens = 2560;
       if (preferences?.responseLength === 'detailed' || isLikelyLarge || isContinuation) {
@@ -3797,7 +3790,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
           try {
             const groqRes = await upstreamGuard.fetchUpstream(
-              'https://api.groq.com/openai/v1/chat/completions',
+              groqChatEndpoint,
               {
                 method: 'POST',
                 headers: {
@@ -3868,7 +3861,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
                   { role: 'user', content: 'Please continue directly from where you stopped. Complete any unfinished sentences, items, or sections without repeating previous text.' }
                 ];
                 const contRes = await upstreamGuard.fetchUpstream(
-                  'https://api.groq.com/openai/v1/chat/completions',
+                  groqChatEndpoint,
                   {
                     method: 'POST',
                     headers: {
@@ -3973,7 +3966,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
           try {
             const attemptRes = await upstreamGuard.fetchUpstream(
-              'https://api.groq.com/openai/v1/chat/completions',
+              groqChatEndpoint,
               {
                 method: 'POST',
                 headers: {
@@ -4107,6 +4100,150 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
           let currentEventType: string | null = null;
           let streamFailed = false;
 
+          const emitGroqStreamError = async (rawDataStr: string, explicitErrObj?: any) => {
+            if (streamFailed) return;
+            streamFailed = true;
+
+            let parsedErrMessage = 'Groq streaming connection encountered an upstream error.';
+            let rawErrCode = 0;
+            let rawErrType = '';
+
+            const extractFromErrorField = (errVal: any) => {
+              if (typeof errVal === 'string' && errVal.trim()) {
+                parsedErrMessage = errVal.trim();
+              } else if (errVal && typeof errVal === 'object') {
+                if (typeof errVal.message === 'string' && errVal.message.trim()) {
+                  parsedErrMessage = errVal.message.trim();
+                } else if (typeof errVal.error === 'string' && errVal.error.trim()) {
+                  parsedErrMessage = errVal.error.trim();
+                }
+                const numCode = Number(errVal.code ?? errVal.status ?? errVal.statusCode);
+                if (Number.isFinite(numCode) && numCode >= 400 && numCode < 600) {
+                  rawErrCode = numCode;
+                }
+                if (typeof errVal.type === 'string' && errVal.type.trim()) {
+                  rawErrType = errVal.type.trim();
+                } else if (typeof errVal.status === 'string' && errVal.status.trim()) {
+                  rawErrType = errVal.status.trim();
+                } else if (typeof errVal.code === 'string' && errVal.code.trim()) {
+                  rawErrType = errVal.code.trim();
+                }
+              }
+            };
+
+            if (explicitErrObj !== undefined) {
+              extractFromErrorField(explicitErrObj);
+            } else if (rawDataStr) {
+              try {
+                const errJson = JSON.parse(rawDataStr);
+                extractFromErrorField(errJson?.error ?? errJson);
+              } catch (_) {
+                const cleaned = rawDataStr
+                  .replace(/<[^>]*>/g, ' ')
+                  .replace(/\s+/g, ' ')
+                  .trim()
+                  .slice(0, 280);
+                if (cleaned) {
+                  parsedErrMessage = cleaned;
+                }
+              }
+            }
+
+            if (!rawErrCode) {
+              if (/rate_limit|429|quota|too many requests/i.test(`${rawErrType} ${parsedErrMessage}`)) {
+                rawErrCode = 429;
+              } else if (/auth|401|invalid_api_key/i.test(`${rawErrType} ${parsedErrMessage}`)) {
+                rawErrCode = 401;
+              } else if (/permission|403/i.test(`${rawErrType} ${parsedErrMessage}`)) {
+                rawErrCode = 403;
+              } else if (/not_found|404|model_not_found/i.test(`${rawErrType} ${parsedErrMessage}`)) {
+                rawErrCode = 404;
+              } else {
+                rawErrCode = 500;
+              }
+            }
+
+            const effectiveStatus = rawErrType || (rawErrCode === 429 ? 'RESOURCE_EXHAUSTED' : 'STREAM_ERROR');
+
+            stopHeartbeat();
+            try { await reader.cancel(); } catch (_) {}
+            logAIDiagnostic({
+              category: 'streaming failure',
+              provider: 'groq',
+              model: modelUsed || selectedModel,
+              phase: 'mid-stream',
+              upstreamStatus: rawErrCode,
+              sanitizedMessage: parsedErrMessage
+            });
+
+            if (!upstreamGuard.isClientClosed() && !res.writableEnded) {
+              sendSSE(res, {
+                type: 'error',
+                error: parsedErrMessage,
+                code: rawErrCode,
+                status: effectiveStatus,
+                provider: 'groq',
+                model: modelUsed || selectedModel,
+                retryable: false,
+                canFallback: true,
+                suggestedProviders: getConfiguredFallbackProviders('groq', isServerless),
+                partial: fullText.length > 0,
+                partialText: fullText.length > 0 ? fullText : undefined
+              });
+              res.end();
+            }
+          };
+
+          const processGroqSSELine = async (line: string): Promise<boolean> => {
+            const trimmed = line.trim();
+            if (!trimmed) {
+              currentEventType = null;
+              return false;
+            }
+            if (trimmed.startsWith(':')) return false;
+
+            if (trimmed.startsWith('event:')) {
+              currentEventType = trimmed.slice(6).trim().toLowerCase();
+              return false;
+            }
+
+            if (!trimmed.startsWith('data:')) return false;
+            const eventTypeForLine = currentEventType;
+            currentEventType = null;
+
+            const dataStr = trimmed.slice(5).trim();
+            if (dataStr === '[DONE]') return false;
+
+            if (eventTypeForLine === 'error') {
+              await emitGroqStreamError(dataStr);
+              return true;
+            }
+
+            try {
+              const parsed = JSON.parse(dataStr);
+              if (parsed && typeof parsed === 'object' && parsed.error) {
+                await emitGroqStreamError(dataStr, parsed.error);
+                return true;
+              }
+
+              if (parsed.model) modelUsed = parsed.model;
+              const finishReason = parsed?.choices?.[0]?.finish_reason;
+              if (finishReason) lastFinishReason = finishReason;
+              const delta = parsed?.choices?.[0]?.delta?.content;
+              if (delta) {
+                fullText += delta;
+                sendSSE(res, { type: 'chunk', text: delta });
+              }
+            } catch (_) {
+              // Detect malformed or truncated error JSON frames (e.g., data: {"error": ...)
+              if (/"error"\s*:/.test(dataStr)) {
+                await emitGroqStreamError(dataStr);
+                return true;
+              }
+            }
+            return false;
+          };
+
           while (true) {
             if (upstreamGuard.isClientClosed() || res.writableEnded) {
               try { await reader.cancel(); } catch (_) {}
@@ -4123,154 +4260,23 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
             buffer = lines.pop() || '';
 
             for (const line of lines) {
-              const trimmed = line.trim();
-              if (!trimmed || trimmed.startsWith(':')) continue;
-
-              if (trimmed.startsWith('event:')) {
-                currentEventType = trimmed.slice(6).trim();
-                continue;
-              }
-
-              if (!trimmed.startsWith('data:')) continue;
-              const dataStr = trimmed.slice(5).trim();
-              if (dataStr === '[DONE]') continue;
-
-              // Upstream SSE error frame detection (e.g. event: error or data: {"error": ...})
-              if (currentEventType === 'error') {
-                streamFailed = true;
-                let parsedErrMessage = 'Groq streaming connection encountered an upstream error.';
-                let parsedErrCode = 500;
-                let parsedErrStatus = 'STREAM_ERROR';
-                try {
-                  const errJson = JSON.parse(dataStr);
-                  if (errJson?.error) {
-                    parsedErrMessage = typeof errJson.error === 'string' ? errJson.error : errJson.error.message || parsedErrMessage;
-                    parsedErrCode = Number(errJson.error.code) || Number(errJson.error.status) || 500;
-                    parsedErrStatus = String(errJson.error.type || errJson.error.status || 'STREAM_ERROR');
-                  }
-                } catch (_) {
-                  if (dataStr) parsedErrMessage = dataStr;
-                }
-
-                stopHeartbeat();
-                try { await reader.cancel(); } catch (_) {}
-                logAIDiagnostic({
-                  category: 'streaming failure',
-                  provider: 'groq',
-                  model: selectedModel,
-                  phase: 'mid-stream',
-                  upstreamStatus: parsedErrCode,
-                  sanitizedMessage: parsedErrMessage
-                });
-
-                if (!res.writableEnded) {
-                  sendSSE(res, {
-                    type: 'error',
-                    error: parsedErrMessage,
-                    code: parsedErrCode,
-                    status: parsedErrStatus,
-                    provider: 'groq',
-                    model: selectedModel,
-                    retryable: false,
-                    canFallback: true,
-                    partial: fullText.length > 0,
-                    partialText: fullText.length > 0 ? fullText : undefined
-                  });
-                  res.end();
-                }
-                return;
-              }
-
-              try {
-                const parsed = JSON.parse(dataStr);
-                if (parsed.error) {
-                  streamFailed = true;
-                  const errMsg = typeof parsed.error === 'string' ? parsed.error : parsed.error.message || 'Groq stream encountered an error.';
-                  const errCode = Number(parsed.error.code) || 500;
-                  const errStatus = String(parsed.error.type || parsed.error.status || 'STREAM_ERROR');
-
-                  stopHeartbeat();
-                  try { await reader.cancel(); } catch (_) {}
-                  logAIDiagnostic({
-                    category: 'streaming failure',
-                    provider: 'groq',
-                    model: selectedModel,
-                    phase: 'mid-stream',
-                    upstreamStatus: errCode,
-                    sanitizedMessage: errMsg
-                  });
-
-                  if (!res.writableEnded) {
-                    sendSSE(res, {
-                      type: 'error',
-                      error: errMsg,
-                      code: errCode,
-                      status: errStatus,
-                      provider: 'groq',
-                      model: selectedModel,
-                      retryable: false,
-                      canFallback: true,
-                      partial: fullText.length > 0,
-                      partialText: fullText.length > 0 ? fullText : undefined
-                    });
-                    res.end();
-                  }
-                  return;
-                }
-
-                if (parsed.model) modelUsed = parsed.model;
-                const finishReason = parsed?.choices?.[0]?.finish_reason;
-                if (finishReason) lastFinishReason = finishReason;
-                const delta = parsed.choices?.[0]?.delta?.content;
-                if (delta) {
-                  fullText += delta;
-                  sendSSE(res, { type: 'chunk', text: delta });
-                }
-              } catch (_) {}
+              const haltedOnError = await processGroqSSELine(line);
+              if (haltedOnError) return;
             }
           }
 
           // Process trailing bytes and buffer
           const finalBytes = decoder.decode();
           if (finalBytes) buffer += finalBytes;
-          if (!upstreamGuard.isClientClosed() && buffer && buffer.trim()) {
-            const trimmedBuf = buffer.trim();
-            if (trimmedBuf.startsWith('data:')) {
-              const dataStr = trimmedBuf.slice(5).trim();
-              if (dataStr !== '[DONE]') {
-                try {
-                  const parsed = JSON.parse(dataStr);
-                  if (parsed.error) {
-                    streamFailed = true;
-                    const errMsg = typeof parsed.error === 'string' ? parsed.error : parsed.error.message || 'Groq stream encountered an error.';
-                    stopHeartbeat();
-                    if (!res.writableEnded) {
-                      sendSSE(res, {
-                        type: 'error',
-                        error: errMsg,
-                        code: Number(parsed.error.code) || 500,
-                        status: String(parsed.error.type || parsed.error.status || 'STREAM_ERROR'),
-                        provider: 'groq',
-                        model: selectedModel,
-                        retryable: false,
-                        canFallback: true,
-                        partial: fullText.length > 0,
-                        partialText: fullText.length > 0 ? fullText : undefined
-                      });
-                      res.end();
-                    }
-                    return;
-                  }
-                  if (parsed.model) modelUsed = parsed.model;
-                  const finishReason = parsed?.choices?.[0]?.finish_reason;
-                  if (finishReason) lastFinishReason = finishReason;
-                  const delta = parsed?.choices?.[0]?.delta?.content;
-                  if (delta) {
-                    fullText += delta;
-                    sendSSE(res, { type: 'chunk', text: delta });
-                  }
-                } catch (_) {}
-              }
+          if (!streamFailed && !upstreamGuard.isClientClosed() && buffer && buffer.trim()) {
+            const remainingLines = buffer.split('\n');
+            for (const line of remainingLines) {
+              const haltedOnError = await processGroqSSELine(line);
+              if (haltedOnError) return;
+            }
+            if (!streamFailed && currentEventType === 'error') {
+              await emitGroqStreamError(buffer.trim());
+              return;
             }
           }
 
@@ -4283,7 +4289,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
                 { role: 'user', content: 'Please continue directly from where you stopped. Complete any unfinished sentences, items, or sections without repeating previous text.' }
               ];
               const contRes = await upstreamGuard.fetchUpstream(
-                'https://api.groq.com/openai/v1/chat/completions',
+                groqChatEndpoint,
                 {
                   method: 'POST',
                   headers: {
@@ -4317,16 +4323,22 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
                   contBuffer = cLines.pop() || '';
                   for (const cLine of cLines) {
                     const cTrimmed = cLine.trim();
-                    if (!cTrimmed || cTrimmed.startsWith(':')) continue;
+                    if (!cTrimmed) {
+                      contEventType = null;
+                      continue;
+                    }
+                    if (cTrimmed.startsWith(':')) continue;
                     if (cTrimmed.startsWith('event:')) {
-                      contEventType = cTrimmed.slice(6).trim();
+                      contEventType = cTrimmed.slice(6).trim().toLowerCase();
                       continue;
                     }
                     if (!cTrimmed.startsWith('data:')) continue;
+                    const lineEvt = contEventType;
+                    contEventType = null;
                     const cData = cTrimmed.slice(5).trim();
                     if (cData === '[DONE]') continue;
 
-                    if (contEventType === 'error') {
+                    if (lineEvt === 'error') {
                       try { await contReader.cancel(); } catch (_) {}
                       break;
                     }
@@ -4378,7 +4390,10 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
               code: 503,
               status: 'STREAM_FAILED',
               provider: 'groq',
+              model: selectedModel,
               retryable: false,
+              canFallback: true,
+              suggestedProviders: getConfiguredFallbackProviders('groq', isServerless),
               partial: fullText.length > 0,
               partialText: fullText.length > 0 ? fullText : undefined
             });
@@ -4461,6 +4476,55 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
       });
 
       const selectedModel = validatedClientModel || 'openrouter/free';
+      const openRouterChatEndpoint = `${getOpenRouterApiBaseUrl()}/chat/completions`;
+      const openRouterHeaders = {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://orvix.ai',
+        'X-Title': 'Orvix'
+      };
+
+      const normalizeOpenRouterHttpError = (statusCode: number, errText: string) => {
+        const parsed = parseGeminiError({ status: statusCode, message: errText }, 'openrouter');
+        let friendlyError = parsed.message;
+        let status = parsed.status;
+        let isRetryable = parsed.isRetryable;
+        let category = parsed.category;
+
+        if (statusCode === 502) {
+          status = 'BAD_GATEWAY';
+          isRetryable = true;
+          category = 'provider API error';
+        } else if (statusCode === 500) {
+          status = 'INTERNAL';
+          isRetryable = true;
+          category = 'provider API error';
+        } else if (statusCode === 402) {
+          status = 'PAYMENT_REQUIRED';
+          isRetryable = false;
+          category = 'provider configuration error';
+        }
+
+        const lowerErr = String(errText || '').toLowerCase();
+        if (
+          lowerErr.includes('context_length_exceeded') ||
+          lowerErr.includes('maximum context length') ||
+          (statusCode === 400 && (lowerErr.includes('too large') || lowerErr.includes('context length')))
+        ) {
+          friendlyError =
+            "The attached document exceeds OpenRouter's context limit. Please switch to Google Gemini (which supports 1M tokens) or ask about specific pages or slides.";
+          isRetryable = false;
+        }
+
+        return {
+          statusCode,
+          status,
+          errorCode: status,
+          category,
+          isRetryable,
+          message: friendlyError
+        };
+      };
 
       let openRouterMaxTokens = 2560;
       if (preferences?.responseLength === 'detailed' || isLikelyLarge || isContinuation) {
@@ -4472,19 +4536,16 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
       if (!shouldStream) {
         try {
           const orRes = await upstreamGuard.fetchUpstream(
-            'https://openrouter.ai/api/v1/chat/completions',
+            openRouterChatEndpoint,
             {
               method: 'POST',
-              headers: {
-                Authorization: `Bearer ${apiKey}`,
-                'Content-Type': 'application/json',
-                'X-Title': 'Orvix'
-              },
+              headers: openRouterHeaders,
               body: JSON.stringify({
                 model: selectedModel,
                 messages,
                 max_tokens: openRouterMaxTokens,
-                temperature: 0.7
+                temperature: 0.7,
+                stream: false
               })
             },
             { provider: 'openrouter' }
@@ -4492,27 +4553,25 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
           if (!orRes.ok) {
             const errText = await orRes.text();
-            const parsed = parseGeminiError({ status: orRes.status, message: errText }, 'openrouter');
-            let friendlyError = parsed.message;
-            if (errText.includes('context_length_exceeded') || errText.includes('maximum context length') || errText.includes('too large') || errText.includes('tokens')) {
-              friendlyError = 'The attached document exceeds OpenRouter\'s context limit. Please switch to Google Gemini (which supports 1M tokens) or ask about specific pages or slides.';
-            }
+            const normErr = normalizeOpenRouterHttpError(orRes.status, errText);
             logAIDiagnostic({
-              category: parsed.category,
+              category: normErr.category,
               provider: 'openrouter',
               model: selectedModel,
               phase: 'non-streaming',
               upstreamStatus: orRes.status,
-              sanitizedMessage: friendlyError
+              upstreamErrorCode: normErr.errorCode,
+              sanitizedMessage: normErr.message
             });
             return res.status(orRes.status).json({
-              error: friendlyError,
+              error: normErr.message,
               code: orRes.status,
-              status: parsed.status,
-              category: parsed.category,
+              status: normErr.status,
+              errorCode: normErr.errorCode,
+              category: normErr.category,
               provider: 'openrouter',
               model: selectedModel,
-              retryable: parsed.isRetryable,
+              retryable: normErr.isRetryable,
               canFallback: true,
               suggestedProviders: getConfiguredFallbackProviders('openrouter', isServerless)
             });
@@ -4520,6 +4579,25 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
           const data = await orRes.json();
           if (upstreamGuard.isClientClosed()) return;
+          if (data?.error) {
+            const embeddedCode = Number(data.error.code) || 502;
+            const normErr = normalizeOpenRouterHttpError(
+              embeddedCode >= 400 && embeddedCode < 600 ? embeddedCode : 502,
+              JSON.stringify(data)
+            );
+            return res.status(normErr.statusCode).json({
+              error: normErr.message,
+              code: normErr.statusCode,
+              status: normErr.status,
+              errorCode: normErr.errorCode,
+              category: normErr.category,
+              provider: 'openrouter',
+              model: selectedModel,
+              retryable: normErr.isRetryable,
+              canFallback: true,
+              suggestedProviders: getConfiguredFallbackProviders('openrouter', isServerless)
+            });
+          }
           let finalText = data?.choices?.[0]?.message?.content || '';
           const finishReason = data?.choices?.[0]?.finish_reason;
 
@@ -4532,14 +4610,10 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
                 { role: 'user', content: 'Please continue directly from where you stopped. Complete any unfinished sentences, items, or sections without repeating previous text.' }
               ];
               const contRes = await upstreamGuard.fetchUpstream(
-                'https://openrouter.ai/api/v1/chat/completions',
+                openRouterChatEndpoint,
                 {
                   method: 'POST',
-                  headers: {
-                    Authorization: `Bearer ${apiKey}`,
-                    'Content-Type': 'application/json',
-                    'X-Title': 'Orvix'
-                  },
+                  headers: openRouterHeaders,
                   body: JSON.stringify({
                     model: selectedModel,
                     messages: contMessages,
@@ -4579,12 +4653,14 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
             model: selectedModel,
             phase: 'non-streaming',
             upstreamStatus: parsed.statusCode,
+            upstreamErrorCode: parsed.status,
             sanitizedMessage: parsed.message
           });
           return res.status(parsed.statusCode).json({
             error: parsed.message,
             code: parsed.statusCode,
             status: parsed.status,
+            errorCode: parsed.status,
             category: parsed.category,
             provider: 'openrouter',
             model: selectedModel,
@@ -4598,14 +4674,10 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         let orRes: Response;
         try {
           orRes = await upstreamGuard.fetchUpstream(
-            'https://openrouter.ai/api/v1/chat/completions',
+            openRouterChatEndpoint,
             {
               method: 'POST',
-              headers: {
-                Authorization: `Bearer ${apiKey}`,
-                'Content-Type': 'application/json',
-                'X-Title': 'Orvix'
-              },
+              headers: openRouterHeaders,
               body: JSON.stringify({
                 model: selectedModel,
                 messages,
@@ -4627,12 +4699,14 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
             model: selectedModel,
             phase: 'pre-stream',
             upstreamStatus: parsed.statusCode,
+            upstreamErrorCode: parsed.status,
             sanitizedMessage: parsed.message
           });
           return res.status(parsed.statusCode).json({
             error: parsed.message,
             code: parsed.statusCode,
             status: parsed.status,
+            errorCode: parsed.status,
             category: parsed.category,
             provider: 'openrouter',
             model: selectedModel,
@@ -4644,27 +4718,25 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
         if (!orRes.ok) {
           const errText = await orRes.text();
-          const parsed = parseGeminiError({ status: orRes.status, message: errText }, 'openrouter');
-          let friendlyError = parsed.message;
-          if (errText.includes('context_length_exceeded') || errText.includes('maximum context length') || errText.includes('too large') || errText.includes('tokens')) {
-            friendlyError = 'The attached document exceeds OpenRouter\'s context limit. Please switch to Google Gemini (which supports 1M tokens) or ask about specific pages or slides.';
-          }
+          const normErr = normalizeOpenRouterHttpError(orRes.status, errText);
           logAIDiagnostic({
-            category: parsed.category,
+            category: normErr.category,
             provider: 'openrouter',
             model: selectedModel,
             phase: 'pre-stream',
             upstreamStatus: orRes.status,
-            sanitizedMessage: friendlyError
+            upstreamErrorCode: normErr.errorCode,
+            sanitizedMessage: normErr.message
           });
           return res.status(orRes.status).json({
-            error: friendlyError,
+            error: normErr.message,
             code: orRes.status,
-            status: parsed.status,
-            category: parsed.category,
+            status: normErr.status,
+            errorCode: normErr.errorCode,
+            category: normErr.category,
             provider: 'openrouter',
             model: selectedModel,
-            retryable: parsed.isRetryable,
+            retryable: normErr.isRetryable,
             canFallback: true,
             suggestedProviders: getConfiguredFallbackProviders('openrouter', isServerless)
           });
@@ -4675,22 +4747,238 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         const stopHeartbeat = startSSEHeartbeat(res);
         sendSSE(res, { type: 'start', modelUsed: selectedModel, provider: 'openrouter' });
 
+        let fullText = '';
+        let modelUsed = selectedModel;
+        let streamFailed = false;
+
         try {
           const reader = orRes.body!.getReader();
           const decoder = new TextDecoder();
           let buffer = '';
-          let fullText = '';
-          let modelUsed = selectedModel;
           let lastFinishReason: string | null = null;
+          let currentEventType: string | null = null;
+          let sawDoneMarker = false;
+
+          const emitOpenRouterStreamError = async (rawDataStr: string, explicitErrObj?: any) => {
+            if (streamFailed) return;
+            streamFailed = true;
+
+            let parsedErrMessage = 'OpenRouter streaming connection encountered an upstream error.';
+            let rawErrCode = 0;
+            let rawErrType = '';
+
+            const extractFromErrorField = (errVal: any) => {
+              if (typeof errVal === 'string' && errVal.trim()) {
+                parsedErrMessage = errVal.trim();
+              } else if (errVal && typeof errVal === 'object') {
+                if (typeof errVal.message === 'string' && errVal.message.trim()) {
+                  parsedErrMessage = errVal.message.trim();
+                } else if (typeof errVal.error === 'string' && errVal.error.trim()) {
+                  parsedErrMessage = errVal.error.trim();
+                }
+                if (
+                  typeof errVal.metadata?.raw === 'string' &&
+                  errVal.metadata.raw.trim() &&
+                  (!parsedErrMessage || parsedErrMessage.toLowerCase() === 'provider returned error')
+                ) {
+                  parsedErrMessage = `${parsedErrMessage}: ${errVal.metadata.raw.trim().slice(0, 200)}`;
+                }
+                const numCode = Number(errVal.code ?? errVal.status ?? errVal.statusCode);
+                if (Number.isFinite(numCode) && numCode >= 400 && numCode < 600) {
+                  rawErrCode = numCode;
+                }
+                if (typeof errVal.type === 'string' && errVal.type.trim()) {
+                  rawErrType = errVal.type.trim();
+                } else if (typeof errVal.status === 'string' && errVal.status.trim()) {
+                  rawErrType = errVal.status.trim();
+                } else if (typeof errVal.code === 'string' && errVal.code.trim()) {
+                  rawErrType = errVal.code.trim();
+                }
+              }
+            };
+
+            if (explicitErrObj !== undefined) {
+              extractFromErrorField(explicitErrObj);
+            } else if (rawDataStr) {
+              try {
+                const errJson = JSON.parse(rawDataStr);
+                extractFromErrorField(errJson?.error ?? errJson);
+              } catch (_) {
+                const cleaned = rawDataStr
+                  .replace(/<[^>]*>/g, ' ')
+                  .replace(/\s+/g, ' ')
+                  .trim()
+                  .slice(0, 280);
+                if (cleaned) {
+                  parsedErrMessage = cleaned;
+                }
+              }
+            }
+
+            if (!rawErrCode) {
+              if (/rate_limit|429|quota|too many requests/i.test(`${rawErrType} ${parsedErrMessage}`)) {
+                rawErrCode = 429;
+              } else if (/auth|401|invalid_api_key/i.test(`${rawErrType} ${parsedErrMessage}`)) {
+                rawErrCode = 401;
+              } else if (/payment|402|credits/i.test(`${rawErrType} ${parsedErrMessage}`)) {
+                rawErrCode = 402;
+              } else if (/permission|403/i.test(`${rawErrType} ${parsedErrMessage}`)) {
+                rawErrCode = 403;
+              } else if (/not_found|404|model_not_found/i.test(`${rawErrType} ${parsedErrMessage}`)) {
+                rawErrCode = 404;
+              } else if (/502|bad gateway|malformed/i.test(`${rawErrType} ${parsedErrMessage}`)) {
+                rawErrCode = 502;
+              } else if (/503|unavailable|overloaded|interrupted/i.test(`${rawErrType} ${parsedErrMessage}`)) {
+                rawErrCode = 503;
+              } else if (/504|timeout|timed out/i.test(`${rawErrType} ${parsedErrMessage}`)) {
+                rawErrCode = 504;
+              } else {
+                rawErrCode = 500;
+              }
+            }
+
+            const effectiveStatus =
+              rawErrType ||
+              (rawErrCode === 429
+                ? 'RESOURCE_EXHAUSTED'
+                : rawErrCode === 401
+                ? 'UNAUTHENTICATED'
+                : rawErrCode === 402
+                ? 'PAYMENT_REQUIRED'
+                : rawErrCode === 403
+                ? 'PERMISSION_DENIED'
+                : rawErrCode === 404
+                ? 'NOT_FOUND'
+                : rawErrCode === 502
+                ? 'BAD_GATEWAY'
+                : rawErrCode === 503
+                ? 'UNAVAILABLE'
+                : rawErrCode === 504
+                ? 'DEADLINE_EXCEEDED'
+                : 'STREAM_ERROR');
+
+            stopHeartbeat();
+            try {
+              await reader.cancel();
+            } catch (_) {}
+            logAIDiagnostic({
+              category: 'streaming failure',
+              provider: 'openrouter',
+              model: modelUsed || selectedModel,
+              phase: 'mid-stream',
+              upstreamStatus: rawErrCode,
+              upstreamErrorCode: effectiveStatus,
+              sanitizedMessage: parsedErrMessage
+            });
+
+            if (!upstreamGuard.isClientClosed() && !res.writableEnded) {
+              sendSSE(res, {
+                type: 'error',
+                error: parsedErrMessage,
+                code: rawErrCode,
+                status: effectiveStatus,
+                errorCode: effectiveStatus,
+                provider: 'openrouter',
+                model: modelUsed || selectedModel,
+                retryable: false,
+                canFallback: true,
+                suggestedProviders: getConfiguredFallbackProviders('openrouter', isServerless),
+                partial: fullText.length > 0,
+                partialText: fullText.length > 0 ? fullText : undefined
+              });
+              res.end();
+            }
+          };
+
+          const processOpenRouterSSELine = async (line: string): Promise<boolean> => {
+            const trimmed = line.trim();
+            if (!trimmed) {
+              currentEventType = null;
+              return false;
+            }
+            if (trimmed.startsWith(':')) return false;
+
+            if (trimmed.startsWith('event:')) {
+              currentEventType = trimmed.slice(6).trim().toLowerCase();
+              return false;
+            }
+
+            if (!trimmed.startsWith('data:')) {
+              // Unexpected non-SSE line (e.g. raw HTML/JSON error body sent despite event-stream header)
+              if (currentEventType === 'error' || /"error"\s*:|<html|bad gateway|service unavailable/i.test(trimmed)) {
+                await emitOpenRouterStreamError(trimmed);
+                return true;
+              }
+              return false;
+            }
+
+            const eventTypeForLine = currentEventType;
+            currentEventType = null;
+
+            const dataStr = trimmed.slice(5).trim();
+            if (!dataStr) return false;
+            if (dataStr === '[DONE]') {
+              sawDoneMarker = true;
+              return false;
+            }
+
+            if (eventTypeForLine === 'error') {
+              await emitOpenRouterStreamError(dataStr);
+              return true;
+            }
+
+            try {
+              const parsed = JSON.parse(dataStr);
+              if (parsed && typeof parsed === 'object' && parsed.error) {
+                await emitOpenRouterStreamError(dataStr, parsed.error);
+                return true;
+              }
+
+              if (parsed.model) modelUsed = parsed.model;
+              const finishReason = parsed?.choices?.[0]?.finish_reason;
+              if (finishReason === 'error') {
+                await emitOpenRouterStreamError(dataStr, {
+                  message: 'OpenRouter upstream provider terminated stream with finish_reason: error.',
+                  code: 502,
+                  type: 'UPSTREAM_STREAM_ERROR'
+                });
+                return true;
+              }
+              if (finishReason) lastFinishReason = finishReason;
+
+              const delta = parsed?.choices?.[0]?.delta?.content;
+              if (delta) {
+                fullText += delta;
+                sendSSE(res, { type: 'chunk', text: delta });
+              }
+            } catch (_) {
+              await emitOpenRouterStreamError(
+                dataStr,
+                /"error"\s*:/.test(dataStr)
+                  ? undefined
+                  : {
+                      message: `Malformed SSE data frame received from OpenRouter: ${dataStr.slice(0, 180)}`,
+                      code: 502,
+                      type: 'MALFORMED_STREAM_FRAME'
+                    }
+              );
+              return true;
+            }
+            return false;
+          };
 
           while (true) {
             if (upstreamGuard.isClientClosed() || res.writableEnded) {
-              try { await reader.cancel(); } catch (_) {}
+              try {
+                await reader.cancel();
+              } catch (_) {}
               break;
             }
             const { done, value } = await reader.read();
             if (upstreamGuard.isClientClosed() || res.writableEnded) {
-              try { await reader.cancel(); } catch (_) {}
+              try {
+                await reader.cancel();
+              } catch (_) {}
               break;
             }
             if (done) break;
@@ -4699,46 +4987,47 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
             buffer = lines.pop() || '';
 
             for (const line of lines) {
-              const trimmed = line.trim();
-              if (!trimmed || !trimmed.startsWith('data:')) continue;
-              const dataStr = trimmed.slice(5).trim();
-              if (dataStr === '[DONE]') continue;
-              try {
-                const parsed = JSON.parse(dataStr);
-                if (parsed.model) modelUsed = parsed.model;
-                const finishReason = parsed?.choices?.[0]?.finish_reason;
-                if (finishReason) lastFinishReason = finishReason;
-                const delta = parsed.choices?.[0]?.delta?.content;
-                if (delta) {
-                  fullText += delta;
-                  sendSSE(res, { type: 'chunk', text: delta });
-                }
-              } catch (_) {}
+              const haltedOnError = await processOpenRouterSSELine(line);
+              if (haltedOnError) return;
             }
           }
 
           // Process trailing bytes and buffer
           const finalBytes = decoder.decode();
           if (finalBytes) buffer += finalBytes;
-          if (!upstreamGuard.isClientClosed() && buffer && buffer.trim().startsWith('data:')) {
-            const dataStr = buffer.trim().slice(5).trim();
-            if (dataStr !== '[DONE]') {
-              try {
-                const parsed = JSON.parse(dataStr);
-                if (parsed.model) modelUsed = parsed.model;
-                const finishReason = parsed?.choices?.[0]?.finish_reason;
-                if (finishReason) lastFinishReason = finishReason;
-                const delta = parsed?.choices?.[0]?.delta?.content;
-                if (delta) {
-                  fullText += delta;
-                  sendSSE(res, { type: 'chunk', text: delta });
-                }
-              } catch (_) {}
+          if (!streamFailed && !upstreamGuard.isClientClosed() && buffer && buffer.trim()) {
+            const remainingLines = buffer.split('\n');
+            for (const line of remainingLines) {
+              const haltedOnError = await processOpenRouterSSELine(line);
+              if (haltedOnError) return;
+            }
+            if (!streamFailed && currentEventType === 'error') {
+              await emitOpenRouterStreamError(buffer.trim());
+              return;
+            }
+          }
+
+          if (!streamFailed && !upstreamGuard.isClientClosed()) {
+            if (!sawDoneMarker && !lastFinishReason) {
+              await emitOpenRouterStreamError('', {
+                message: 'OpenRouter streaming connection closed unexpectedly before completion.',
+                code: 503,
+                type: 'STREAM_INTERRUPTED'
+              });
+              return;
+            }
+            if (fullText.length === 0) {
+              await emitOpenRouterStreamError('', {
+                message: 'OpenRouter stream completed without returning any response text.',
+                code: 502,
+                type: 'EMPTY_STREAM_RESPONSE'
+              });
+              return;
             }
           }
 
           // Continuation if finish_reason indicates token truncation
-          if ((lastFinishReason === 'length' || lastFinishReason === 'max_tokens') && !upstreamGuard.isClientClosed() && !res.writableEnded && fullText.length > 60) {
+          if (!streamFailed && (lastFinishReason === 'length' || lastFinishReason === 'max_tokens') && !upstreamGuard.isClientClosed() && !res.writableEnded && fullText.length > 60) {
             try {
               const contMessages = [
                 ...messages,
@@ -4746,14 +5035,10 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
                 { role: 'user', content: 'Please continue directly from where you stopped. Complete any unfinished sentences, items, or sections without repeating previous text.' }
               ];
               const contRes = await upstreamGuard.fetchUpstream(
-                'https://openrouter.ai/api/v1/chat/completions',
+                openRouterChatEndpoint,
                 {
                   method: 'POST',
-                  headers: {
-                    Authorization: `Bearer ${apiKey}`,
-                    'Content-Type': 'application/json',
-                    'X-Title': 'Orvix'
-                  },
+                  headers: openRouterHeaders,
                   body: JSON.stringify({
                     model: selectedModel,
                     messages: contMessages,
@@ -4768,9 +5053,12 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
               if (contRes.ok && contRes.body) {
                 const contReader = contRes.body.getReader();
                 let contBuffer = '';
+                let contEventType: string | null = null;
                 while (true) {
                   if (upstreamGuard.isClientClosed() || res.writableEnded) {
-                    try { await contReader.cancel(); } catch (_) {}
+                    try {
+                      await contReader.cancel();
+                    } catch (_) {}
                     break;
                   }
                   const { done: cDone, value: cVal } = await contReader.read();
@@ -4780,11 +5068,34 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
                   contBuffer = cLines.pop() || '';
                   for (const cLine of cLines) {
                     const cTrimmed = cLine.trim();
+                    if (!cTrimmed) {
+                      contEventType = null;
+                      continue;
+                    }
+                    if (cTrimmed.startsWith(':')) continue;
+                    if (cTrimmed.startsWith('event:')) {
+                      contEventType = cTrimmed.slice(6).trim().toLowerCase();
+                      continue;
+                    }
                     if (!cTrimmed.startsWith('data:')) continue;
+                    const lineEvt = contEventType;
+                    contEventType = null;
                     const cData = cTrimmed.slice(5).trim();
                     if (cData === '[DONE]') continue;
+                    if (lineEvt === 'error') {
+                      try {
+                        await contReader.cancel();
+                      } catch (_) {}
+                      break;
+                    }
                     try {
                       const cParsed = JSON.parse(cData);
+                      if (cParsed.error) {
+                        try {
+                          await contReader.cancel();
+                        } catch (_) {}
+                        break;
+                      }
                       const cDelta = cParsed?.choices?.[0]?.delta?.content;
                       if (cDelta) {
                         fullText += cDelta;
@@ -4798,7 +5109,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
           }
 
           stopHeartbeat();
-          if (!upstreamGuard.isClientClosed() && !res.writableEnded) {
+          if (!streamFailed && !upstreamGuard.isClientClosed() && !res.writableEnded) {
             if (isLikelyLarge && !isContinuation && !responseHasContinuationNotice(fullText)) {
               sendSSE(res, { type: 'chunk', text: CONTINUATION_NOTICES.PART_1 });
               fullText += CONTINUATION_NOTICES.PART_1;
@@ -4809,14 +5120,17 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
           return;
         } catch (streamErr: any) {
           stopHeartbeat();
-          if (upstreamGuard.isClientDisconnected(streamErr)) {
+          if (streamFailed || upstreamGuard.isClientDisconnected(streamErr)) {
             return;
           }
+          streamFailed = true;
           logAIDiagnostic({
             category: 'streaming failure',
             provider: 'openrouter',
-            model: selectedModel,
+            model: modelUsed || selectedModel,
             phase: 'mid-stream',
+            upstreamStatus: 503,
+            upstreamErrorCode: 'STREAM_FAILED',
             sanitizedMessage: streamErr?.message || 'OpenRouter streaming interrupted'
           });
           if (!res.writableEnded) {
@@ -4825,8 +5139,14 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
               error: 'OpenRouter streaming connection interrupted.',
               code: 503,
               status: 'STREAM_FAILED',
+              errorCode: 'STREAM_FAILED',
               provider: 'openrouter',
-              retryable: false
+              model: modelUsed || selectedModel,
+              retryable: false,
+              canFallback: true,
+              suggestedProviders: getConfiguredFallbackProviders('openrouter', isServerless),
+              partial: fullText.length > 0,
+              partialText: fullText.length > 0 ? fullText : undefined
             });
             res.end();
           }
@@ -4840,7 +5160,6 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
       const accountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
       const apiToken = (process.env.CLOUDFLARE_API_TOKEN || '').trim();
       const modelId = validatedClientModel || '@cf/meta/llama-3.1-8b-instruct';
-      const displayModel = 'Cloudflare Workers AI — Llama 3.1 8B';
 
       if (!isConfiguredCredential(accountId) || !isConfiguredCredential(apiToken)) {
         if (!isDemoModeEnabled()) {
@@ -4912,7 +5231,31 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
       const estimatedPromptTokens = Math.ceil(JSON.stringify(messages).length / 3.8);
       const maxContextTokens = 8192;
-      const availableTokenHeadroom = Math.max(1024, maxContextTokens - estimatedPromptTokens - 256);
+      if (estimatedPromptTokens >= maxContextTokens - 128) {
+        const contextErrMsg = `Prompt is too large for the Cloudflare model context window (estimated ${estimatedPromptTokens} tokens, limit ${maxContextTokens}). Please shorten your message or start a new conversation.`;
+        logAIDiagnostic({
+          category: 'request validation error',
+          provider: 'cloudflare',
+          model: modelId,
+          phase: shouldStream ? 'pre-stream' : 'non-streaming',
+          upstreamStatus: 400,
+          sanitizedMessage: contextErrMsg
+        });
+        return res.status(400).json({
+          error: contextErrMsg,
+          code: 400,
+          status: 'CONTEXT_LENGTH_EXCEEDED',
+          errorCode: 'CONTEXT_LENGTH_EXCEEDED',
+          category: 'invalid request / model',
+          provider: 'cloudflare',
+          model: modelId,
+          retryable: false,
+          canFallback: true,
+          suggestedProviders: getConfiguredFallbackProviders('cloudflare', isServerless)
+        });
+      }
+
+      const availableTokenHeadroom = Math.max(256, maxContextTokens - estimatedPromptTokens - 256);
 
       let targetOutputTokens = 3072;
       if (preferences?.responseLength === 'detailed' || isLikelyLarge || isContinuation) {
@@ -4924,7 +5267,65 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
       }
 
       const cfMaxTokens = Math.min(targetOutputTokens, availableTokenHeadroom);
-      const cfEndpoint = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/ai/run/${modelId}`;
+      const cfEndpoint = `${getCloudflareApiBaseUrl()}/accounts/${encodeURIComponent(accountId)}/ai/run/${modelId}`;
+
+      const normalizeCloudflareHttpError = (statusCode: number, errDetail: string) => {
+        const lowerDetail = (errDetail || '').toLowerCase();
+        const isContextLimit =
+          (statusCode === 400 || statusCode === 413) &&
+          (lowerDetail.includes('context length') ||
+            lowerDetail.includes('context window') ||
+            lowerDetail.includes('too many tokens') ||
+            lowerDetail.includes('maximum context') ||
+            lowerDetail.includes('prompt is too long') ||
+            lowerDetail.includes('exceeds maximum') ||
+            lowerDetail.includes('max_tokens'));
+
+        if (isContextLimit) {
+          return {
+            status: 'CONTEXT_LENGTH_EXCEEDED',
+            errorCode: 'CONTEXT_LENGTH_EXCEEDED',
+            category: 'request validation error' as AIDiagnosticCategory,
+            isRetryable: false,
+            friendlyError: 'Prompt exceeds the Cloudflare model context window. Please shorten your message or clear older conversation turns.'
+          };
+        }
+
+        const parsed = parseGeminiError({ status: statusCode, message: errDetail || `HTTP ${statusCode}` }, 'cloudflare');
+        let friendlyError = parsed.message;
+        let status = parsed.status;
+        let isRetryable = parsed.isRetryable;
+
+        if (statusCode === 401 || statusCode === 403) {
+          friendlyError = 'Invalid or unauthorized Cloudflare API token. Please verify CLOUDFLARE_API_TOKEN.';
+          status = statusCode === 401 ? 'UNAUTHENTICATED' : 'PERMISSION_DENIED';
+          isRetryable = false;
+        } else if (statusCode === 404) {
+          friendlyError = 'Cloudflare account or model not found. Please verify CLOUDFLARE_ACCOUNT_ID and model availability.';
+          status = 'NOT_FOUND';
+          isRetryable = false;
+        } else if (statusCode === 400) {
+          status = 'INVALID_ARGUMENT';
+          isRetryable = false;
+        } else if (statusCode === 429) {
+          status = 'RESOURCE_EXHAUSTED';
+          isRetryable = true;
+        } else if (statusCode === 500 || statusCode === 502 || statusCode === 503 || statusCode === 504) {
+          isRetryable = true;
+          if (statusCode === 500) status = 'INTERNAL';
+          else if (statusCode === 502) status = 'BAD_GATEWAY';
+          else if (statusCode === 503) status = 'UNAVAILABLE';
+          else if (statusCode === 504) status = 'DEADLINE_EXCEEDED';
+        }
+
+        return {
+          status,
+          errorCode: status,
+          category: parsed.category,
+          isRetryable,
+          friendlyError
+        };
+      };
 
       if (!shouldStream) {
         try {
@@ -4959,40 +5360,95 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
               errDetail = await cfRes.text();
             }
 
-            const parsed = parseGeminiError({ status: cfRes.status, message: errDetail || cfRes.statusText }, 'cloudflare');
-            let friendlyError = parsed.message;
-            if (cfRes.status === 401 || cfRes.status === 403) {
-              friendlyError = 'Invalid or unauthorized Cloudflare API token. Please verify CLOUDFLARE_API_TOKEN.';
-            } else if (cfRes.status === 404) {
-              friendlyError = 'Cloudflare account or model not found. Please verify CLOUDFLARE_ACCOUNT_ID and model availability.';
-            }
+            const normalizedErr = normalizeCloudflareHttpError(cfRes.status, errDetail || cfRes.statusText);
 
             logAIDiagnostic({
-              category: parsed.category,
+              category: normalizedErr.category,
               provider: 'cloudflare',
               model: modelId,
               phase: 'non-streaming',
               upstreamStatus: cfRes.status,
-              sanitizedMessage: friendlyError
+              sanitizedMessage: normalizedErr.friendlyError
             });
 
             return res.status(cfRes.status).json({
-              error: friendlyError,
+              error: normalizedErr.friendlyError,
               code: cfRes.status,
-              status: parsed.status,
-              category: parsed.category,
+              status: normalizedErr.status,
+              errorCode: normalizedErr.errorCode,
+              category: normalizedErr.category,
               provider: 'cloudflare',
               model: modelId,
-              retryable: parsed.isRetryable,
+              retryable: normalizedErr.isRetryable,
               canFallback: true,
               suggestedProviders: getConfiguredFallbackProviders('cloudflare', isServerless)
             });
           }
 
-          const data = await cfRes.json();
+          let data: any;
+          try {
+            data = await cfRes.json();
+          } catch (_) {
+            return res.status(502).json({
+              error: 'Cloudflare returned an invalid JSON response.',
+              code: 502,
+              status: 'MALFORMED_UPSTREAM_RESPONSE',
+              errorCode: 'MALFORMED_UPSTREAM_RESPONSE',
+              category: 'upstream unavailable',
+              provider: 'cloudflare',
+              model: modelId,
+              retryable: true,
+              canFallback: true,
+              suggestedProviders: getConfiguredFallbackProviders('cloudflare', isServerless)
+            });
+          }
+
           if (upstreamGuard.isClientClosed()) return;
-          let text = data?.result?.response || (typeof data?.result === 'string' ? data.result : '') || '';
-          const finishReason = data?.result?.finish_reason || (data?.result?.usage?.completion_tokens >= cfMaxTokens ? 'length' : null);
+
+          if (data?.success === false || (Array.isArray(data?.errors) && data.errors.length > 0)) {
+            const errMsg = Array.isArray(data?.errors) && data.errors.length > 0
+              ? data.errors.map((e: any) => e?.message || JSON.stringify(e)).join('; ')
+              : (typeof data?.error === 'string' ? data.error : 'Cloudflare Workers AI reported an upstream failure.');
+            const normalizedErr = normalizeCloudflareHttpError(502, errMsg);
+            return res.status(502).json({
+              error: normalizedErr.friendlyError,
+              code: 502,
+              status: normalizedErr.status,
+              errorCode: normalizedErr.errorCode,
+              category: normalizedErr.category,
+              provider: 'cloudflare',
+              model: modelId,
+              retryable: normalizedErr.isRetryable,
+              canFallback: true,
+              suggestedProviders: getConfiguredFallbackProviders('cloudflare', isServerless)
+            });
+          }
+
+          let text =
+            data?.result?.response ??
+            data?.choices?.[0]?.message?.content ??
+            (typeof data?.result === 'string' ? data.result : '') ??
+            '';
+          if (typeof text !== 'string') {
+            text = String(text || '');
+          }
+
+          if (!text.trim()) {
+            return res.status(502).json({
+              error: 'Cloudflare Workers AI returned an empty response.',
+              code: 502,
+              status: 'EMPTY_UPSTREAM_RESPONSE',
+              errorCode: 'EMPTY_UPSTREAM_RESPONSE',
+              category: 'upstream unavailable',
+              provider: 'cloudflare',
+              model: modelId,
+              retryable: true,
+              canFallback: true,
+              suggestedProviders: getConfiguredFallbackProviders('cloudflare', isServerless)
+            });
+          }
+
+          const finishReason = data?.result?.finish_reason || data?.choices?.[0]?.finish_reason || (data?.result?.usage?.completion_tokens >= cfMaxTokens ? 'length' : null);
 
           // Transparent continuation if Cloudflare reached output token limit
           if (finishReason === 'length' && text.length > 60 && !upstreamGuard.isClientClosed()) {
@@ -5035,7 +5491,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
           }
           return res.json({
             text,
-            modelUsed: displayModel,
+            modelUsed: modelId,
             provider: 'cloudflare'
           });
         } catch (fetchErr: any) {
@@ -5055,6 +5511,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
             error: parsed.message,
             code: parsed.statusCode,
             status: parsed.status,
+            errorCode: parsed.status,
             category: parsed.category,
             provider: 'cloudflare',
             model: modelId,
@@ -5101,6 +5558,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
             error: parsed.message,
             code: parsed.statusCode,
             status: parsed.status,
+            errorCode: parsed.status,
             category: parsed.category,
             provider: 'cloudflare',
             model: modelId,
@@ -5123,31 +5581,26 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
             errDetail = await cfRes.text();
           }
 
-          const parsed = parseGeminiError({ status: cfRes.status, message: errDetail || cfRes.statusText }, 'cloudflare');
-          let friendlyError = parsed.message;
-          if (cfRes.status === 401 || cfRes.status === 403) {
-            friendlyError = 'Invalid or unauthorized Cloudflare API token. Please verify CLOUDFLARE_API_TOKEN.';
-          } else if (cfRes.status === 404) {
-            friendlyError = 'Cloudflare account or model not found. Please verify CLOUDFLARE_ACCOUNT_ID and model availability.';
-          }
+          const normalizedErr = normalizeCloudflareHttpError(cfRes.status, errDetail || cfRes.statusText);
 
           logAIDiagnostic({
-            category: parsed.category,
+            category: normalizedErr.category,
             provider: 'cloudflare',
             model: modelId,
             phase: 'pre-stream',
             upstreamStatus: cfRes.status,
-            sanitizedMessage: friendlyError
+            sanitizedMessage: normalizedErr.friendlyError
           });
 
           return res.status(cfRes.status).json({
-            error: friendlyError,
+            error: normalizedErr.friendlyError,
             code: cfRes.status,
-            status: parsed.status,
-            category: parsed.category,
+            status: normalizedErr.status,
+            errorCode: normalizedErr.errorCode,
+            category: normalizedErr.category,
             provider: 'cloudflare',
             model: modelId,
-            retryable: parsed.isRetryable,
+            retryable: normalizedErr.isRetryable,
             canFallback: true,
             suggestedProviders: getConfiguredFallbackProviders('cloudflare', isServerless)
           });
@@ -5157,35 +5610,216 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         const contentType = cfRes.headers.get('content-type') || '';
 
         if (contentType.includes('application/json') || !cfRes.body) {
-          const data = await cfRes.json();
+          let data: any;
+          try {
+            data = await cfRes.json();
+          } catch (_) {
+            return res.status(502).json({
+              error: 'Cloudflare returned an invalid JSON response.',
+              code: 502,
+              status: 'MALFORMED_UPSTREAM_RESPONSE',
+              errorCode: 'MALFORMED_UPSTREAM_RESPONSE',
+              category: 'upstream unavailable',
+              provider: 'cloudflare',
+              model: modelId,
+              retryable: true,
+              canFallback: true,
+              suggestedProviders: getConfiguredFallbackProviders('cloudflare', isServerless)
+            });
+          }
+
           if (upstreamGuard.isClientClosed()) return;
-          let fullText = data?.result?.response || (typeof data?.result === 'string' ? data.result : '') || '';
+
+          if (data?.success === false || (Array.isArray(data?.errors) && data.errors.length > 0)) {
+            const errMsg = Array.isArray(data?.errors) && data.errors.length > 0
+              ? data.errors.map((e: any) => e?.message || JSON.stringify(e)).join('; ')
+              : (typeof data?.error === 'string' ? data.error : 'Cloudflare Workers AI reported an upstream failure.');
+            const normalizedErr = normalizeCloudflareHttpError(502, errMsg);
+            return res.status(502).json({
+              error: normalizedErr.friendlyError,
+              code: 502,
+              status: normalizedErr.status,
+              errorCode: normalizedErr.errorCode,
+              category: normalizedErr.category,
+              provider: 'cloudflare',
+              model: modelId,
+              retryable: normalizedErr.isRetryable,
+              canFallback: true,
+              suggestedProviders: getConfiguredFallbackProviders('cloudflare', isServerless)
+            });
+          }
+
+          let fullText =
+            data?.result?.response ??
+            data?.choices?.[0]?.message?.content ??
+            (typeof data?.result === 'string' ? data.result : '') ??
+            '';
+          if (typeof fullText !== 'string') {
+            fullText = String(fullText || '');
+          }
+
+          if (!fullText.trim()) {
+            return res.status(502).json({
+              error: 'Cloudflare Workers AI returned an empty response.',
+              code: 502,
+              status: 'EMPTY_UPSTREAM_RESPONSE',
+              errorCode: 'EMPTY_UPSTREAM_RESPONSE',
+              category: 'upstream unavailable',
+              provider: 'cloudflare',
+              model: modelId,
+              retryable: true,
+              canFallback: true,
+              suggestedProviders: getConfiguredFallbackProviders('cloudflare', isServerless)
+            });
+          }
+
           if (isLikelyLarge && !isContinuation && !responseHasContinuationNotice(fullText)) {
             fullText += CONTINUATION_NOTICES.PART_1;
           }
           initSSE(res);
-          sendSSE(res, { type: 'start', modelUsed: displayModel, provider: 'cloudflare' });
-          if (fullText) {
-            sendSSE(res, { type: 'chunk', text: fullText });
-          }
-          sendSSE(res, { type: 'done', text: fullText, modelUsed: displayModel, provider: 'cloudflare' });
+          sendSSE(res, { type: 'start', modelUsed: modelId, provider: 'cloudflare' });
+          sendSSE(res, { type: 'chunk', text: fullText });
+          sendSSE(res, { type: 'done', text: fullText, modelUsed: modelId, provider: 'cloudflare' });
           res.end();
           return;
         }
 
         initSSE(res);
         const stopHeartbeat = startSSEHeartbeat(res);
-        sendSSE(res, { type: 'start', modelUsed: displayModel, provider: 'cloudflare' });
+        sendSSE(res, { type: 'start', modelUsed: modelId, provider: 'cloudflare' });
+
+        let fullText = '';
+        let lastFinishReason: string | null = null;
+        let sawDoneSentinel = false;
+        let sawErrorEvent = false;
+        let streamFailed = false;
+
+        const emitCloudflareStreamError = (
+          errMessage: string,
+          status = 'STREAM_FAILED',
+          code = 502,
+          retryable = false
+        ) => {
+          if (streamFailed || upstreamGuard.isClientClosed() || res.writableEnded) return;
+          streamFailed = true;
+          stopHeartbeat();
+          logAIDiagnostic({
+            category: 'streaming failure',
+            provider: 'cloudflare',
+            model: modelId,
+            phase: 'mid-stream',
+            upstreamStatus: code,
+            sanitizedMessage: errMessage
+          });
+          sendSSE(res, {
+            type: 'error',
+            error: errMessage,
+            code,
+            status,
+            errorCode: status,
+            provider: 'cloudflare',
+            model: modelId,
+            retryable,
+            canFallback: true,
+            suggestedProviders: getConfiguredFallbackProviders('cloudflare', isServerless),
+            partial: fullText.length > 0,
+            ...(fullText.length > 0 ? { partialText: fullText } : {})
+          });
+          res.end();
+        };
+
+        const processCloudflareSSELine = (rawLine: string): boolean => {
+          const trimmed = rawLine.trim();
+          if (!trimmed) {
+            sawErrorEvent = false;
+            return true;
+          }
+          if (trimmed.startsWith(':')) {
+            return true;
+          }
+          if (trimmed.startsWith('event:')) {
+            const eventType = trimmed.slice(6).trim().toLowerCase();
+            sawErrorEvent = eventType === 'error';
+            return true;
+          }
+          if (!trimmed.startsWith('data:')) {
+            return true;
+          }
+
+          const dataStr = trimmed.slice(5).trim();
+          if (!dataStr) return true;
+          if (dataStr === '[DONE]') {
+            sawDoneSentinel = true;
+            return true;
+          }
+
+          let parsed: any;
+          try {
+            parsed = JSON.parse(dataStr);
+          } catch (_) {
+            emitCloudflareStreamError(
+              'Malformed SSE data frame received from Cloudflare stream.',
+              'MALFORMED_STREAM_FRAME',
+              502,
+              false
+            );
+            return false;
+          }
+
+          if (
+            sawErrorEvent ||
+            parsed?.error ||
+            (Array.isArray(parsed?.errors) && parsed.errors.length > 0) ||
+            parsed?.success === false
+          ) {
+            const upstreamErrMsg =
+              typeof parsed?.error === 'string'
+                ? parsed.error
+                : parsed?.error?.message ||
+                  (Array.isArray(parsed?.errors) && parsed.errors[0]?.message) ||
+                  'Cloudflare Workers AI reported an error during streaming.';
+            emitCloudflareStreamError(upstreamErrMsg, 'UPSTREAM_STREAM_ERROR', 502, false);
+            return false;
+          }
+
+          const finishReason =
+            parsed?.finish_reason ??
+            parsed?.result?.finish_reason ??
+            parsed?.choices?.[0]?.finish_reason ??
+            null;
+          if (finishReason) {
+            lastFinishReason = finishReason;
+            if (String(finishReason).toLowerCase() === 'error') {
+              emitCloudflareStreamError(
+                'Cloudflare stream terminated with finish_reason=error.',
+                'STREAM_FINISH_ERROR',
+                502,
+                false
+              );
+              return false;
+            }
+          }
+
+          const delta =
+            parsed?.response ??
+            parsed?.result?.response ??
+            parsed?.choices?.[0]?.delta?.content ??
+            '';
+          if (typeof delta === 'string' && delta.length > 0) {
+            fullText += delta;
+            sendSSE(res, { type: 'chunk', text: delta });
+          }
+
+          return true;
+        };
 
         try {
           const reader = cfRes.body.getReader();
           const decoder = new TextDecoder();
           let buffer = '';
-          let fullText = '';
-          let lastFinishReason: string | null = null;
 
           while (true) {
-            if (upstreamGuard.isClientClosed() || res.writableEnded) {
+            if (upstreamGuard.isClientClosed() || res.writableEnded || streamFailed) {
               try {
                 await reader.cancel();
               } catch (_) {}
@@ -5193,7 +5827,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
             }
 
             const { done, value } = await reader.read();
-            if (upstreamGuard.isClientClosed() || res.writableEnded) {
+            if (upstreamGuard.isClientClosed() || res.writableEnded || streamFailed) {
               try {
                 await reader.cancel();
               } catch (_) {}
@@ -5206,47 +5840,56 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
             buffer = lines.pop() || '';
 
             for (const line of lines) {
-              const trimmed = line.trim();
-              if (!trimmed || !trimmed.startsWith('data:')) continue;
-              const dataStr = trimmed.slice(5).trim();
-              if (dataStr === '[DONE]') continue;
-
-              try {
-                const parsed = JSON.parse(dataStr);
-                const finishReason = parsed?.finish_reason || parsed?.choices?.[0]?.finish_reason;
-                if (finishReason) {
-                  lastFinishReason = finishReason;
-                }
-                const delta = parsed?.response ?? parsed?.choices?.[0]?.delta?.content ?? '';
-                if (delta) {
-                  fullText += delta;
-                  sendSSE(res, { type: 'chunk', text: delta });
-                }
-              } catch (_) {}
+              if (!processCloudflareSSELine(line)) {
+                try {
+                  await reader.cancel();
+                } catch (_) {}
+                break;
+              }
             }
           }
 
-          // Process any trailing bytes and line in buffer
+          // Process any trailing bytes and lines in buffer
           const finalBytes = decoder.decode();
           if (finalBytes) {
             buffer += finalBytes;
           }
-          if (!upstreamGuard.isClientClosed() && buffer && buffer.trim().startsWith('data:')) {
-            const dataStr = buffer.trim().slice(5).trim();
-            if (dataStr !== '[DONE]') {
-              try {
-                const parsed = JSON.parse(dataStr);
-                const finishReason = parsed?.finish_reason || parsed?.choices?.[0]?.finish_reason;
-                if (finishReason) {
-                  lastFinishReason = finishReason;
-                }
-                const delta = parsed?.response ?? parsed?.choices?.[0]?.delta?.content ?? '';
-                if (delta) {
-                  fullText += delta;
-                  sendSSE(res, { type: 'chunk', text: delta });
-                }
-              } catch (_) {}
+          if (!upstreamGuard.isClientClosed() && !res.writableEnded && !streamFailed && buffer.trim()) {
+            const remainingLines = buffer.split('\n');
+            for (const remLine of remainingLines) {
+              if (!processCloudflareSSELine(remLine)) {
+                break;
+              }
             }
+          }
+
+          if (streamFailed || upstreamGuard.isClientClosed() || res.writableEnded) {
+            stopHeartbeat();
+            return;
+          }
+
+          const completedCleanly =
+            sawDoneSentinel ||
+            (lastFinishReason !== null && lastFinishReason !== '');
+
+          if (!completedCleanly) {
+            emitCloudflareStreamError(
+              'Cloudflare stream closed prematurely before completion signal.',
+              'STREAM_INTERRUPTED',
+              502,
+              false
+            );
+            return;
+          }
+
+          if (!fullText.trim()) {
+            emitCloudflareStreamError(
+              'Cloudflare stream completed without returning any response content.',
+              'EMPTY_STREAM_RESPONSE',
+              502,
+              true
+            );
+            return;
           }
 
           // Transparent continuation if Cloudflare reached output token ceiling mid-generation
@@ -5315,7 +5958,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
           }
 
           stopHeartbeat();
-          if (!upstreamGuard.isClientClosed() && !res.writableEnded) {
+          if (!upstreamGuard.isClientClosed() && !res.writableEnded && !streamFailed) {
             if (lastFinishReason === 'length' && !responseHasContinuationNotice(fullText)) {
               sendSSE(res, { type: 'chunk', text: CONTINUATION_NOTICES.PART_N });
               fullText += CONTINUATION_NOTICES.PART_N;
@@ -5323,33 +5966,21 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
               sendSSE(res, { type: 'chunk', text: CONTINUATION_NOTICES.PART_1 });
               fullText += CONTINUATION_NOTICES.PART_1;
             }
-            sendSSE(res, { type: 'done', text: fullText, modelUsed: displayModel, provider: 'cloudflare' });
+            sendSSE(res, { type: 'done', text: fullText, modelUsed: modelId, provider: 'cloudflare' });
             res.end();
           }
           return;
         } catch (streamErr: any) {
-          stopHeartbeat();
           if (upstreamGuard.isClientDisconnected(streamErr)) {
+            stopHeartbeat();
             return;
           }
-          logAIDiagnostic({
-            category: 'streaming failure',
-            provider: 'cloudflare',
-            model: modelId,
-            phase: 'mid-stream',
-            sanitizedMessage: streamErr?.message || 'Cloudflare streaming interrupted'
-          });
-          if (!res.writableEnded) {
-            sendSSE(res, {
-              type: 'error',
-              error: 'Cloudflare streaming connection interrupted.',
-              code: 503,
-              status: 'STREAM_FAILED',
-              provider: 'cloudflare',
-              retryable: false
-            });
-            res.end();
-          }
+          emitCloudflareStreamError(
+            'Cloudflare streaming connection interrupted.',
+            'STREAM_FAILED',
+            503,
+            false
+          );
           return;
         }
       }

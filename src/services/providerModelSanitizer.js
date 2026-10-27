@@ -37,6 +37,92 @@ export const PROVIDER_DISPLAY_NAMES = Object.freeze({
   webllm: 'Browser AI (WebLLM)'
 });
 
+export const GROQ_CHAT_MODELS = Object.freeze([
+  'openai/gpt-oss-120b',
+  'llama-3.1-8b-instant',
+  'openai/gpt-oss-20b'
+]);
+
+export const GROQ_FALLBACK_CHAT_MODELS = Object.freeze([
+  'openai/gpt-oss-120b',
+  'llama-3.1-8b-instant'
+]);
+
+export const GROQ_TRANSCRIPTION_MODELS = Object.freeze([
+  'whisper-large-v3-turbo',
+  'whisper-large-v3'
+]);
+
+export const DEFAULT_GROQ_TRANSCRIPTION_MODEL = 'whisper-large-v3-turbo';
+
+export const OPENROUTER_DEFAULT_MODEL = 'openrouter/free';
+
+export const OPENROUTER_DYNAMIC_ROUTERS = Object.freeze([
+  'openrouter/free',
+  'openrouter/auto'
+]);
+
+export const CLOUDFLARE_DEFAULT_MODEL = '@cf/meta/llama-3.1-8b-instruct';
+
+export const RETIRED_GROQ_MODELS = Object.freeze([
+  'llama3-70b-8192',
+  'llama3-8b-8192',
+  'mixtral-8x7b-32768',
+  'gemma-7b-it',
+  'gemma2-9b-it',
+  'llama-3.1-70b-versatile',
+  'llama-3.2-1b-preview',
+  'llama-3.2-3b-preview',
+  'llama-3.2-11b-vision-preview',
+  'llama-3.2-90b-vision-preview',
+  'distil-whisper-large-v3-en'
+]);
+
+const GROQ_TRANSCRIPTION_MODEL_SET = new Set(
+  GROQ_TRANSCRIPTION_MODELS.map((m) => m.toLowerCase())
+);
+const RETIRED_GROQ_MODEL_SET = new Set(
+  RETIRED_GROQ_MODELS.map((m) => m.toLowerCase())
+);
+
+/**
+ * Validates a requested Groq audio transcription model identifier.
+ * Keeps audio transcription models strictly separate from chat-completion models.
+ *
+ * @param {unknown} rawModel
+ * @returns {{ valid: boolean, model: string, error?: string, code?: string }}
+ */
+export function validateGroqTranscriptionModel(rawModel) {
+  if (rawModel === undefined || rawModel === null || rawModel === '') {
+    return { valid: true, model: DEFAULT_GROQ_TRANSCRIPTION_MODEL };
+  }
+  if (typeof rawModel !== 'string') {
+    return {
+      valid: false,
+      model: DEFAULT_GROQ_TRANSCRIPTION_MODEL,
+      error: 'Invalid transcription model parameter: expected a string identifier.',
+      code: 'INVALID_TRANSCRIPTION_MODEL'
+    };
+  }
+  const trimmed = rawModel.trim();
+  if (!trimmed) {
+    return { valid: true, model: DEFAULT_GROQ_TRANSCRIPTION_MODEL };
+  }
+  const lower = trimmed.toLowerCase();
+  if (GROQ_TRANSCRIPTION_MODEL_SET.has(lower)) {
+    const canonical =
+      GROQ_TRANSCRIPTION_MODELS.find((m) => m.toLowerCase() === lower) ||
+      DEFAULT_GROQ_TRANSCRIPTION_MODEL;
+    return { valid: true, model: canonical };
+  }
+  return {
+    valid: false,
+    model: DEFAULT_GROQ_TRANSCRIPTION_MODEL,
+    error: `Model '${trimmed}' is not a valid Groq audio transcription model. Supported transcription models are: ${GROQ_TRANSCRIPTION_MODELS.join(', ')}.`,
+    code: 'INVALID_TRANSCRIPTION_MODEL'
+  };
+}
+
 export const PROVIDER_DEFAULT_MODELS = Object.freeze({
   gemini: 'gemini-2.5-flash',
   groq: 'openai/gpt-oss-120b',
@@ -70,6 +156,11 @@ const KNOWN_UI_DISPLAY_LABELS = new Set([
   'llama 3.3 70b',
   'llama 3.3 70b (free)',
   'llama 3.3 70b free',
+  'free models router',
+  'free router',
+  'openrouter (free models router)',
+  'openrouter — free models router',
+  'openrouter - free models router',
   'openrouter',
   'groq',
   'llama 3.1 8b',
@@ -218,9 +309,29 @@ export function checkModelCompatibilityForProvider(provider, candidateModel) {
     }
 
     case 'groq': {
-      // Preserve existing Groq legacy Llama 3.3 compatibility alias until Phase 4D
+      // Preserve legacy Llama 3.3 migration alias to current primary Groq chat model
       if (lower.includes('llama-3.3') && /^[a-z0-9._/-]+$/i.test(trimmed) && !lower.includes(':')) {
         return { compatible: true, normalizedModel: 'openai/gpt-oss-120b' };
+      }
+      // Reject audio transcription models (Whisper) when requested for Groq chat completions
+      if (
+        GROQ_TRANSCRIPTION_MODEL_SET.has(lower) ||
+        lower.startsWith('whisper-') ||
+        lower.startsWith('distil-whisper')
+      ) {
+        return {
+          compatible: false,
+          normalizedModel: null,
+          reason: `Model "${trimmed}" is an audio transcription model and cannot be used for Groq chat completions.`
+        };
+      }
+      // Reject verified retired / decommissioned Groq model IDs
+      if (RETIRED_GROQ_MODEL_SET.has(lower)) {
+        return {
+          compatible: false,
+          normalizedModel: null,
+          reason: `Model "${trimmed}" has been retired on Groq. Please use "${PROVIDER_DEFAULT_MODELS.groq}" or "llama-3.1-8b-instant".`
+        };
       }
       // Reject foreign provider formats: Cloudflare (@cf/@hf), OpenRouter (openrouter/* or :free/:variant),
       // Ollama tags (:), Gemini (gemini-*/models/*), WebLLM (*-MLC)
@@ -255,12 +366,24 @@ export function checkModelCompatibilityForProvider(provider, candidateModel) {
         lower.startsWith('@cf/') ||
         lower.startsWith('@hf/') ||
         lower.startsWith('models/') ||
-        lower.endsWith('-mlc')
+        lower.endsWith('-mlc') ||
+        GROQ_TRANSCRIPTION_MODEL_SET.has(lower) ||
+        lower.includes('/whisper-')
       ) {
         return {
           compatible: false,
           normalizedModel: null,
           reason: `Model "${trimmed}" belongs to another provider and is not valid for OpenRouter.`
+        };
+      }
+      if (lower.startsWith('openrouter/')) {
+        if (OPENROUTER_DYNAMIC_ROUTERS.includes(lower)) {
+          return { compatible: true, normalizedModel: lower };
+        }
+        return {
+          compatible: false,
+          normalizedModel: null,
+          reason: `Model "${trimmed}" is not a recognized OpenRouter router. Supported routers are: ${OPENROUTER_DYNAMIC_ROUTERS.join(', ')}.`
         };
       }
       if (/^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*(?::[a-z0-9._-]+)?$/i.test(trimmed)) {
@@ -274,8 +397,19 @@ export function checkModelCompatibilityForProvider(provider, candidateModel) {
     }
 
     case 'cloudflare': {
-      // Cloudflare Workers AI models use `@cf/<org>/<model>` or `@hf/<org>/<model>`
-      if (/^@(?:cf|hf)\/[a-z0-9._-]+\/[a-z0-9._/-]+$/i.test(trimmed)) {
+      // Cloudflare Workers AI chat models use `@cf/<org>/<model>` or `@hf/<org>/<model>`
+      if (
+        GROQ_TRANSCRIPTION_MODEL_SET.has(lower) ||
+        lower.includes('/whisper') ||
+        lower.endsWith('-mlc')
+      ) {
+        return {
+          compatible: false,
+          normalizedModel: null,
+          reason: `Model "${trimmed}" is not a valid Cloudflare Workers AI chat model identifier.`
+        };
+      }
+      if (/^@(?:cf|hf)\/[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)+$/i.test(trimmed)) {
         return { compatible: true, normalizedModel: trimmed };
       }
       return {

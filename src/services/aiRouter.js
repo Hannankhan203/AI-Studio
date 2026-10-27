@@ -46,14 +46,16 @@ export const PROVIDER_OPTIONS = [
   {
     id: AI_PROVIDERS.OPENROUTER,
     name: 'OpenRouter',
-    modelTag: 'Llama 3.3 70B (Free)',
-    description: 'Multi-model gateway'
+    modelTag: 'Free Models Router',
+    defaultModel: 'openrouter/free',
+    description: 'Dynamic free-tier model router (openrouter/free)'
   },
   {
     id: AI_PROVIDERS.CLOUDFLARE,
     name: 'Cloudflare Workers AI',
     shortName: 'Cloudflare AI',
     modelTag: 'Llama 3.1 8B',
+    defaultModel: '@cf/meta/llama-3.1-8b-instruct',
     description: 'Serverless inference',
     label: 'Cloudflare Workers AI — Llama 3.1 8B'
   },
@@ -401,7 +403,9 @@ export function parseRouterError(rawError, statusCode = 500, providerHint = null
     code = code === 401 ? 401 : 403;
     status = code === 401 ? 'UNAUTHENTICATED' : 'PERMISSION_DENIED';
     retryable = false;
-    cleanMsg = 'Invalid or unauthorized API key. Please check your configuration.';
+    if (!cleanMsg || !lowerMsg.includes('cloudflare')) {
+      cleanMsg = 'Invalid or unauthorized API key. Please check your configuration.';
+    }
   } else if (code === 404 || upperStatus === 'NOT_FOUND') {
     code = 404;
     status = 'NOT_FOUND';
@@ -437,6 +441,10 @@ export function parseRouterError(rawError, statusCode = 500, providerHint = null
     if (!cleanMsg || cleanMsg.includes('Server request failed')) {
       cleanMsg = "The response was blocked by Google Gemini's safety filters. Please rephrase your request.";
     }
+  } else if (upperStatus === 'CONTEXT_LENGTH_EXCEEDED') {
+    code = 400;
+    status = 'CONTEXT_LENGTH_EXCEEDED';
+    retryable = false;
   } else if (code === 400 || upperStatus === 'INVALID_ARGUMENT') {
     code = 400;
     status = 'INVALID_ARGUMENT';
@@ -451,7 +459,7 @@ export function parseRouterError(rawError, statusCode = 500, providerHint = null
   } else if (code === 500 || upperStatus === 'INTERNAL') {
     code = 500;
     status = 'INTERNAL';
-    retryable = false;
+    retryable = explicitRetryable ?? false;
     if (!cleanMsg || cleanMsg === 'Internal Server Error' || cleanMsg.includes('Server request failed (500)')) {
       cleanMsg = 'The AI service encountered an internal error. Please try again or switch providers.';
     }
@@ -462,6 +470,7 @@ export function parseRouterError(rawError, statusCode = 500, providerHint = null
   );
   err.code = code;
   err.status = status;
+  err.errorCode = isObjectInput && rawError.errorCode ? String(rawError.errorCode) : status;
   if (explicitRetryable === false || isOllamaContext) {
     err.retryable = false;
   } else if (typeof explicitRetryable === 'boolean') {
@@ -484,6 +493,10 @@ export function parseRouterError(rawError, statusCode = 500, providerHint = null
   }
   if (isObjectInput && rawError.finishReason) {
     err.finishReason = rawError.finishReason;
+  }
+  if (isObjectInput && rawError.serverRetriesExhausted === true) {
+    err.serverRetriesExhausted = true;
+    err.retryable = false;
   }
   return err;
 }
@@ -778,14 +791,30 @@ export async function streamAIMessage({
               );
               if (data.code) streamErr.code = data.code;
               if (data.status) streamErr.status = data.status;
+              if (data.errorCode) {
+                streamErr.errorCode = data.errorCode;
+              } else if (streamErr.status && !streamErr.errorCode) {
+                streamErr.errorCode = streamErr.status;
+              }
+              if (data.model) streamErr.model = data.model;
               if (typeof data.retryable === 'boolean') streamErr.retryable = data.retryable;
               if (typeof data.canFallback === 'boolean') streamErr.canFallback = data.canFallback;
               if (Array.isArray(data.suggestedProviders)) {
                 streamErr.suggestedProviders = data.suggestedProviders;
               }
+              if (typeof data.partial === 'boolean') {
+                streamErr.partial = data.partial;
+              }
+              if (typeof data.partialText === 'string') {
+                streamErr.partialText = data.partialText;
+              }
               // Never auto-retry at the router layer if partial stream tokens were already emitted
               if (accumulatedText.length > 0) {
                 streamErr.retryable = false;
+                streamErr.partial = true;
+                if (!streamErr.partialText) {
+                  streamErr.partialText = accumulatedText;
+                }
               }
               streamErr.provider = data.provider || normalizedProvider;
               throw streamErr;
@@ -1012,6 +1041,14 @@ export async function streamAIMessage({
           throw createRouterAbortError();
         }
         continue;
+      }
+
+      if (
+        normalizedErr?.retryable === true &&
+        !normalizedErr?.serverRetriesExhausted &&
+        clientAttempt >= maxClientAttempts
+      ) {
+        normalizedErr.retriesExhausted = true;
       }
 
       throw normalizedErr;
