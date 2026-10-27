@@ -52,7 +52,31 @@ export function truncateSafely(text, limit = MAX_EXTRACTED_CHARACTERS) {
 }
 
 /**
- * Parses markdown or text headings into structured sections
+ * Decodes standard XML and HTML character entities
+ * @param {string} str
+ * @returns {string}
+ */
+export function decodeXmlEntities(str) {
+  if (!str || typeof str !== 'string') return '';
+  return str
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, dec) => {
+      const code = parseInt(dec, 10);
+      return !isNaN(code) && code > 0 ? String.fromCharCode(code) : '';
+    })
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => {
+      const code = parseInt(hex, 16);
+      return !isNaN(code) && code > 0 ? String.fromCharCode(code) : '';
+    });
+}
+
+/**
+ * Parses markdown or text headings into structured sections,
+ * properly ignoring code block comments (#) inside backtick fences.
  * @param {string} markdownText
  * @returns {Array<{ heading: string, level: number, content: string, charCount: number }>}
  */
@@ -63,27 +87,36 @@ export function extractSectionsFromMarkdown(markdownText) {
   let currentHeading = 'Introduction';
   let currentLevel = 1;
   let currentContentLines = [];
+  let inCodeBlock = false;
 
   const headingRegex = /^(#{1,6})\s+(.*)$/;
 
   for (const line of lines) {
-    const match = line.match(headingRegex);
-    if (match) {
-      if (currentContentLines.length > 0 || currentHeading !== 'Introduction') {
-        const content = currentContentLines.join('\n').trim();
-        sections.push({
-          heading: currentHeading,
-          level: currentLevel,
-          content,
-          charCount: content.length
-        });
-        currentContentLines = [];
-      }
-      currentLevel = match[1].length;
-      currentHeading = match[2].trim();
-    } else {
+    if (line.trim().startsWith('```')) {
+      inCodeBlock = !inCodeBlock;
       currentContentLines.push(line);
+      continue;
     }
+
+    if (!inCodeBlock) {
+      const match = line.match(headingRegex);
+      if (match) {
+        if (currentContentLines.length > 0 || currentHeading !== 'Introduction') {
+          const content = currentContentLines.join('\n').trim();
+          sections.push({
+            heading: currentHeading,
+            level: currentLevel,
+            content,
+            charCount: content.length
+          });
+          currentContentLines = [];
+        }
+        currentLevel = match[1].length;
+        currentHeading = match[2].trim();
+        continue;
+      }
+    }
+    currentContentLines.push(line);
   }
 
   if (currentContentLines.length > 0) {
@@ -100,39 +133,65 @@ export function extractSectionsFromMarkdown(markdownText) {
 }
 
 /**
- * Robust CSV/TSV parser supporting quotes and commas/tabs within quotes
+ * Robust CSV/TSV parser supporting quotes, escaped quotes (""),
+ * and embedded newlines within quoted fields without corrupting row boundaries.
  * @param {string} rawText
  * @param {string} delimiter
  * @returns {Object}
  */
 export function parseDelimitedText(rawText, delimiter) {
+  if (!rawText || !rawText.trim()) {
+    return {
+      headers: [],
+      rowCount: 0,
+      columnCount: 0,
+      previewRows: [],
+      markdownTable: ''
+    };
+  }
+
   const rows = [];
-  const lines = (rawText || '').split(/\r?\n/);
+  let currentRow = [];
+  let currentCell = '';
+  let insideQuotes = false;
+  const len = rawText.length;
 
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    const cells = [];
-    let insideQuotes = false;
-    let currentCell = '';
+  for (let i = 0; i < len; i++) {
+    const char = rawText[i];
 
-    for (let i = 0; i < line.length; i++) {
-      const char = line[i];
-      if (char === '"') {
-        if (insideQuotes && line[i + 1] === '"') {
-          currentCell += '"';
-          i++;
-        } else {
-          insideQuotes = !insideQuotes;
-        }
-      } else if (char === delimiter && !insideQuotes) {
-        cells.push(currentCell.trim());
-        currentCell = '';
+    if (char === '"') {
+      if (insideQuotes && i + 1 < len && rawText[i + 1] === '"') {
+        currentCell += '"';
+        i++; // Skip escaped quote
       } else {
-        currentCell += char;
+        insideQuotes = !insideQuotes;
       }
+    } else if (char === delimiter && !insideQuotes) {
+      currentRow.push(currentCell.trim());
+      currentCell = '';
+    } else if ((char === '\r' || char === '\n') && !insideQuotes) {
+      // Row delimiter outside quotes
+      currentRow.push(currentCell.trim());
+      currentCell = '';
+      if (currentRow.some((c) => c.length > 0)) {
+        rows.push(currentRow);
+      }
+      currentRow = [];
+      // Handle \r\n
+      if (char === '\r' && i + 1 < len && rawText[i + 1] === '\n') {
+        i++;
+      }
+    } else {
+      currentCell += char;
     }
-    cells.push(currentCell.trim());
-    rows.push(cells);
+  }
+
+  // Flush last pending cell/row
+  if (currentCell.length > 0 || currentRow.length > 0) {
+    currentRow.push(currentCell.trim());
+    if (currentRow.some((c) => c.length > 0)) {
+      rows.push(currentRow);
+    }
   }
 
   if (rows.length === 0) {
@@ -149,17 +208,27 @@ export function parseDelimitedText(rawText, delimiter) {
   const dataRows = rows.slice(1);
   const maxCols = Math.max(...rows.map((r) => r.length));
 
+  // Build markdown table representation
   const colWidths = new Array(maxCols).fill(3);
   for (const row of rows) {
-    for (let c = 0; c < row.length; c++) {
-      colWidths[c] = Math.max(colWidths[c], Math.min((row[c] || '').length, 40));
+    for (let c = 0; c < maxCols; c++) {
+      const cellClean = (row[c] || '').replace(/[\r\n]+/g, ' ');
+      colWidths[c] = Math.max(colWidths[c], Math.min(cellClean.length, 40));
     }
   }
 
-  const headerRow = '| ' + headers.map((h, i) => (h || `Col ${i + 1}`).padEnd(colWidths[i] || 3)).join(' | ') + ' |';
+  const headerRow = '| ' + Array.from({ length: maxCols }, (_, i) => {
+    const h = (headers[i] || `Col ${i + 1}`).replace(/[\r\n]+/g, ' ');
+    return h.padEnd(colWidths[i] || 3);
+  }).join(' | ') + ' |';
+
   const dividerRow = '| ' + colWidths.map((w) => '-'.repeat(w)).join(' | ') + ' |';
+
   const previewData = dataRows.slice(0, 10).map((row) => {
-    return '| ' + row.map((cell, i) => (cell || '').padEnd(colWidths[i] || 3)).join(' | ') + ' |';
+    return '| ' + Array.from({ length: maxCols }, (_, i) => {
+      const c = (row[i] || '').replace(/[\r\n]+/g, '<br>');
+      return c.padEnd(colWidths[i] || 3);
+    }).join(' | ') + ' |';
   });
 
   const markdownTable = [headerRow, dividerRow, ...previewData].join('\n');
@@ -174,16 +243,31 @@ export function parseDelimitedText(rawText, delimiter) {
 }
 
 /**
- * Extracts plain text and markdown documents
+ * Extracts plain text, log, and markdown documents
  */
 function extractPlainTextDocument(text, ext) {
+  let cleanText = text || '';
+  if (cleanText.charCodeAt(0) === 0xfeff) {
+    cleanText = cleanText.slice(1);
+  }
+  cleanText = cleanText.trim();
+
+  if (!cleanText) {
+    return {
+      status: 'empty',
+      success: false,
+      text: '',
+      warning: ext === '.log' ? 'The log file is empty.' : 'The text file is empty.'
+    };
+  }
+
   const isMarkdown = ext === '.md' || ext === '.markdown';
-  const sections = isMarkdown ? extractSectionsFromMarkdown(text) : undefined;
+  const sections = isMarkdown ? extractSectionsFromMarkdown(cleanText) : undefined;
 
   return {
     status: 'ready',
     success: true,
-    text,
+    text: cleanText,
     sections,
     sectionCount: sections ? sections.length : undefined
   };
@@ -193,13 +277,28 @@ function extractPlainTextDocument(text, ext) {
  * Extracts and formats delimited text (CSV / TSV)
  */
 function extractDelimitedDocument(text, ext) {
+  let cleanText = text || '';
+  if (cleanText.charCodeAt(0) === 0xfeff) {
+    cleanText = cleanText.slice(1);
+  }
+  cleanText = cleanText.trim();
+
+  if (!cleanText) {
+    return {
+      status: 'empty',
+      success: false,
+      text: '',
+      warning: 'The tabular data file is empty.'
+    };
+  }
+
   const delimiter = ext === '.tsv' ? '\t' : ',';
-  const tableData = parseDelimitedText(text, delimiter);
+  const tableData = parseDelimitedText(cleanText, delimiter);
 
   return {
     status: 'ready',
     success: true,
-    text: tableData.markdownTable || text,
+    text: tableData.markdownTable || cleanText,
     table: tableData
   };
 }
@@ -208,8 +307,23 @@ function extractDelimitedDocument(text, ext) {
  * Extracts and formats JSON documents
  */
 function extractJsonDocument(text) {
+  let cleanText = text || '';
+  if (cleanText.charCodeAt(0) === 0xfeff) {
+    cleanText = cleanText.slice(1);
+  }
+  cleanText = cleanText.trim();
+
+  if (!cleanText) {
+    return {
+      status: 'empty',
+      success: false,
+      text: '',
+      warning: 'The JSON file is empty.'
+    };
+  }
+
   try {
-    const parsed = JSON.parse(text);
+    const parsed = JSON.parse(cleanText);
     const prettyJson = JSON.stringify(parsed, null, 2);
 
     let summaryStructure = '';
@@ -233,43 +347,64 @@ function extractJsonDocument(text) {
     return {
       status: 'corrupted',
       success: false,
-      text: text,
+      text: cleanText,
       warning: `JSON syntax error: ${err?.message || 'Invalid JSON format'}. Raw content retained.`
     };
   }
 }
 
 /**
- * Extracts XML documents
+ * Extracts XML documents with entity decoding and readable block structure
  */
 function extractXmlDocument(text) {
+  let cleanText = text || '';
+  if (cleanText.charCodeAt(0) === 0xfeff) {
+    cleanText = cleanText.slice(1);
+  }
+  cleanText = cleanText.trim();
+
+  if (!cleanText) {
+    return {
+      status: 'empty',
+      success: false,
+      text: '',
+      warning: 'The XML file is empty.'
+    };
+  }
+
   try {
-    let cleanText = text;
-    if (typeof DOMParser !== 'undefined') {
-      const parser = new DOMParser();
-      const xmlDoc = parser.parseFromString(text, 'text/xml');
-      const parseError = xmlDoc.getElementsByTagName('parsererror');
-      if (parseError.length > 0) {
-        return {
-          status: 'corrupted',
-          success: false,
-          text,
-          warning: 'XML contains malformed syntax. Raw content retained.'
-        };
-      }
-      cleanText = xmlDoc.documentElement ? xmlDoc.documentElement.textContent || text : text;
+    let structured = cleanText
+      .replace(/<\/(?:p|div|section|article|item|entry|row|record|message|h[1-6]|li|title)>/gi, '\n')
+      .replace(/<(?:br|hr)\s*\/?>/gi, '\n')
+      .replace(/<[^>]+>/g, ' ');
+
+    const decoded = decodeXmlEntities(structured);
+    const cleanLines = decoded
+      .split('\n')
+      .map((l) => l.replace(/[ \t]+/g, ' ').trim())
+      .filter((l) => l.length > 0);
+
+    const bodyText = cleanLines.join('\n\n');
+
+    if (!bodyText) {
+      return {
+        status: 'empty',
+        success: false,
+        text: '',
+        warning: 'The XML file contains tags but no readable text content.'
+      };
     }
 
     return {
       status: 'ready',
       success: true,
-      text: cleanText.trim() ? cleanText.trim() : text
+      text: `\`\`\`xml\n${cleanText.slice(0, 100_000)}\n\`\`\`\n\n### Extracted Text Content\n${bodyText}`
     };
   } catch (err) {
     return {
       status: 'corrupted',
       success: false,
-      text,
+      text: cleanText,
       warning: `XML parsing notice: ${err?.message || 'Non-standard XML'}. Raw content retained.`
     };
   }
@@ -352,8 +487,41 @@ async function extractPdfDocument(arrayBuffer) {
 }
 
 /**
- * Browser-side DOCX extraction using lazy-loaded mammoth
- * Preserves headings, lists, tables, and paragraphs.
+ * Extracts text boxes from Word document XML (both DrawingML wps:txbx / w:txbxContent and VML v:textbox)
+ * @param {string} xml
+ * @returns {Array<string>}
+ */
+function extractDocxTextBoxes(xml) {
+  if (!xml) return [];
+  const boxes = [];
+  const txbxRegex = /<(?:w:txbxContent|v:textbox)\b[^>]*>([\s\S]*?)<\/(?:w:txbxContent|v:textbox)>/gi;
+  let match;
+  while ((match = txbxRegex.exec(xml)) !== null) {
+    const boxXml = match[1];
+    const pRegex = /<w:p\b[^>]*>([\s\S]*?)<\/w:p>/gi;
+    let pMatch;
+    const boxParagraphs = [];
+    while ((pMatch = pRegex.exec(boxXml)) !== null) {
+      const pXml = pMatch[1];
+      const tRegex = /<w:t\b[^>]*>([\s\S]*?)<\/w:t>/gi;
+      const textTokens = [];
+      let tMatch;
+      while ((tMatch = tRegex.exec(pXml)) !== null) {
+        textTokens.push(tMatch[1]);
+      }
+      const pText = decodeXmlEntities(textTokens.join('')).trim();
+      if (pText) boxParagraphs.push(pText);
+    }
+    if (boxParagraphs.length > 0) {
+      boxes.push(boxParagraphs.join('\n'));
+    }
+  }
+  return boxes;
+}
+
+/**
+ * Browser-side DOCX extraction using lazy-loaded mammoth with text box preservation
+ * Preserves headings, lists, tables, paragraphs, and text boxes (w:txbxContent)
  * @param {ArrayBuffer} arrayBuffer
  */
 async function extractDocxDocument(arrayBuffer) {
@@ -365,36 +533,57 @@ async function extractDocxDocument(arrayBuffer) {
     try {
       const res = await mammoth.convertToMarkdown({ arrayBuffer });
       markdown = (res?.value || '').trim();
-    } catch (_) {
-      // Fallback to extractRawText if convertToMarkdown throws
-    }
+    } catch (_) {}
 
     if (!markdown) {
-      const raw = await mammoth.extractRawText({ arrayBuffer });
-      const rawText = (raw?.value || '').trim();
-      if (!rawText) {
-        return {
-          status: 'empty',
-          success: false,
-          text: '',
-          warning: 'This Word document contains no readable text content.'
-        };
+      try {
+        const raw = await mammoth.extractRawText({ arrayBuffer });
+        markdown = (raw?.value || '').trim();
+      } catch (_) {}
+    }
+
+    // Inspect docx package via JSZip for text boxes (DrawingML / VML) that Mammoth does not capture
+    let textBoxes = [];
+    try {
+      const jszipModule = await import('jszip');
+      const JSZip = jszipModule.default || jszipModule;
+      const zip = await JSZip.loadAsync(arrayBuffer);
+      const docXmlFiles = Object.keys(zip.files).filter((fname) =>
+        /^word\/(?:document|header\d+|footer\d+)\.xml$/.test(fname)
+      );
+      for (const xmlPath of docXmlFiles) {
+        const xml = await zip.files[xmlPath].async('text');
+        const extractedBoxes = extractDocxTextBoxes(xml);
+        for (const box of extractedBoxes) {
+          if (box && !markdown.includes(box) && !textBoxes.includes(box)) {
+            textBoxes.push(box);
+          }
+        }
       }
+    } catch (_) {}
+
+    let combinedText = markdown;
+    if (textBoxes.length > 0) {
+      const calloutText = textBoxes.map((b, i) => `### Text Box ${i + 1}\n${b}`).join('\n\n');
+      combinedText = combinedText ? `${combinedText}\n\n${calloutText}` : calloutText;
+    }
+
+    combinedText = combinedText.trim();
+    if (!combinedText) {
       return {
-        status: 'ready',
-        success: true,
-        text: rawText,
-        sections: [{ heading: 'Content', level: 1, content: rawText, charCount: rawText.length }],
-        sectionCount: 1
+        status: 'empty',
+        success: false,
+        text: '',
+        warning: 'This Word document contains no readable text content.'
       };
     }
 
-    const sections = extractSectionsFromMarkdown(markdown);
+    const sections = extractSectionsFromMarkdown(combinedText);
 
     return {
       status: 'ready',
       success: true,
-      text: markdown,
+      text: combinedText,
       sections,
       sectionCount: sections.length
     };
@@ -409,8 +598,65 @@ async function extractDocxDocument(arrayBuffer) {
 }
 
 /**
+ * Formats a PPTX DrawingML table (<a:tbl>) into a readable Markdown table
+ * @param {string} tblXml
+ * @returns {string}
+ */
+function extractTableFromPptxXml(tblXml) {
+  const rows = [];
+  const trRegex = /<a:tr\b[^>]*>([\s\S]*?)<\/a:tr>/gi;
+  let trMatch;
+  while ((trMatch = trRegex.exec(tblXml)) !== null) {
+    const trContent = trMatch[1];
+    const tcRegex = /<a:tc\b[^>]*>([\s\S]*?)<\/a:tc>/gi;
+    let tcMatch;
+    const cells = [];
+    while ((tcMatch = tcRegex.exec(trContent)) !== null) {
+      const tcContent = tcMatch[1];
+      const tRegex = /<a:t\b[^>]*>([\s\S]*?)<\/a:t>/gi;
+      let tMatch;
+      const cellTokens = [];
+      while ((tMatch = tRegex.exec(tcContent)) !== null) {
+        cellTokens.push(tMatch[1]);
+      }
+      cells.push(decodeXmlEntities(cellTokens.join('')).trim());
+    }
+    if (cells.length > 0 && cells.some((c) => c.length > 0)) {
+      rows.push(cells);
+    }
+  }
+
+  if (rows.length === 0) return '';
+
+  const maxCols = Math.max(...rows.map((r) => r.length));
+  const colWidths = new Array(maxCols).fill(3);
+  for (const r of rows) {
+    for (let c = 0; c < maxCols; c++) {
+      const val = (r[c] || '').replace(/[\r\n]+/g, ' ');
+      colWidths[c] = Math.max(colWidths[c], Math.min(val.length, 40));
+    }
+  }
+
+  const header = rows[0];
+  const dataRows = rows.slice(1);
+  const headerLine = '| ' + Array.from({ length: maxCols }, (_, i) => {
+    return ((header[i] || `Col ${i + 1}`).replace(/[\r\n]+/g, ' ')).padEnd(colWidths[i] || 3);
+  }).join(' | ') + ' |';
+
+  const dividerLine = '| ' + colWidths.map((w) => '-'.repeat(w)).join(' | ') + ' |';
+
+  const rowLines = dataRows.map((r) => {
+    return '| ' + Array.from({ length: maxCols }, (_, i) => {
+      return ((r[i] || '').replace(/[\r\n]+/g, ' ')).padEnd(colWidths[i] || 3);
+    }).join(' | ') + ' |';
+  });
+
+  return [headerLine, dividerLine, ...rowLines].join('\n');
+}
+
+/**
  * Browser-side PPTX extraction using lazy-loaded jszip
- * Extracts slide-by-slide text and speaker notes in natural numerical order.
+ * Extracts slide-by-slide text, tables (p:graphicFrame), grouped shapes, and speaker notes
  * @param {ArrayBuffer} arrayBuffer
  */
 async function extractPptxDocument(arrayBuffer) {
@@ -451,45 +697,48 @@ async function extractPptxDocument(arrayBuffer) {
 
       let slideTitle = undefined;
       const paragraphs = [];
+      const tableTexts = [];
 
-      // Detect slide title shape first
+      // 1. Extract slide tables from <p:graphicFrame> / <a:tbl>
+      const tblRegex = /<a:tbl\b[^>]*>([\s\S]*?)<\/a:tbl>/gi;
+      let tblMatch;
+      while ((tblMatch = tblRegex.exec(slideXml)) !== null) {
+        const mdTable = extractTableFromPptxXml(tblMatch[1]);
+        if (mdTable) {
+          tableTexts.push(mdTable);
+        }
+      }
+
+      // 2. Extract slide title and text from all shapes (standalone & in grouped <p:grpSp>)
       const spRegex = /<p:sp\b[^>]*>([\s\S]*?)<\/p:sp>/gi;
       let spMatch;
       while ((spMatch = spRegex.exec(slideXml)) !== null) {
         const spXml = spMatch[1];
         const isTitleShape = /<p:ph\b[^>]*\btype=["'](?:title|ctrTitle)["']/i.test(spXml);
-        if (isTitleShape && !slideTitle) {
+
+        const pRegex = /<a:p\b[^>]*>([\s\S]*?)<\/a:p>/gi;
+        let pMatch;
+        while ((pMatch = pRegex.exec(spXml)) !== null) {
+          const pXml = pMatch[1];
           const tRegex = /<a:t\b[^>]*>([\s\S]*?)<\/a:t>/gi;
-          const titleTokens = [];
+          const textTokens = [];
           let tMatch;
-          while ((tMatch = tRegex.exec(spXml)) !== null) {
-            titleTokens.push(tMatch[1]);
+          while ((tMatch = tRegex.exec(pXml)) !== null) {
+            textTokens.push(tMatch[1]);
           }
-          const candidateTitle = titleTokens.join('').trim();
-          if (candidateTitle) {
-            slideTitle = candidateTitle;
+          const candidate = decodeXmlEntities(textTokens.join('')).trim();
+          if (candidate) {
+            if (isTitleShape && !slideTitle) {
+              slideTitle = candidate;
+            }
+            if (!isTitleShape || paragraphs.length > 0) {
+              paragraphs.push(candidate);
+            }
           }
         }
       }
 
-      // Extract all paragraphs across standard shapes, tables, group shapes, and text frames
-      const pRegex = /<a:p\b[^>]*>([\s\S]*?)<\/a:p>/gi;
-      let pMatch;
-      while ((pMatch = pRegex.exec(slideXml)) !== null) {
-        const pXml = pMatch[1];
-        const tRegex = /<a:t\b[^>]*>([\s\S]*?)<\/a:t>/gi;
-        const textTokens = [];
-        let tMatch;
-        while ((tMatch = tRegex.exec(pXml)) !== null) {
-          textTokens.push(tMatch[1]);
-        }
-        const paragraphText = textTokens.join('').trim();
-        if (paragraphText) {
-          paragraphs.push(paragraphText);
-        }
-      }
-
-      // Check corresponding speaker notes slide
+      // 3. Check corresponding speaker notes slide
       let notesText = undefined;
       const notesPath = `ppt/notesSlides/notesSlide${slideNum}.xml`;
       if (zip.files[notesPath]) {
@@ -499,7 +748,7 @@ async function extractPptxDocument(arrayBuffer) {
           const tRegex = /<a:t\b[^>]*>([\s\S]*?)<\/a:t>/gi;
           let tMatch;
           while ((tMatch = tRegex.exec(notesXml)) !== null) {
-            const token = tMatch[1].trim();
+            const token = decodeXmlEntities(tMatch[1]).trim();
             if (token && !token.startsWith('Slide ') && !/^\d+$/.test(token)) {
               noteParagraphs.push(token);
             }
@@ -510,7 +759,15 @@ async function extractPptxDocument(arrayBuffer) {
         } catch (_) {}
       }
 
-      const slideBody = paragraphs.join('\n');
+      const bodyElements = [];
+      if (paragraphs.length > 0) {
+        bodyElements.push(paragraphs.join('\n'));
+      }
+      if (tableTexts.length > 0) {
+        bodyElements.push(tableTexts.join('\n\n'));
+      }
+
+      const slideBody = bodyElements.join('\n\n');
       slides.push({
         slideNumber: slideNum,
         title: slideTitle,
@@ -568,7 +825,7 @@ export function isBrowserExtractable(extension = '', mimeType = '') {
   const ext = (extension || '').replace(/^\./, '').toLowerCase();
   const mime = (mimeType || '').toLowerCase();
 
-  const supportedExts = ['txt', 'md', 'markdown', 'csv', 'tsv', 'json', 'xml', 'docx', 'pdf', 'pptx'];
+  const supportedExts = ['txt', 'log', 'md', 'markdown', 'csv', 'tsv', 'json', 'xml', 'docx', 'pdf', 'pptx'];
   if (supportedExts.includes(ext)) return true;
 
   if (
@@ -576,6 +833,7 @@ export function isBrowserExtractable(extension = '', mimeType = '') {
     mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
     mime === 'application/vnd.openxmlformats-officedocument.presentationml.presentation' ||
     mime === 'text/plain' ||
+    mime === 'text/x-log' ||
     mime === 'text/markdown' ||
     mime === 'text/csv' ||
     mime === 'text/tab-separated-values' ||
@@ -772,6 +1030,7 @@ export async function extractBrowserDocument(file, metadata = {}) {
 
       case '.txt':
       case '.text':
+      case '.log':
       case '.md':
       case '.markdown': {
         const text = await file.text();

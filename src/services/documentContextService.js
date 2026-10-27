@@ -398,10 +398,39 @@ export function prepareDocumentContext(prompt, docs, options = {}) {
       continue;
     }
 
-    // Check for extraction failure or non-readable content
+    // 1. Check for scanned document with NO readable text detected by OCR
+    if (doc.status === 'NO_TEXT_DETECTED') {
+      const issueExplanation =
+        doc.message ||
+        doc.warning ||
+        `No readable text detected in '${docName}'. This document was scanned or contains images, but OCR detected no readable text.`;
+      unreadableDocNotes.push(issueExplanation);
+      if (selectedDocs.length === 1) {
+        directAnswer = issueExplanation;
+      }
+      docBlocks.push(`[DOCUMENT ${docIdx + 1}: "${docName}" (${format}) - STATUS: NO TEXT DETECTED]\n${issueExplanation}`);
+      continue;
+    }
+
+    // 2. Check for OCR engine failure or unsupported rendering
+    if (doc.status === 'ocr_failed' || doc.status === 'unsupported_rendering') {
+      const issueExplanation =
+        doc.error ||
+        doc.warning ||
+        `Optical Character Recognition (OCR) failed on '${docName}'.`;
+      unreadableDocNotes.push(issueExplanation);
+      if (selectedDocs.length === 1) {
+        directAnswer = issueExplanation;
+      }
+      const label = doc.status === 'ocr_failed' ? 'OCR FAILED' : 'UNSUPPORTED RENDERING';
+      docBlocks.push(`[DOCUMENT ${docIdx + 1}: "${docName}" (${format}) - STATUS: ${label}]\n${issueExplanation}`);
+      continue;
+    }
+
+    // 3. Check for unhandled scanned / image-only PDFs without extracted text
     if (
       doc.status === 'scanned_or_image_only' ||
-      doc.isScanned ||
+      (doc.isScanned && (!doc.success || !doc.text || (doc.totalCharacters === 0 && !doc.hasText))) ||
       (doc.totalCharacters === 0 && !doc.success && doc.status !== 'empty' && doc.status !== 'encrypted' && doc.status !== 'error')
     ) {
       const issueExplanation =
@@ -546,11 +575,17 @@ export function prepareDocumentContext(prompt, docs, options = {}) {
 
     // Case 3: Whole File or General Document Query
     let docBody = '';
+    const charCount = doc.totalCharacters || (doc.text ? doc.text.length : 0);
+    const wordCount = doc.totalWords || countWordsInString(doc.text);
+    const scannedBadge = doc.isScanned ? ' | Type: Scanned PDF (OCR Extracted Text)' : '';
+    const ocrBadge = doc.ocrEngine ? ` | OCR Engine: ${doc.ocrEngine}` : '';
+    const noticeBadge = doc.warning ? `\n[Notice: ${doc.warning}]` : '';
     const metaHeader = `=== DOCUMENT ${docIdx + 1} of ${selectedDocs.length}: "${docName}" ===\n` +
-      `Format: ${format} | Total Characters: ${doc.totalCharacters.toLocaleString()} | Words: ${doc.totalWords.toLocaleString()}` +
+      `Format: ${format}${scannedBadge}${ocrBadge} | Total Characters: ${charCount.toLocaleString()} | Words: ${wordCount.toLocaleString()}` +
       (doc.pageCount ? ` | Pages: ${doc.pageCount}` : '') +
       (doc.slideCount ? ` | Slides: ${doc.slideCount}` : '') +
       (doc.sectionCount ? ` | Sections: ${doc.sectionCount}` : '') +
+      noticeBadge +
       '\n';
 
     // Check size limit: If document exceeds MAX_PROMPT_CHARS_PER_DOC, implement safe bounded chunking / retrieval

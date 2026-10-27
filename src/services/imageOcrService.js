@@ -396,6 +396,87 @@ export function validateImageBuffer(buffer, ext = '') {
 }
 
 /**
+ * Converts raw pixel data (RGB, RGBA, or Grayscale) into a valid 24-bit uncompressed BMP Buffer.
+ * Fully compatible with Tesseract.js, Leptonica, and validateImageBuffer.
+ *
+ * @param {number} width - Image width in pixels
+ * @param {number} height - Image height in pixels
+ * @param {number} channels - Number of color channels (1 = grayscale, 3 = RGB, 4 = RGBA)
+ * @param {Uint8Array|Uint8ClampedArray|Buffer} data - Raw pixel bytes
+ * @returns {Buffer|null} 24-bit BMP Buffer or null if parameters are invalid
+ */
+export function rawImageDataToBmp(width, height, channels, data) {
+  if (!width || !height || !data || width <= 0 || height <= 0 || data.length === 0) {
+    return null;
+  }
+
+  const validChannels = [1, 3, 4].includes(channels) ? channels : Math.round(data.length / (width * height));
+  if (![1, 3, 4].includes(validChannels)) {
+    return null;
+  }
+
+  // Each row in 24-bit BMP must be aligned to a 4-byte boundary
+  const rowSize = Math.floor((24 * width + 31) / 32) * 4;
+  const pixelArraySize = rowSize * height;
+  const fileSize = 54 + pixelArraySize;
+  const buf = Buffer.alloc(fileSize);
+
+  // 1. BMP File Header (14 bytes)
+  buf.write('BM', 0); // 'BM' signature
+  buf.writeUInt32LE(fileSize, 2); // File size
+  buf.writeUInt16LE(0, 6); // Reserved 1
+  buf.writeUInt16LE(0, 8); // Reserved 2
+  buf.writeUInt32LE(54, 10); // Offset to pixel array
+
+  // 2. DIB Header (BITMAPINFOHEADER - 40 bytes)
+  buf.writeUInt32LE(40, 14); // Header size
+  buf.writeInt32LE(width, 18); // Image width
+  buf.writeInt32LE(height, 22); // Image height (positive = bottom-up)
+  buf.writeUInt16LE(1, 26); // Color planes
+  buf.writeUInt16LE(24, 28); // Bits per pixel (24-bit RGB)
+  buf.writeUInt32LE(0, 30); // Compression (0 = BI_RGB uncompressed)
+  buf.writeUInt32LE(pixelArraySize, 34); // Image size
+  buf.writeInt32LE(2835, 38); // Horizontal resolution (~72 DPI)
+  buf.writeInt32LE(2835, 42); // Vertical resolution (~72 DPI)
+  buf.writeUInt32LE(0, 46); // Colors in palette
+  buf.writeUInt32LE(0, 50); // Important colors
+
+  // 3. Pixel Array (Bottom-up BGR scanlines)
+  for (let y = 0; y < height; y++) {
+    const srcY = height - 1 - y; // Bottom-up row mapping
+    const destRowOffset = 54 + y * rowSize;
+
+    for (let x = 0; x < width; x++) {
+      const srcIdx = (srcY * width + x) * validChannels;
+      let r, g, b;
+
+      if (validChannels === 1) {
+        r = g = b = data[srcIdx];
+      } else if (validChannels === 3) {
+        r = data[srcIdx];
+        g = data[srcIdx + 1];
+        b = data[srcIdx + 2];
+      } else if (validChannels === 4) {
+        const a = (data[srcIdx + 3] ?? 255) / 255;
+        // Alpha blend over white background (ideal for document text OCR)
+        r = Math.round(data[srcIdx] * a + 255 * (1 - a));
+        g = Math.round(data[srcIdx + 1] * a + 255 * (1 - a));
+        b = Math.round(data[srcIdx + 2] * a + 255 * (1 - a));
+      } else {
+        r = g = b = data[srcIdx] || 0;
+      }
+
+      const destIdx = destRowOffset + x * 3;
+      buf[destIdx] = b; // Blue
+      buf[destIdx + 1] = g; // Green
+      buf[destIdx + 2] = r; // Red
+    }
+  }
+
+  return buf;
+}
+
+/**
  * Normalizes raw OCR text:
  * - Unifies newline variations (\r\n -> \n)
  * - Converts form-feed (\f) to paragraph breaks

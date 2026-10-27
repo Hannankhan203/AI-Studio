@@ -7,6 +7,9 @@
 import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
+import zlib from 'node:zlib';
+import { PDFDocument } from 'pdf-lib';
+import { extractDocumentContent } from '../src/services/documentExtractor.js';
 
 import {
   isBrowserExtractable,
@@ -45,11 +48,14 @@ import {
   PROVIDER_PROFILES
 } from '../src/services/documentContextService.js';
 
+import JSZip from 'jszip';
 import {
   validateImageBuffer,
   normalizeOcrText,
   detectReadableText,
-  extractImageText
+  extractImageText,
+  rawImageDataToBmp,
+  discardOcrWorker
 } from '../src/services/imageOcrService.js';
 
 console.log('--- Starting Orvix Offline Reliability Audit ---');
@@ -83,7 +89,7 @@ function test(name, fn) {
 // 1. Document Format Support Decisions
 // ----------------------------------------------------------------------------
 test('isBrowserExtractable accurately identifies supported browser document formats', () => {
-  const supported = ['txt', 'md', 'markdown', 'csv', 'tsv', 'json', 'xml', 'docx', 'pdf', 'pptx'];
+  const supported = ['txt', 'log', 'md', 'markdown', 'csv', 'tsv', 'json', 'xml', 'docx', 'pdf', 'pptx'];
   for (const ext of supported) {
     assert.strictEqual(isBrowserExtractable(ext), true, `Extension .${ext} should be extractable in browser`);
     assert.strictEqual(isBrowserExtractable(`.${ext}`), true, `Extension with dot .${ext} should be extractable`);
@@ -782,6 +788,360 @@ test('Phase 2B Test 7: Readable extracted text with punctuation and numbers is d
   assert.strictEqual(groqContext.directAnswer, undefined);
   assert.ok(groqContext.formattedContext.includes('Invoice #10492'));
   assert.ok(groqContext.formattedContext.includes('Total: $450.00'));
+});
+
+// ----------------------------------------------------------------------------
+// 8. Phase 2C: Scanned PDF Processing & OCR Reliability Tests
+// ----------------------------------------------------------------------------
+
+// Deterministic test fixtures helpers for real PDF creation with embedded images
+const CRC_TABLE = (() => {
+  const table = new Int32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) {
+      c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    table[i] = c;
+  }
+  return table;
+})();
+
+function computeCrc32(buf) {
+  let c = -1;
+  for (let i = 0; i < buf.length; i++) {
+    c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  }
+  return (c ^ -1) | 0;
+}
+
+function createPngChunk(type, data) {
+  const len = data.length;
+  const chunk = Buffer.alloc(12 + len);
+  chunk.writeUInt32BE(len, 0);
+  chunk.write(type, 4);
+  data.copy(chunk, 8);
+  const typeAndData = Buffer.concat([Buffer.from(type), data]);
+  chunk.writeInt32BE(computeCrc32(typeAndData), 8 + len);
+  return chunk;
+}
+
+function createDeterministicPng(width, height, rgbData) {
+  const scanlineLength = 1 + width * 3;
+  const rawData = Buffer.alloc(scanlineLength * height);
+  for (let y = 0; y < height; y++) {
+    const rawOffset = y * scanlineLength;
+    rawData[rawOffset] = 0;
+    const srcOffset = y * width * 3;
+    rgbData.copy(rawData, rawOffset + 1, srcOffset, srcOffset + width * 3);
+  }
+  const compressed = zlib.deflateSync(rawData);
+  const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 2; // RGB
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+  return Buffer.concat([sig, createPngChunk('IHDR', ihdr), createPngChunk('IDAT', compressed), createPngChunk('IEND', Buffer.alloc(0))]);
+}
+
+function drawDeterministicTextBitmap(width, height, text) {
+  const font5x7 = {
+    ' ': [0, 0, 0, 0, 0],
+    'A': [0x7c, 0x12, 0x11, 0x12, 0x7c],
+    'B': [0x7f, 0x49, 0x49, 0x49, 0x36],
+    'C': [0x3e, 0x41, 0x41, 0x41, 0x22],
+    'D': [0x7f, 0x41, 0x41, 0x22, 0x1c],
+    'E': [0x7f, 0x49, 0x49, 0x49, 0x41],
+    'H': [0x7f, 0x08, 0x08, 0x08, 0x7f],
+    'L': [0x7f, 0x40, 0x40, 0x40, 0x40],
+    'O': [0x3e, 0x41, 0x41, 0x41, 0x3e],
+    'R': [0x7f, 0x09, 0x19, 0x29, 0x46],
+    'S': [0x46, 0x49, 0x49, 0x49, 0x31],
+    'T': [0x01, 0x01, 0x7f, 0x01, 0x01],
+    'W': [0x3f, 0x40, 0x38, 0x40, 0x3f],
+    '0': [0x3e, 0x51, 0x49, 0x45, 0x3e],
+    '1': [0x00, 0x42, 0x7f, 0x40, 0x00],
+    '2': [0x42, 0x61, 0x51, 0x49, 0x46]
+  };
+
+  const scale = 5;
+  const pixels = Buffer.alloc(width * height * 3, 255);
+  let cursorX = 30;
+  const cursorY = 25;
+
+  for (const char of text.toUpperCase()) {
+    const glyph = font5x7[char] || font5x7[' '];
+    for (let col = 0; col < 5; col++) {
+      const colBits = glyph[col];
+      for (let row = 0; row < 7; row++) {
+        if ((colBits & (1 << row)) !== 0) {
+          for (let dy = 0; dy < scale; dy++) {
+            for (let dx = 0; dx < scale; dx++) {
+              const px = cursorX + col * scale + dx;
+              const py = cursorY + row * scale + dy;
+              if (px < width && py < height) {
+                const idx = (py * width + px) * 3;
+                pixels[idx] = 0;
+                pixels[idx + 1] = 0;
+                pixels[idx + 2] = 0;
+              }
+            }
+          }
+        }
+      }
+    }
+    cursorX += (5 + 2) * scale;
+  }
+  return pixels;
+}
+
+await test('Phase 2C Test 1: A text-based PDF uses native extraction without unnecessary OCR', async () => {
+  // Create a real text-based PDF using pdf-lib
+  const pdfDoc = await PDFDocument.create();
+  const page = pdfDoc.addPage([400, 300]);
+  page.drawText('This is a native digital PDF document containing plain selectable text.', {
+    x: 20,
+    y: 250,
+    size: 14
+  });
+  const pdfBytes = Buffer.from(await pdfDoc.save());
+
+  const result = await extractDocumentContent(pdfBytes, 'text_doc.pdf', '.pdf', 'application/pdf', 'test-pdf-native');
+  assert.strictEqual(result.status, 'ready');
+  assert.strictEqual(result.success, true);
+  assert.strictEqual(result.isScanned, false, 'Must not be flagged as scanned');
+  assert.ok(result.totalCharacters >= 40, 'Must extract native text characters');
+  assert.ok(result.text.includes('native digital PDF'), 'Must contain native extracted text');
+  assert.strictEqual(result.ocrEngine, undefined, 'Must not invoke OCR for text-based PDFs');
+
+  // Verify prepareDocumentContext accepts native PDF without rejection
+  const prep = prepareDocumentContext('Summarize this document', [result], { provider: 'gemini' });
+  assert.strictEqual(prep.directAnswer, undefined);
+  assert.ok(prep.formattedContext.includes('native digital PDF'));
+});
+
+await test('Phase 2C Test 2: A scanned PDF with readable text successfully produces OCR text', async () => {
+  // Create a real scanned PDF fixture: PDF containing an embedded raster image with readable text
+  const w = 480;
+  const h = 90;
+  const rgb = drawDeterministicTextBitmap(w, h, 'HELLO WORLD');
+  const png = createDeterministicPng(w, h, rgb);
+
+  const pdfDoc = await PDFDocument.create();
+  const page = pdfDoc.addPage([500, 200]);
+  const img = await pdfDoc.embedPng(png);
+  page.drawImage(img, { x: 10, y: 50, width: 480, height: 90 });
+  const pdfBytes = Buffer.from(await pdfDoc.save());
+
+  // Run extraction using local OCR (offline mode)
+  const result = await extractDocumentContent(
+    pdfBytes,
+    'scanned_contract.pdf',
+    '.pdf',
+    'application/pdf',
+    'test-pdf-scanned-real',
+    { offline: true }
+  );
+
+  assert.strictEqual(result.status, 'ready', 'Must successfully return status ready');
+  assert.strictEqual(result.success, true, 'Must return success true');
+  assert.strictEqual(result.isScanned, true, 'Must correctly identify as scanned PDF');
+  assert.strictEqual(result.hasText, true, 'hasText must be true');
+  assert.ok(result.totalCharacters > 0, 'Must contain positive extracted character count');
+  assert.ok(result.text.includes('HELLO') || result.text.includes('WORLD'), 'Extracted text must contain OCR words');
+  assert.strictEqual(result.ocrEngine, 'tesseract-local', 'Must record tesseract-local OCR engine');
+  assert.strictEqual(result.pages.length, 1, 'Must have page entry for page 1');
+  assert.ok(result.pages[0].text.length > 0, 'Page 1 must contain extracted text');
+
+  // Verify prepareDocumentContext passes extracted OCR text to model without premature rejection
+  const prep = prepareDocumentContext('What text is in this scanned contract?', [result], { provider: 'groq' });
+  assert.strictEqual(prep.directAnswer, undefined, 'Must not reject scanned PDF when OCR extracted text');
+  assert.ok(prep.formattedContext.includes('Type: Scanned PDF (OCR Extracted Text)'));
+  assert.ok(prep.formattedContext.includes(result.pages[0].text));
+});
+
+await test('Phase 2C Test 3: A scanned PDF with no readable text returns the correct no-text result', async () => {
+  // Create a real PDF containing a blank raster image (no text)
+  const w = 120;
+  const h = 60;
+  const blankRgb = Buffer.alloc(w * h * 3, 255); // pure white
+  const png = createDeterministicPng(w, h, blankRgb);
+
+  const pdfDoc = await PDFDocument.create();
+  const page = pdfDoc.addPage([200, 200]);
+  const img = await pdfDoc.embedPng(png);
+  page.drawImage(img, { x: 10, y: 10, width: 120, height: 60 });
+  const pdfBytes = Buffer.from(await pdfDoc.save());
+
+  const result = await extractDocumentContent(
+    pdfBytes,
+    'blank_scan.pdf',
+    '.pdf',
+    'application/pdf',
+    'test-pdf-blank',
+    { offline: true }
+  );
+
+  assert.strictEqual(result.status, 'NO_TEXT_DETECTED', 'Must return NO_TEXT_DETECTED');
+  assert.strictEqual(result.success, true);
+  assert.strictEqual(result.isScanned, true);
+  assert.strictEqual(result.hasText, false);
+  assert.strictEqual(result.text, '');
+  assert.strictEqual(result.totalCharacters, 0);
+  assert.ok(result.message.includes('No readable text detected in this scanned PDF.'));
+
+  // Verify prepareDocumentContext handles NO_TEXT_DETECTED with clear explanation
+  const prep = prepareDocumentContext('Summarize this document', [result], { provider: 'groq' });
+  assert.ok(prep.directAnswer, 'Must provide directAnswer explaining no text was detected');
+  assert.ok(prep.directAnswer.includes('No readable text detected'));
+});
+
+test('Phase 2C Test 4: OCR and rendering failures are accurately distinguished from successful no-text detection', () => {
+  // OCR failure doc fixture
+  const ocrFailedDoc = {
+    fileId: 'ocr-failed-1',
+    originalName: 'damaged_scan.pdf',
+    filename: 'damaged_scan.pdf',
+    format: 'PDF',
+    status: 'ocr_failed',
+    success: false,
+    isScanned: true,
+    hasText: false,
+    text: '',
+    error: 'Optical Character Recognition (OCR) failed on this scanned PDF: Local OCR recognition timed out (60s limit).',
+    totalCharacters: 0,
+    totalWords: 0
+  };
+
+  const prepFailed = prepareDocumentContext('What is in damaged_scan.pdf?', [ocrFailedDoc], { provider: 'groq' });
+  assert.ok(prepFailed.directAnswer.includes('Optical Character Recognition (OCR) failed'));
+  assert.ok(prepFailed.formattedContext.includes('STATUS: OCR FAILED'));
+
+  // Unsupported rendering doc fixture (e.g. vector rasterization without extractable image streams)
+  const unsuppDoc = {
+    fileId: 'unsupp-1',
+    originalName: 'vector_scan.pdf',
+    filename: 'vector_scan.pdf',
+    format: 'PDF',
+    status: 'unsupported_rendering',
+    success: false,
+    isScanned: true,
+    hasText: false,
+    text: '',
+    error: 'No readable text layer was found, and page images could not be extracted for OCR processing.',
+    totalCharacters: 0,
+    totalWords: 0
+  };
+
+  const prepUnsupp = prepareDocumentContext('What is in vector_scan.pdf?', [unsuppDoc], { provider: 'groq' });
+  assert.ok(prepUnsupp.directAnswer.includes('No readable text layer was found'));
+  assert.ok(prepUnsupp.formattedContext.includes('STATUS: UNSUPPORTED RENDERING'));
+});
+
+await test('Phase 2C Test 5: Invalid and encrypted PDFs preserve appropriate error handling', async () => {
+  // Corrupted / malformed PDF bytes
+  const corruptPdf = Buffer.from('NOT A PDF FILE DATA - JUST CORRUPTED GARBAGE');
+  const corruptResult = await extractDocumentContent(corruptPdf, 'broken.pdf', '.pdf', 'application/pdf', 'corrupt-1');
+  assert.strictEqual(corruptResult.status, 'corrupted');
+  assert.strictEqual(corruptResult.success, false);
+  assert.ok(corruptResult.error.includes('Failed to parse PDF document'));
+
+  // Encrypted PDF fixture
+  const encDoc = {
+    fileId: 'enc-pdf-1',
+    originalName: 'payroll_protected.pdf',
+    filename: 'payroll_protected.pdf',
+    format: 'PDF',
+    status: 'encrypted',
+    success: false,
+    hasText: false,
+    text: '',
+    error: 'This PDF document is encrypted or password-protected and cannot be read without a password.',
+    totalCharacters: 0,
+    totalWords: 0
+  };
+
+  const prepEnc = prepareDocumentContext('Read payroll', [encDoc], { provider: 'gemini' });
+  assert.ok(prepEnc.directAnswer.includes('is encrypted or password-protected'));
+  assert.ok(prepEnc.formattedContext.includes('STATUS: ENCRYPTED'));
+});
+
+test('Phase 2C Test 6: Scanned PDF page-range limits and page query boundaries remain enforced', () => {
+  // Multi-page scanned PDF with OCR extracted text on each page
+  const multiPageScannedDoc = {
+    fileId: 'scanned-multi-1',
+    originalName: 'financial_records_scanned.pdf',
+    filename: 'financial_records_scanned.pdf',
+    format: 'PDF',
+    status: 'ready',
+    success: true,
+    isScanned: true,
+    hasText: true,
+    pageCount: 3,
+    pages: [
+      { pageNumber: 1, text: 'Q1 Revenue: $1,250,000\nOperating Expenses: $820,000', charCount: 48 },
+      { pageNumber: 2, text: 'Q2 Revenue: $1,410,000\nOperating Expenses: $890,000', charCount: 48 },
+      { pageNumber: 3, text: 'Q3 Revenue: $1,650,000\nOperating Expenses: $940,000', charCount: 48 }
+    ],
+    text: '--- Page 1 ---\nQ1 Revenue: $1,250,000\n\n--- Page 2 ---\nQ2 Revenue: $1,410,000\n\n--- Page 3 ---\nQ3 Revenue: $1,650,000',
+    totalCharacters: 120,
+    totalWords: 15,
+    ocrEngine: 'tesseract-local'
+  };
+
+  // Valid page query: "What is on page 2?"
+  const page2Prep = prepareDocumentContext('What is on page 2?', [multiPageScannedDoc], { provider: 'groq' });
+  assert.strictEqual(page2Prep.directAnswer, undefined);
+  assert.ok(page2Prep.formattedContext.includes('Q2 Revenue: $1,410,000'));
+  assert.ok(!page2Prep.formattedContext.includes('Q1 Revenue'));
+
+  // Out of bounds page query: "What is on page 99?"
+  const page99Prep = prepareDocumentContext('What is on page 99?', [multiPageScannedDoc], { provider: 'groq' });
+  assert.ok(page99Prep.directAnswer.includes('Requested page 99 does not exist in this document.'));
+
+  // Page range query: "Explain pages 1 to 2"
+  const rangePrep = prepareDocumentContext('Explain pages 1 to 2', [multiPageScannedDoc], { provider: 'groq' });
+  assert.strictEqual(rangePrep.directAnswer, undefined);
+  assert.ok(rangePrep.formattedContext.includes('Q1 Revenue'));
+  assert.ok(rangePrep.formattedContext.includes('Q2 Revenue'));
+});
+
+test('Phase 2C Test 7: Phase 2A/2B image OCR behavior and rawImageDataToBmp conversion remain unchanged', () => {
+  // Test rawImageDataToBmp produces valid BMP format recognized by validateImageBuffer
+  const testPixels = new Uint8Array([255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]); // 2x2 RGB
+  const bmpBuf = rawImageDataToBmp(2, 2, 3, testPixels);
+  assert.ok(Buffer.isBuffer(bmpBuf), 'Must return a Buffer');
+  const validation = validateImageBuffer(bmpBuf);
+  assert.strictEqual(validation.valid, true, 'validateImageBuffer must validate rawImageDataToBmp output');
+  assert.strictEqual(validation.format, 'BMP');
+
+  // Verify Phase 2A/2B plain image behavior remains intact
+  const pngDoc = {
+    fileId: 'img-1',
+    originalName: 'photo.jpg',
+    format: 'JPG',
+    status: 'NO_TEXT_DETECTED',
+    success: true,
+    isImage: true,
+    hasText: false,
+    text: '',
+    totalCharacters: 0,
+    totalWords: 0
+  };
+
+  // Gemini vision allows visual analysis
+  const geminiPrep = prepareDocumentContext('What is in photo.jpg?', [pngDoc], { provider: 'gemini' });
+  assert.strictEqual(geminiPrep.isVision, true);
+  assert.strictEqual(geminiPrep.directAnswer, undefined);
+
+  // Text-only provider receives no-text notice
+  const groqPrep = prepareDocumentContext('What is in photo.jpg?', [pngDoc], { provider: 'groq' });
+  assert.strictEqual(groqPrep.isVision, false);
+  assert.strictEqual(groqPrep.directAnswer, 'No readable text detected in this image.');
 });
 
 console.log(`\nAll ${passedTests} offline reliability tests passed successfully!`);

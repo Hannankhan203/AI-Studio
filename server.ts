@@ -1132,6 +1132,7 @@ const ALLOWED_EXTENSIONS_MAP: Record<string, string[]> = {
   ],
   '.xls': ['application/vnd.ms-excel', 'application/octet-stream'],
   '.txt': ['text/plain', 'application/octet-stream'],
+  '.log': ['text/plain', 'text/x-log', 'application/octet-stream'],
   '.md': ['text/markdown', 'text/plain', 'text/x-markdown', 'application/octet-stream'],
   '.markdown': ['text/markdown', 'text/plain', 'application/octet-stream'],
   '.csv': ['text/csv', 'text/plain', 'application/csv', 'application/vnd.ms-excel', 'application/octet-stream'],
@@ -1313,7 +1314,7 @@ async function verifyFileSignature(
     }
 
     // Text formats: disallow null bytes \0 to prevent disguised binary files
-    if (['.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.xml'].includes(ext)) {
+    if (['.txt', '.log', '.md', '.markdown', '.csv', '.tsv', '.json', '.xml'].includes(ext)) {
       for (let i = 0; i < buffer.length; i++) {
         if (buffer[i] === 0x00) {
           return { valid: false, reason: 'Text file contains unexpected null binary bytes.' };
@@ -1914,15 +1915,18 @@ app.post(['/api/upload', '/upload'], (req, res) => {
           rec.extraction = imgExtraction;
           rec.status = imgExtraction?.status === 'error' ? 'error' : 'ready';
         } else {
+          const isOfflineUpload = String(req.body?.offline || '').toLowerCase() === 'true';
+          const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || null;
           const extraction = (await extractDocumentContent(
             inputSource,
             rec.originalName,
             ext,
             rec.mimeType,
-            rec.id
+            rec.id,
+            { offline: isOfflineUpload, apiKey: geminiKey }
           )) as DocumentExtractionResult;
           rec.extraction = extraction;
-          rec.status = extraction.success || extraction.status === 'scanned_or_image_only' ? 'ready' : 'uploaded';
+          rec.status = extraction.success || extraction.status === 'scanned_or_image_only' || extraction.status === 'NO_TEXT_DETECTED' ? 'ready' : 'uploaded';
         }
       } catch (err: any) {
         console.warn(`[Document Extraction] Extraction error for ${rec.originalName}:`, err);
@@ -2599,11 +2603,12 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
             const fullDiskPath = path.join(UPLOAD_DIR, record.diskFilename);
             const inputSource = record.buffer || (fs.existsSync(fullDiskPath) ? fullDiskPath : null);
             if (inputSource) {
+              const isOfflineChat =
+                Boolean(req.body?.offline) ||
+                String(req.body?.provider || '').toLowerCase() === 'ollama';
+              const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || null;
+
               if (isImg) {
-                const isOfflineChat =
-                  Boolean(req.body?.offline) ||
-                  String(req.body?.provider || '').toLowerCase() === 'ollama';
-                const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || null;
                 record.extraction = (await extractImageText(
                   inputSource,
                   record.originalName,
@@ -2621,7 +2626,8 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
                   record.originalName,
                   ext,
                   record.mimeType,
-                  record.id
+                  record.id,
+                  { offline: isOfflineChat, apiKey: geminiKey }
                 )) as any;
               }
             }
