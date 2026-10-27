@@ -29,7 +29,7 @@ import { getChatMode } from '../config/chatModes.js';
 import { useAuth } from '../context/AuthContext.jsx';
 import { useSettings } from '../context/SettingsContext.jsx';
 import { useSpeech } from '../context/SpeechContext.jsx';
-import { saveAttachmentBlob } from '../services/attachmentStorageService.js';
+import { saveAttachmentBlob, hydrateAttachmentsWithImageBytes } from '../services/attachmentStorageService.js';
 import {
   isContinuationRequest,
   resolveMultiPartContext,
@@ -1120,6 +1120,15 @@ export default function ChatPage() {
       );
     }
     try {
+      let requestAttachments = currentAttachments;
+      if (Array.isArray(currentAttachments) && currentAttachments.length > 0) {
+        try {
+          requestAttachments = await hydrateAttachmentsWithImageBytes(currentAttachments);
+        } catch (hydrateErr) {
+          console.warn('[Chat] Failed to hydrate image attachments from IndexedDB:', hydrateErr);
+        }
+      }
+
       const result = await streamAIMessage({
         provider: providerToUse,
         model: effectiveModelOverride,
@@ -1134,7 +1143,7 @@ export default function ChatPage() {
         },
         signal: abortController.signal,
         conversationId: targetChatId,
-        attachments: currentAttachments,
+        attachments: requestAttachments,
         isContinuation: multiPartParams.isContinuation,
         partNumber: multiPartParams.partNumber,
         originalPrompt: multiPartParams.originalPrompt,
@@ -2048,7 +2057,8 @@ export default function ChatPage() {
           }
         }
         if (found.length > 0) {
-          activeAttachments = found.reverse();
+          // Keep newest attachments first (do not reverse to oldest)
+          activeAttachments = found;
         }
       }
 

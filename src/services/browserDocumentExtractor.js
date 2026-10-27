@@ -450,8 +450,15 @@ async function extractPdfDocument(arrayBuffer) {
 
     const fullAggregatedText = combinedTextParts.join('\n\n');
 
-    // Detect scanned or image-only PDFs (no extractable text layer)
-    if (nonWhitespaceChars < 10) {
+    const clean = fullAggregatedText.replace(/--- Page \d+ ---/g, '').trim();
+    const nonWs = clean.replace(/\s+/g, '');
+    const isWatermark =
+      /^(?:scanned\s+(?:by|with|using)\s+)?camscanner(?:\s+free\s+version)?$/i.test(clean) ||
+      /^(?:scanned\s+(?:by|with|using)\s+)?(?:adobe\s*scan|microsoft\s*lens|genius\s*scan|tapscanner|fast\s*scanner)$/i.test(clean) ||
+      (nonWs.length < 60 && /(?:camscanner|adobe\s*scan|microsoft\s*lens|genius\s*scan|tapscanner)/i.test(clean));
+
+    // Detect scanned or image-only PDFs (no extractable text layer or scanner watermark)
+    if (nonWhitespaceChars < 10 || isWatermark) {
       return {
         status: 'scanned_or_image_only',
         success: false,
@@ -740,9 +747,16 @@ async function extractDocxDocument(arrayBuffer) {
 
     let markdown = '';
 
+    const mammothInput = {
+      arrayBuffer,
+      ...(typeof Buffer !== 'undefined'
+        ? { buffer: Buffer.isBuffer(arrayBuffer) ? arrayBuffer : Buffer.from(arrayBuffer) }
+        : {})
+    };
+
     // 2. Primary path: convert to HTML first to preserve table structures with cell alignments
     try {
-      const htmlResult = await mammoth.convertToHtml({ arrayBuffer });
+      const htmlResult = await mammoth.convertToHtml(mammothInput);
       const rawHtml = htmlResult?.value || '';
       if (rawHtml.trim()) {
         markdown = convertMammothHtmlToMarkdown(rawHtml);
@@ -752,7 +766,7 @@ async function extractDocxDocument(arrayBuffer) {
     // 3. Secondary fallback: convert to Markdown directly
     if (!markdown) {
       try {
-        const res = await mammoth.convertToMarkdown({ arrayBuffer });
+        const res = await mammoth.convertToMarkdown(mammothInput);
         markdown = (res?.value || '').trim();
       } catch (_) {}
     }
@@ -760,7 +774,7 @@ async function extractDocxDocument(arrayBuffer) {
     // 4. Tertiary fallback: extract raw text
     if (!markdown) {
       try {
-        const raw = await mammoth.extractRawText({ arrayBuffer });
+        const raw = await mammoth.extractRawText(mammothInput);
         markdown = (raw?.value || '').trim();
       } catch (_) {}
     }

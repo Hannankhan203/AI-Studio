@@ -1663,5 +1663,20 @@ console.log(`\nAll ${passedTests} offline reliability tests passed successfully!
 try {
   await discardOcrWorker();
 } catch (_) {}
+
+// Run Phase 2E End-to-End Integration and Regression Test Suite
+const { spawnSync } = await import('node:child_process');
+const { fileURLToPath } = await import('node:url');
+const currentScriptDir = path.dirname(fileURLToPath(import.meta.url));
+const phase2EPath = path.join(currentScriptDir, 'testPhase2E.js');
+
+console.log('\n--- Executing Phase 2E End-to-End Integration Suite ---');
+const phase2EResult = spawnSync(process.execPath, [phase2EPath], { stdio: 'inherit' });
+if (phase2EResult.status !== 0) {
+  console.error(`\nPhase 2E integration tests failed with status ${phase2EResult.status}`);
+  process.exit(phase2EResult.status || 1);
+}
+
 process.exit(0);
+
 

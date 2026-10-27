@@ -15,7 +15,14 @@ let dbPromise = null;
  * @returns {Promise<IDBDatabase|null>}
  */
 function getDB() {
-  if (typeof window === 'undefined' || !window.indexedDB) {
+  const idb =
+    typeof indexedDB !== 'undefined'
+      ? indexedDB
+      : typeof window !== 'undefined' && window.indexedDB
+      ? window.indexedDB
+      : null;
+
+  if (!idb) {
     return Promise.resolve(null);
   }
 
@@ -23,7 +30,7 @@ function getDB() {
 
   dbPromise = new Promise((resolve) => {
     try {
-      const request = window.indexedDB.open(DB_NAME, DB_VERSION);
+      const request = idb.open(DB_NAME, DB_VERSION);
 
       request.onupgradeneeded = (event) => {
         const db = event.target.result;
@@ -125,6 +132,135 @@ export async function getAttachmentRecord(id) {
     console.warn('[Attachment Storage] getAttachmentRecord error:', err);
     return null;
   }
+}
+
+/**
+ * Retrieves a stored attachment's binary Blob from IndexedDB
+ * @param {string} id
+ * @returns {Promise<Blob|null>}
+ */
+export async function getAttachmentBlob(id) {
+  if (!id) return null;
+  const record = await getAttachmentRecord(id);
+  return record?.blob || null;
+}
+
+/**
+ * Converts a Blob or File to a base64 Data URL.
+ * Supports both browser environments (FileReader) and Node.js environments (blob.arrayBuffer).
+ * @param {Blob|File} blob
+ * @param {string} [mimeType]
+ * @returns {Promise<string|null>}
+ */
+export async function convertBlobToDataUrl(blob, mimeType = '') {
+  if (!blob) return null;
+  const mime = mimeType || blob.type || 'image/jpeg';
+
+  if (typeof FileReader !== 'undefined') {
+    return new Promise((resolve) => {
+      try {
+        const reader = new FileReader();
+        reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : null);
+        reader.onerror = () => resolve(null);
+        reader.readAsDataURL(blob);
+      } catch (_) {
+        resolve(null);
+      }
+    });
+  }
+
+  if (typeof blob.arrayBuffer === 'function') {
+    try {
+      const buffer = Buffer.from(await blob.arrayBuffer());
+      return `data:${mime};base64,${buffer.toString('base64')}`;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Restores original image bytes from IndexedDB for attachments that need them before request dispatch.
+ * Converts the Blob to a base64 Data URL expected by the request pipeline.
+ * Does not mutate the original attachment objects.
+ * Gracefully handles missing records, invalid blobs, or non-images without crashing or fabricating payloads.
+ *
+ * @param {Array<Object>} attachments
+ * @returns {Promise<Array<Object>>}
+ */
+export async function hydrateAttachmentsWithImageBytes(attachments) {
+  if (!Array.isArray(attachments) || attachments.length === 0) {
+    return [];
+  }
+
+  return Promise.all(
+    attachments.map(async (att) => {
+      if (!att) return att;
+
+      // Check if attachment is an image
+      const isImg = Boolean(
+        att.isImage ||
+        (att.type && String(att.type).toLowerCase().startsWith('image/')) ||
+        (att.mimeType && String(att.mimeType).toLowerCase().startsWith('image/')) ||
+        /\.(png|jpe?g|webp|gif|bmp|heic|heif)$/i.test(att.name || att.originalName || att.filename || att.extension || '')
+      );
+
+      // If not an image, preserve exactly as-is
+      if (!isImg) {
+        return att;
+      }
+
+      // If it already has usable base64, dataUrl, or data, do NOT re-read or duplicate
+      if (att.base64 || att.dataUrl || att.data) {
+        return att;
+      }
+
+      // If it has in-memory Blob/File (e.g. freshly attached)
+      if (att.file instanceof Blob) {
+        try {
+          const b64 = await convertBlobToDataUrl(att.file, att.type || att.file.type);
+          if (b64) {
+            return {
+              ...att,
+              base64: b64,
+              dataUrl: b64
+            };
+          }
+        } catch (_) {}
+      }
+
+      // Retrieve from IndexedDB using attachment ID
+      const attId = att.id || att.fileId;
+      if (!attId) {
+        return att;
+      }
+
+      try {
+        const record = await getAttachmentRecord(attId);
+        const blob = record?.blob;
+        if (blob && (blob instanceof Blob || typeof blob.arrayBuffer === 'function') && blob.size > 0) {
+          // Bounded size check (max 10MB as defined by server)
+          if (blob.size <= 10 * 1024 * 1024) {
+            const b64 = await convertBlobToDataUrl(blob, record.type || att.type || blob.type);
+            if (b64) {
+              return {
+                ...att,
+                base64: b64,
+                dataUrl: b64
+              };
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('[Attachment Storage] Graceful hydration fallback:', err);
+      }
+
+      // If image cannot be recovered, return original attachment without inventing bytes
+      return att;
+    })
+  );
 }
 
 /**
