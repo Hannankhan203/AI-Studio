@@ -225,7 +225,8 @@ export default function ChatArea({
   onSelectWebLLMModel,
   onLoadWebLLMModel,
   onCancelWebLLMLoad,
-  onUnloadWebLLMModel
+  onUnloadWebLLMModel,
+  providerConfig = null
 }) {
   const textareaRef = useRef(null);
   const langMenuRef = useRef(null);
@@ -1473,6 +1474,7 @@ Transcript:
               showTimestamps={showTimestamps}
               selectedProvider={selectedProvider}
               activeMode={activeMode}
+              providerConfig={providerConfig}
             />
           )}
         </div>

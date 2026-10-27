@@ -43,29 +43,8 @@ export function generateAlternativeId(provider = 'assistant') {
  * @param {boolean} [params.isStopped=false]
  * @returns {Object} Clean ResponseAlternative object
  */
-/**
- * Safely sanitizes and migrates deprecated/obsolete model IDs to active models
- * to prevent obsolete models stored in localStorage or history from being sent.
- * @param {string} provider
- * @param {string|null} model
- * @returns {string|null}
- */
-export function sanitizeModelForProvider(provider, model) {
-  if (!model || typeof model !== 'string') return model;
-  const trimmed = model.trim();
-  const lowerProvider = String(provider || '').toLowerCase();
-  if (lowerProvider === 'groq') {
-    if (
-      trimmed === 'llama-3.3-70b-versatile' ||
-      trimmed === 'llama-3.1-8b-instant' ||
-      trimmed.includes('llama-3.3') ||
-      trimmed.includes('llama-3.1-70b')
-    ) {
-      return 'openai/gpt-oss-120b';
-    }
-  }
-  return trimmed;
-}
+export { sanitizeModelForProvider } from './providerModelSanitizer.js';
+import { sanitizeStoredDisplayModel } from './providerModelSanitizer.js';
 
 export function createAlternativeRecord({
   id = null,
@@ -81,7 +60,7 @@ export function createAlternativeRecord({
   isStopped = false
 } = {}) {
   const chosenProvider = provider || 'gemini';
-  const cleanModel = sanitizeModelForProvider(chosenProvider, modelUsed);
+  const cleanModel = sanitizeStoredDisplayModel(chosenProvider, modelUsed);
   return {
     id: id || generateAlternativeId(chosenProvider),
     parentMessageId: parentMessageId || null,

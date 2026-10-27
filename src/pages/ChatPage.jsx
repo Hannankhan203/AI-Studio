@@ -3,7 +3,16 @@ import React, { useState, useRef, useEffect } from 'react';
 import Layout from '../components/layout/Layout.jsx';
 import ChatArea from '../components/chat/ChatArea.jsx';
 import { SAMPLE_CHATS } from '../config/sampleData.js';
-import { streamAIMessage, DEFAULT_PROVIDER, PROVIDER_OPTIONS } from '../services/aiRouter.js';
+import {
+  streamAIMessage,
+  fetchProviderConfig,
+  DEFAULT_PROVIDER,
+  PROVIDER_OPTIONS
+} from '../services/aiRouter.js';
+import {
+  sanitizeModelForProvider,
+  evaluateOfflineProviderGuard
+} from '../services/providerModelSanitizer.js';
 import {
   createChatDocument,
   saveChatMessage,
@@ -17,6 +26,7 @@ import {
   updateChatMode,
   getCachedUserChats,
   saveCachedChatMessages,
+  sanitizeMessageForStorage,
   syncOfflineUserChatsToFirestore
 } from '../services/chatStorageService.js';
 import { exportAsMarkdown, exportAsPlainText } from '../utils/exportConversation.js';
@@ -29,7 +39,12 @@ import { getChatMode } from '../config/chatModes.js';
 import { useAuth } from '../context/AuthContext.jsx';
 import { useSettings } from '../context/SettingsContext.jsx';
 import { useSpeech } from '../context/SpeechContext.jsx';
-import { saveAttachmentBlob, hydrateAttachmentsWithImageBytes } from '../services/attachmentStorageService.js';
+import {
+  saveAttachmentBlob,
+  hydrateAttachmentsWithImageBytes,
+  sanitizeAttachmentForNetwork
+} from '../services/attachmentStorageService.js';
+import { isVisionCapableProvider } from '../services/documentContextService.js';
 import {
   isContinuationRequest,
   resolveMultiPartContext,
@@ -63,6 +78,12 @@ import {
   getAppShellState,
   subscribeAppShellState
 } from '../services/serviceWorkerManager.js';
+import {
+  createAbortError,
+  createRequestIsolationController,
+  cancelActiveChatRequest,
+  runIsolatedPromptStream
+} from '../services/requestIsolationService.js';
 import { AlertCircle, X, Check, WifiOff } from 'lucide-react';
 
 export default function ChatPage() {
@@ -133,20 +154,77 @@ export default function ChatPage() {
     supported: null,
     message: null
   });
+  const [providerConfig, setProviderConfig] = useState({
+    status: 'idle',
+    data: null
+  });
 
   const isSubmittingRef = useRef(false);
   const persistedMessageIdsRef = useRef(new Set());
   const activeChatIdRef = useRef(activeChatId);
+  const messagesRef = useRef(messages);
+  const userChatsRef = useRef(userChats);
   const fetchRequestIdRef = useRef(0);
   const skipNextChatLoadRef = useRef(null);
-  const activeAnimationRef = useRef(null);
-  const activeAbortControllerRef = useRef(null);
-  const isUserStoppedRef = useRef(false);
+  const requestControllerRef = useRef(null);
+  if (!requestControllerRef.current) {
+    requestControllerRef.current = createRequestIsolationController();
+  }
 
-  // Keep the active conversation ref synchronized with React state.
+  // Keep refs synchronized with React state for synchronous access inside async lifecycles.
   activeChatIdRef.current = activeChatId;
+  messagesRef.current = messages;
+  userChatsRef.current = userChats;
+
+  const setLoadingAndSubmitting = (loading) => {
+    setIsLoading(loading);
+    isSubmittingRef.current = loading;
+  };
+
+  const updateMessagesState = (updater) => {
+    setMessages((previous) => {
+      const next = typeof updater === 'function' ? updater(previous) : updater;
+      messagesRef.current = next;
+      return next;
+    });
+  };
+
+  const findExistingAssistantMessage = (chatId, assistantMessageId) => {
+    if (!assistantMessageId) return null;
+    if (activeChatIdRef.current === chatId) {
+      const inVisible = messagesRef.current.find((m) => m.id === assistantMessageId);
+      if (inVisible) return inVisible;
+    }
+    const targetChat = userChatsRef.current.find((c) => c.id === chatId);
+    return targetChat?.messages?.find((m) => m.id === assistantMessageId) || null;
+  };
+
+  const cancelCurrentGeneration = (reason = 'stopped') => {
+    return cancelActiveChatRequest(requestControllerRef.current, reason, {
+      getActiveChatId: () => activeChatIdRef.current,
+      onUpdateMessages: updateMessagesState,
+      onPersistMessage: (chatId, message, force) => persistMessageSafe(chatId, message, force),
+      onSetLoadingState: setLoadingAndSubmitting,
+      findExistingAssistantMessage,
+      stopLocalEngine: stopWebLLMGeneration,
+      forceStopLocalEngine:
+        reason === 'stopped' &&
+        (selectedProvider === 'webllm' ||
+          webllmState.status === 'generating' ||
+          webllmState.status === 'downloading' ||
+          webllmState.status === 'loading')
+    });
+  };
 
   const handleSelectProvider = (provider) => {
+    if (
+      provider &&
+      provider !== selectedProvider &&
+      requestControllerRef.current.hasActiveRequest()
+    ) {
+      cancelCurrentGeneration('provider_switched');
+    }
+
     setSelectedProvider(provider);
 
     if (typeof window !== 'undefined') {
@@ -176,6 +254,37 @@ export default function ChatPage() {
     return subscribeAppShellState((state) => {
       setAppShellState(state);
     });
+  }, []);
+
+  // Load server provider configuration safely without exposing secrets or failing noisy when offline
+  useEffect(() => {
+    let cancelled = false;
+    if (!isBrowserOnline()) {
+      setProviderConfig((prev) =>
+        prev.status === 'ready' ? prev : { status: 'unavailable', data: null }
+      );
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    fetchProviderConfig()
+      .then((snapshot) => {
+        if (!cancelled && snapshot) {
+          setProviderConfig(snapshot);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setProviderConfig((prev) =>
+            prev.status === 'ready' ? prev : { status: 'unavailable', data: null }
+          );
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Inspect WebGPU compatibility & local model cache status when Browser AI is active
@@ -237,14 +346,12 @@ export default function ChatPage() {
   useEffect(() => {
     return () => {
       stopSpeech();
-      if (activeAbortControllerRef.current) {
-        try {
-          activeAbortControllerRef.current.abort();
-        } catch (_) {}
-      }
-      if (activeAnimationRef.current) {
-        activeAnimationRef.current();
-      }
+      cancelActiveChatRequest(requestControllerRef.current, 'unmounted', {
+        getActiveChatId: () => activeChatIdRef.current,
+        onUpdateMessages: () => {},
+        onSetLoadingState: () => {},
+        stopLocalEngine: stopWebLLMGeneration
+      });
     };
   }, [stopSpeech]);
 
@@ -335,13 +442,7 @@ export default function ChatPage() {
           if (!chat || !Array.isArray(chat.messages)) return chat;
           return {
             ...chat,
-            messages: chat.messages.map((msg) => {
-              if (!msg || !Array.isArray(msg.attachments) || msg.attachments.length === 0) return msg;
-              return {
-                ...msg,
-                attachments: msg.attachments.map(({ file, base64, dataUrl, previewUrl, ...rest }) => rest)
-              };
-            })
+            messages: chat.messages.map((msg) => sanitizeMessageForStorage(msg))
           };
         });
         const serialized = JSON.stringify(sanitizedChats);
@@ -360,10 +461,21 @@ export default function ChatPage() {
       if (!online) {
         setOfflineBannerDismissed(false);
       } else {
-        // Clear stale offline Firestore errors upon reconnecting
+        // Clear stale offline Firestore or offline cloud-provider errors upon reconnecting
         setPersistenceError((prev) =>
-          prev && prev.toLowerCase().includes('firestore') ? null : prev
+          prev &&
+          (prev.toLowerCase().includes('firestore') ||
+            prev.toLowerCase().includes('requires an internet connection'))
+            ? null
+            : prev
         );
+        fetchProviderConfig({ forceRefresh: true })
+          .then((snapshot) => {
+            if (snapshot) {
+              setProviderConfig(snapshot);
+            }
+          })
+          .catch(() => {});
         if (isCloudEnabled && currentUser?.uid) {
           syncOfflineUserChatsToFirestore(currentUser.uid)
             .then(() => {
@@ -379,6 +491,23 @@ export default function ChatPage() {
       }
     });
   }, [isCloudEnabled, currentUser?.uid]);
+
+  /**
+   * Shared offline guard enforced before every user-initiated cloud AI action.
+   * Permits local providers ('webllm', 'ollama') offline while blocking cloud
+   * providers ('gemini', 'groq', 'openrouter', 'cloudflare') before mutating state.
+   */
+  const guardOfflineProviderAction = (targetProvider) => {
+    const guard = evaluateOfflineProviderGuard({
+      provider: targetProvider,
+      isOnline: isBrowserOnline()
+    });
+    if (!guard.allowed) {
+      setPersistenceError(guard.message);
+      return false;
+    }
+    return true;
+  };
 
   // 1. Subscribe to the conversation list (re-subscribes cleanly when transitioning back online).
   useEffect(() => {
@@ -582,29 +711,18 @@ export default function ChatPage() {
   const handleNewChat = () => {
     stopSpeech();
 
-    if (activeAbortControllerRef.current) {
-      try {
-        activeAbortControllerRef.current.abort();
-      } catch (_) {}
-      activeAbortControllerRef.current = null;
-    }
-
-    if (activeAnimationRef.current) {
-      activeAnimationRef.current();
-      activeAnimationRef.current = null;
-    }
-
-    // Invalidate any outstanding history load.
+    // Update target conversation ref BEFORE cancelling so any outgoing chat's
+    // interrupted message persists only to its own chat and never touches New Chat state.
     fetchRequestIdRef.current += 1;
     activeChatIdRef.current = null;
+    cancelCurrentGeneration('conversation_switched');
 
     setActiveChatId(null);
-    setMessages([]);
+    updateMessagesState([]);
     setInputValue('');
     setEditingMessageId(null);
-    setIsLoading(false);
+    setLoadingAndSubmitting(false);
     setMessagesLoading(false);
-    isSubmittingRef.current = false;
     setModeChangeNotice(null);
     setActiveMode(settings?.defaultMode || 'general');
 
@@ -612,34 +730,22 @@ export default function ChatPage() {
     sessionStorage.removeItem('chatora_active_chat');
   };
 
-  // Switch conversations without allowing old history to overwrite new messages.
+  // Switch conversations without allowing old history or active streams to overwrite new messages.
   const handleSelectChat = (chatId) => {
     if (chatId === activeChatIdRef.current) return;
 
     stopSpeech();
 
-    if (activeAbortControllerRef.current) {
-      try {
-        activeAbortControllerRef.current.abort();
-      } catch (_) {}
-      activeAbortControllerRef.current = null;
-    }
-
-    if (activeAnimationRef.current) {
-      activeAnimationRef.current();
-      activeAnimationRef.current = null;
-    }
-
-    setIsLoading(false);
-    isSubmittingRef.current = false;
-    setEditingMessageId(null);
-
     fetchRequestIdRef.current += 1;
     activeChatIdRef.current = chatId;
+    cancelCurrentGeneration('conversation_switched');
+
+    setLoadingAndSubmitting(false);
+    setEditingMessageId(null);
 
     setActiveChatId(chatId);
     setInputValue('');
-    setMessages([]);
+    updateMessagesState([]);
     setMessagesLoading(Boolean(isCloudEnabled));
   };
 
@@ -894,7 +1000,160 @@ export default function ChatPage() {
   };
 
   /**
-   * Run the AI request and animate its response.
+   * Formats raw provider/router errors into actionable user-facing messages.
+   */
+  const classifyPromptError = (error, { finalProvider, providerToUse }) => {
+    console.error('Streaming prompt execution error:', error);
+
+    let rawMsg = String(error?.message || '');
+    if (rawMsg.includes('{') && rawMsg.includes('}')) {
+      try {
+        const match = rawMsg.match(/\{[\s\S]*\}/);
+        if (match) {
+          const parsed = JSON.parse(match[0]);
+          if (parsed.error?.message) {
+            rawMsg = parsed.error.message;
+          }
+        }
+      } catch (_) {}
+    }
+
+    const effectiveProvider = error?.provider || finalProvider || providerToUse;
+    const currentProviderConfig = Array.isArray(PROVIDER_OPTIONS)
+      ? PROVIDER_OPTIONS.find((p) => p.id === effectiveProvider)
+      : null;
+    const providerDisplayName =
+      currentProviderConfig?.name ||
+      (effectiveProvider
+        ? effectiveProvider.charAt(0).toUpperCase() + effectiveProvider.slice(1)
+        : 'AI Provider');
+
+    const isOllama = effectiveProvider === 'ollama';
+    const isWebLLM = effectiveProvider === 'webllm';
+    const isLocalProvider = isOllama || isWebLLM;
+    const isGemini = effectiveProvider === 'gemini';
+
+    const isNotConfigured = Boolean(
+      error?.errorCode === 'PROVIDER_NOT_CONFIGURED' ||
+      error?.status === 'PROVIDER_NOT_CONFIGURED' ||
+      rawMsg.toLowerCase().includes('not configured on this server')
+    );
+    const isInvalidModel = Boolean(
+      error?.errorCode === 'INVALID_MODEL' || error?.status === 'INVALID_MODEL'
+    );
+    const isTimeout = Boolean(
+      error?.code === 504 || error?.status === 'DEADLINE_EXCEEDED'
+    );
+
+    const is503 =
+      !isNotConfigured &&
+      (error?.code === 503 ||
+        error?.status === 'UNAVAILABLE' ||
+        rawMsg.toLowerCase().includes('high demand') ||
+        rawMsg.toLowerCase().includes('spikes in demand') ||
+        rawMsg.toLowerCase().includes('overloaded')) &&
+      error?.code !== 500;
+
+    const is500 = error?.code === 500 || error?.status === 'INTERNAL';
+    const isAuthError =
+      error?.code === 401 ||
+      error?.code === 403 ||
+      error?.status === 'UNAUTHENTICATED' ||
+      error?.status === 'PERMISSION_DENIED';
+    const isRateLimit =
+      error?.code === 429 || error?.status === 'RESOURCE_EXHAUSTED';
+    const isPayloadError = Boolean(
+      error?.isPayloadError ||
+      error?.code === 413 ||
+      error?.status === 'PAYLOAD_TOO_LARGE'
+    );
+    const isNotFound =
+      !isPayloadError &&
+      !isInvalidModel &&
+      (error?.code === 404 ||
+        error?.status === 'NOT_FOUND' ||
+        rawMsg.toLowerCase().includes('not found') ||
+        rawMsg.toLowerCase().includes('does not exist') ||
+        rawMsg.toLowerCase().includes('access to it') ||
+        rawMsg.toLowerCase().includes('decommissioned') ||
+        rawMsg.toLowerCase().includes('retired'));
+
+    let friendlyMsg = rawMsg;
+    if (isNotConfigured) {
+      friendlyMsg =
+        rawMsg ||
+        `${providerDisplayName} is not configured on this server. Configure its server API key in the server environment or switch to an available provider below.`;
+    } else if (isInvalidModel) {
+      friendlyMsg =
+        rawMsg ||
+        `The requested model identifier is not valid for ${providerDisplayName}. Please retry or select another provider below.`;
+    } else if (isPayloadError) {
+      friendlyMsg =
+        rawMsg ||
+        'The attached image payload exceeds the supported request budget (3.0 MB max per image, 4.2 MB max total request). Please resize or compress the image and try again.';
+    } else if (isOllama) {
+      if (rawMsg) {
+        friendlyMsg = rawMsg;
+      } else if (isNotFound) {
+        friendlyMsg = `Local AI (Ollama) model 'qwen2.5:1.5b' was not found. Please pull the model locally using 'ollama pull qwen2.5:1.5b'.`;
+      } else if (is503) {
+        friendlyMsg = `Local AI (Ollama) is unavailable: could not connect to Ollama at http://127.0.0.1:11434. Make sure Ollama is running locally ('ollama serve').`;
+      } else {
+        friendlyMsg = `An error occurred with Local AI (Ollama). Please make sure Ollama is running locally and model 'qwen2.5:1.5b' is installed.`;
+      }
+    } else if (isWebLLM) {
+      friendlyMsg =
+        rawMsg ||
+        'Browser AI (WebLLM) encountered a local initialization or generation error on this device.';
+    } else if (isTimeout) {
+      friendlyMsg =
+        rawMsg ||
+        `${providerDisplayName} timed out before sending response headers. Please retry in a moment or switch to another provider below.`;
+    } else if (is503) {
+      if (isGemini) {
+        friendlyMsg =
+          'Google Gemini is currently experiencing high demand. Spikes in demand are usually temporary. Please try again in a few moments, or switch to Groq, OpenRouter, or Local AI below.';
+      } else {
+        friendlyMsg = `${providerDisplayName} is currently experiencing high demand. Spikes in demand are usually temporary. Please try again in a few moments, or switch to another provider below.`;
+      }
+    } else if (isNotFound) {
+      friendlyMsg =
+        rawMsg ||
+        `The requested model for ${providerDisplayName} is unavailable or retired. Please choose another model or provider below.`;
+    } else if (is500) {
+      friendlyMsg =
+        rawMsg && !rawMsg.includes('Server request failed') && !rawMsg.includes('Internal Server Error')
+          ? `${providerDisplayName} encountered an internal error: ${rawMsg}. You can retry or switch to another provider below.`
+          : `${providerDisplayName} encountered an internal error (HTTP 500). Please try again in a moment, or switch to another provider below.`;
+    } else if (isAuthError) {
+      friendlyMsg = `Authentication or permission error with ${providerDisplayName}. Please check your API key configuration or switch providers below.`;
+    } else if (isRateLimit) {
+      friendlyMsg = `${providerDisplayName} rate limit or quota exceeded. Please wait a moment before trying again, or switch providers below.`;
+    } else if (!friendlyMsg) {
+      friendlyMsg = `An unexpected error occurred while communicating with ${providerDisplayName}.`;
+    }
+
+    return {
+      friendlyMsg,
+      effectiveProvider,
+      canSwitchProvider: error?.canFallback === false ? false : !isLocalProvider,
+      errorCode:
+        error?.errorCode ||
+        (isNotConfigured
+          ? 'PROVIDER_NOT_CONFIGURED'
+          : isInvalidModel
+          ? 'INVALID_MODEL'
+          : isTimeout
+          ? 'DEADLINE_EXCEEDED'
+          : undefined),
+      suggestedProviders: Array.isArray(error?.suggestedProviders)
+        ? error.suggestedProviders
+        : undefined
+    };
+  };
+
+  /**
+   * Run the AI request and animate its response under strict monotonic request isolation.
    */
   const executePrompt = async (
     promptText,
@@ -905,594 +1164,93 @@ export default function ChatPage() {
     currentAttachments = [],
     multiPartParams = {},
     customStartTime = null,
-    overrideModel = null
+    overrideModel = null,
+    existingRequestId = null
   ) => {
     const providerToUse = overrideProvider || selectedProvider;
-    setIsLoading(true);
-    isUserStoppedRef.current = false;
-
-    // Stop any existing network request and animation pump.
-    if (activeAbortControllerRef.current) {
-      try {
-        activeAbortControllerRef.current.abort();
-      } catch (_) {}
-      activeAbortControllerRef.current = null;
-    }
-
-    if (activeAnimationRef.current) {
-      activeAnimationRef.current();
-      activeAnimationRef.current = null;
-    }
-
-    const abortController = new AbortController();
-    activeAbortControllerRef.current = abortController;
-
-    let requestStartTime =
-      typeof customStartTime === 'number' && customStartTime > 0
-        ? customStartTime
-        : performance.now();
-    let measuredResponseTimeMs = null;
-
-    let targetText = '';
-    let displayedText = '';
-    const effectiveModelOverride =
+    const rawModelCandidate =
       overrideModel || (providerToUse === 'webllm' ? webllmModelId : null);
-    let activeModel = effectiveModelOverride;
-    let finalProvider = providerToUse;
-    let isStreamDone = false;
-    let timerId = null;
-    let isCancelled = false;
-    let isFinalized = false;
+    const effectiveModelOverride = sanitizeModelForProvider(
+      providerToUse,
+      rawModelCandidate
+    );
 
-    const prefersReducedMotion =
+    const prefersReducedMotion = Boolean(
       typeof window !== 'undefined' &&
-      window.matchMedia?.('(prefers-reduced-motion: reduce)')
-        ?.matches;
+      window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches
+    );
 
-    const cancelCurrentAnimation = () => {
-      isCancelled = true;
-
-      if (timerId !== null) {
-        clearTimeout(timerId);
-        timerId = null;
-      }
-    };
-
-    activeAnimationRef.current = cancelCurrentAnimation;
-
-    // Finalize exactly once. Do not call cancelCurrentAnimation first:
-    // cancellation intentionally prevents this function from running.
-    const finalizeAssistantMessage = async (
-      contentToSave,
-      modelToUse,
-      providerToFinalize,
-      isStopped = false,
-      responseTime = null
-    ) => {
-      if (isCancelled || isFinalized) return;
-
-      isFinalized = true;
-
-      const finalResponseTime = !isStopped
-        ? (responseTime ?? measuredResponseTimeMs)
-        : null;
-
-      let completedMessage = null;
-
-      if (activeChatIdRef.current === targetChatId) {
-        setMessages((previous) => {
-          return previous.map((message) => {
-            if (message.id !== assistantMessageId) return message;
-            const normalized = normalizeAssistantMessage(message);
-            const finalized = updateActiveAlternativeInMessage(normalized, {
-              content: contentToSave,
-              modelUsed: modelToUse || activeModel || normalized.modelUsed,
-              provider: providerToFinalize || finalProvider || providerToUse || normalized.provider,
-              responseTimeMs: typeof finalResponseTime === 'number' ? finalResponseTime : normalized.responseTimeMs,
-              isStreaming: false,
-              isStopped: Boolean(isStopped),
-              referencedAttachments: undefined
+    return runIsolatedPromptStream({
+      controller: requestControllerRef.current,
+      existingRequestId,
+      targetChatId,
+      assistantMessageId,
+      providerToUse,
+      effectiveModelOverride,
+      promptText,
+      currentAttachments,
+      customStartTime,
+      prefersReducedMotion,
+      getActiveChatId: () => activeChatIdRef.current,
+      onUpdateMessages: updateMessagesState,
+      onPersistMessage: persistMessageSafe,
+      onSetLoadingState: setLoadingAndSubmitting,
+      onSetPersistenceError: setPersistenceError,
+      findExistingAssistantMessage,
+      prepareAttachments: async (atts, { provider, model }) => {
+        if (!Array.isArray(atts) || atts.length === 0) {
+          return atts;
+        }
+        if (isVisionCapableProvider(provider, model)) {
+          try {
+            return await hydrateAttachmentsWithImageBytes(atts, {
+              provider,
+              model
             });
-            completedMessage = finalized;
-            return finalized;
-          });
-        });
-      }
-
-      if (!completedMessage) {
-        completedMessage = normalizeAssistantMessage({
-          id: assistantMessageId,
-          sender: 'assistant',
-          provider: providerToFinalize || finalProvider || providerToUse,
-          modelUsed: modelToUse || activeModel,
-          timestamp: new Date().toLocaleTimeString([], {
-            hour: '2-digit',
-            minute: '2-digit'
-          }),
-          content: contentToSave,
-          isStreaming: false,
-          isStopped: Boolean(isStopped),
-          responseTimeMs: typeof finalResponseTime === 'number' ? finalResponseTime : undefined,
-          referencedAttachments: undefined
-        });
-      }
-
-      if (targetChatId) {
-        await persistMessageSafe(targetChatId, completedMessage, true);
-      }
-
-      if (activeAnimationRef.current === cancelCurrentAnimation) {
-        activeAnimationRef.current = null;
-      }
-
-      if (activeAbortControllerRef.current === abortController) {
-        activeAbortControllerRef.current = null;
-      }
-
-      setIsLoading(false);
-      isSubmittingRef.current = false;
-    };
-
-    // Gradually reveal the received response.
-    const pumpAnimation = () => {
-      timerId = null;
-
-      if (isCancelled || isFinalized) return;
-
-      if (activeChatIdRef.current !== targetChatId) {
-        return;
-      }
-
-      const backlog = targetText.length - displayedText.length;
-
-      if (backlog > 0) {
-        if (prefersReducedMotion) {
-          displayedText = targetText;
-        } else {
-          let stepSize = 1;
-
-          if (backlog > 500) {
-            stepSize = Math.ceil(backlog / 16);
-          } else if (backlog > 200) {
-            stepSize = Math.ceil(backlog / 12);
-          } else if (backlog > 80) {
-            stepSize = Math.ceil(backlog / 8);
-          } else if (backlog > 30) {
-            stepSize = Math.ceil(backlog / 5);
-          } else if (backlog > 8) {
-            stepSize = 2;
-          }
-
-          displayedText = targetText.slice(
-            0,
-            displayedText.length + stepSize
-          );
-        }
-
-        setMessages((previous) =>
-          previous.map((message) => {
-            if (message.id !== assistantMessageId) return message;
-            const normalized = normalizeAssistantMessage(message);
-            return updateActiveAlternativeInMessage(normalized, {
-              content: displayedText,
-              modelUsed: activeModel || message.modelUsed,
-              provider: finalProvider || message.provider,
-              isStreaming: true,
-              referencedAttachments: undefined
-            });
-          })
-        );
-
-        timerId = setTimeout(pumpAnimation, 18);
-        return;
-      }
-
-      if (isStreamDone) {
-        void finalizeAssistantMessage(
-          targetText,
-          activeModel,
-          finalProvider,
-          false,
-          measuredResponseTimeMs
-        );
-      }
-    };
-
-    const triggerPump = () => {
-      if (isCancelled || isFinalized || timerId !== null) return;
-
-      timerId = setTimeout(pumpAnimation, 10);
-    };
-
-    if (!requestStartTime) {
-      requestStartTime =
-        typeof customStartTime === 'number' && customStartTime > 0
-          ? customStartTime
-          : performance.now();
-    }
-    if (activeChatIdRef.current === targetChatId) {
-      setMessages((previous) =>
-        previous.map((message) =>
-          message.id === assistantMessageId
-            ? { ...message, requestStartTime, isStreaming: true }
-            : message
-        )
-      );
-    }
-    try {
-      let requestAttachments = currentAttachments;
-      if (Array.isArray(currentAttachments) && currentAttachments.length > 0) {
-        try {
-          requestAttachments = await hydrateAttachmentsWithImageBytes(currentAttachments);
-        } catch (hydrateErr) {
-          console.warn('[Chat] Failed to hydrate image attachments from IndexedDB:', hydrateErr);
-        }
-      }
-
-      const result = await streamAIMessage({
-        provider: providerToUse,
-        model: effectiveModelOverride,
-        mode: activeMode,
-        prompt: promptText,
-        history: historyContext,
-        username:
-          username || currentUser?.displayName || null,
-        preferences: {
-          responseLength: settings?.responseLength || 'balanced',
-          beginnerFriendly: Boolean(settings?.beginnerFriendly)
-        },
-        signal: abortController.signal,
-        conversationId: targetChatId,
-        attachments: requestAttachments,
-        isContinuation: multiPartParams.isContinuation,
-        partNumber: multiPartParams.partNumber,
-        originalPrompt: multiPartParams.originalPrompt,
-        previousContentSummary: multiPartParams.previousContentSummary,
-
-        onStart: ({ modelUsed, provider: reportedProvider } = {}) => {
-          if (modelUsed) activeModel = modelUsed;
-          if (reportedProvider) finalProvider = reportedProvider;
-
-          if (activeChatIdRef.current === targetChatId) {
-            setMessages((previous) =>
-              previous.map((message) => {
-                if (message.id !== assistantMessageId) return message;
-                const normalized = normalizeAssistantMessage(message);
-                return updateActiveAlternativeInMessage(normalized, {
-                  modelUsed: activeModel,
-                  provider: finalProvider,
-                  referencedAttachments: undefined
-                });
-              })
-            );
-          }
-        },
-
-        onChunk: (_chunkText, currentAccumulated) => {
-          // Accept the cumulative text supplied by the router.
-          if (typeof currentAccumulated === 'string') {
-            targetText = currentAccumulated;
-          }
-
-          triggerPump();
-        }
-      });
-
-      // Stop timing when the AI response stream genuinely completes
-      measuredResponseTimeMs = Math.max(1, Math.round(performance.now() - requestStartTime));
-
-      const resolvedText =
-        typeof result?.text === 'string'
-          ? result.text
-          : targetText;
-
-      targetText = resolvedText;
-
-      if (result?.modelUsed) activeModel = result.modelUsed;
-      if (result?.provider) finalProvider = result.provider;
-
-      isStreamDone = true;
-
-      // Immediately set responseTimeMs on the active message so the live timer
-      // stops and the final response time is displayed at the exact stream completion point
-      if (activeChatIdRef.current === targetChatId) {
-        setMessages((previous) =>
-          previous.map((message) => {
-            if (message.id !== assistantMessageId) return message;
-            const normalized = normalizeAssistantMessage(message);
-            return updateActiveAlternativeInMessage(normalized, {
-              responseTimeMs: measuredResponseTimeMs,
-              modelUsed: activeModel || message.modelUsed,
-              provider: finalProvider || message.provider
-            });
-          })
-        );
-      }
-
-      // If the user has switched chats, persist this answer in the
-      // original conversation without touching the currently visible chat.
-      if (activeChatIdRef.current !== targetChatId) {
-        cancelCurrentAnimation();
-
-        let existingTargetMsg = null;
-        setUserChats((chats) => {
-          const chat = chats.find((c) => c.id === targetChatId);
-          existingTargetMsg = chat?.messages?.find((m) => m.id === assistantMessageId);
-          return chats;
-        });
-
-        const normalized = normalizeAssistantMessage(existingTargetMsg || {
-          id: assistantMessageId,
-          sender: 'assistant',
-          provider: finalProvider || providerToUse,
-          modelUsed: activeModel,
-          content: resolvedText
-        });
-
-        const completedMessage = updateActiveAlternativeInMessage(normalized, {
-          content: resolvedText,
-          modelUsed: activeModel,
-          provider: finalProvider || providerToUse,
-          isStreaming: false,
-          responseTimeMs: measuredResponseTimeMs,
-          referencedAttachments: undefined
-        });
-
-        if (targetChatId) {
-          await persistMessageSafe(targetChatId, completedMessage, true);
-        }
-
-        setIsLoading(false);
-        isSubmittingRef.current = false;
-        return;
-      }
-
-      if (
-        !prefersReducedMotion &&
-        displayedText.length < targetText.length
-      ) {
-        triggerPump();
-      } else {
-        if (timerId !== null) {
-          clearTimeout(timerId);
-          timerId = null;
-        }
-
-        displayedText = targetText;
-
-        await finalizeAssistantMessage(
-          targetText,
-          activeModel,
-          finalProvider,
-          false,
-          measuredResponseTimeMs
-        );
-      }
-    } catch (error) {
-      isStreamDone = true;
-      cancelCurrentAnimation();
-
-      if (activeAnimationRef.current === cancelCurrentAnimation) {
-        activeAnimationRef.current = null;
-      }
-
-      if (activeAbortControllerRef.current === abortController) {
-        activeAbortControllerRef.current = null;
-      }
-
-      const isAbortedByUser =
-        isUserStoppedRef.current ||
-        abortController.signal.aborted ||
-        error?.name === 'AbortError' ||
-        String(error?.message || '').toLowerCase().includes('aborted');
-
-      if (isAbortedByUser) {
-        // Distinguish intentional stop from genuine error: preserve partial response
-        const stoppedText =
-          targetText.trim().length > 0 ? targetText : 'Response generation stopped.';
-
-        let stoppedMessage = null;
-
-        if (activeChatIdRef.current === targetChatId) {
-          setMessages((previous) => {
-            return previous.map((message) => {
-              if (message.id !== assistantMessageId) return message;
-              const normalized = normalizeAssistantMessage(message);
-              const finalized = updateActiveAlternativeInMessage(normalized, {
-                content: stoppedText,
-                modelUsed: activeModel,
-                provider: finalProvider || providerToUse,
-                isStreaming: false,
-                isStopped: true,
-                referencedAttachments: undefined
-              });
-              stoppedMessage = finalized;
-              return finalized;
-            });
-          });
-        }
-
-        if (targetChatId && stoppedMessage) {
-          await persistMessageSafe(targetChatId, stoppedMessage, true);
-        }
-
-        setIsLoading(false);
-        isSubmittingRef.current = false;
-        return;
-      }
-
-      console.error('Streaming prompt execution error:', error);
-
-      isStreamDone = true;
-      cancelCurrentAnimation();
-
-      if (activeAnimationRef.current === cancelCurrentAnimation) {
-        activeAnimationRef.current = null;
-      }
-
-      // Parse error message and extract JSON if stringified
-      let rawMsg = String(error?.message || '');
-      if (rawMsg.includes('{') && rawMsg.includes('}')) {
-        try {
-          const match = rawMsg.match(/\{[\s\S]*\}/);
-          if (match) {
-            const parsed = JSON.parse(match[0]);
-            if (parsed.error?.message) {
-              rawMsg = parsed.error.message;
+          } catch (hydrateErr) {
+            if (
+              hydrateErr?.isPayloadError ||
+              hydrateErr?.name === 'ImagePayloadLimitError' ||
+              hydrateErr?.name === 'ImagePayloadValidationError' ||
+              hydrateErr?.code === 413 ||
+              hydrateErr?.code === 400 ||
+              hydrateErr?.status === 'PAYLOAD_TOO_LARGE'
+            ) {
+              throw hydrateErr;
             }
+            console.warn('[Chat] Failed to hydrate image attachments from IndexedDB:', hydrateErr);
+            return atts;
           }
-        } catch (_) {}
-      }
-
-      const effectiveProvider = error?.provider || finalProvider || providerToUse;
-      const currentProviderConfig = Array.isArray(PROVIDER_OPTIONS)
-        ? PROVIDER_OPTIONS.find((p) => p.id === effectiveProvider)
-        : null;
-      const providerDisplayName =
-        currentProviderConfig?.name ||
-        (effectiveProvider ? effectiveProvider.charAt(0).toUpperCase() + effectiveProvider.slice(1) : 'AI Provider');
-
-      const isOllama = effectiveProvider === 'ollama';
-      const isWebLLM = effectiveProvider === 'webllm';
-      const isLocalProvider = isOllama || isWebLLM;
-      const isGemini = effectiveProvider === 'gemini';
-
-      const is503 =
-        (error?.code === 503 ||
-          error?.status === 'UNAVAILABLE' ||
-          rawMsg.toLowerCase().includes('high demand') ||
-          rawMsg.toLowerCase().includes('spikes in demand') ||
-          rawMsg.toLowerCase().includes('overloaded')) &&
-        error?.code !== 500;
-
-      const is500 = error?.code === 500 || error?.status === 'INTERNAL';
-      const isAuthError =
-        error?.code === 401 ||
-        error?.code === 403 ||
-        error?.status === 'UNAUTHENTICATED' ||
-        error?.status === 'PERMISSION_DENIED';
-      const isRateLimit =
-        error?.code === 429 || error?.status === 'RESOURCE_EXHAUSTED';
-      const isNotFound =
-        error?.code === 404 ||
-        error?.status === 'NOT_FOUND' ||
-        rawMsg.toLowerCase().includes('not found') ||
-        rawMsg.toLowerCase().includes('does not exist') ||
-        rawMsg.toLowerCase().includes('access to it') ||
-        rawMsg.toLowerCase().includes('decommissioned') ||
-        rawMsg.toLowerCase().includes('retired');
-
-      let friendlyMsg = rawMsg;
-      if (isOllama) {
-        // Ollama errors are local, specific, and actionable. Never rewrite into cloud provider demand errors.
-        if (rawMsg) {
-          friendlyMsg = rawMsg;
-        } else if (isNotFound) {
-          friendlyMsg = `Local AI (Ollama) model 'qwen2.5:1.5b' was not found. Please pull the model locally using 'ollama pull qwen2.5:1.5b'.`;
-        } else if (is503) {
-          friendlyMsg = `Local AI (Ollama) is unavailable: could not connect to Ollama at http://127.0.0.1:11434. Make sure Ollama is running locally ('ollama serve').`;
-        } else {
-          friendlyMsg = `An error occurred with Local AI (Ollama). Please make sure Ollama is running locally and model 'qwen2.5:1.5b' is installed.`;
         }
-      } else if (isWebLLM) {
-        // Browser AI (WebLLM) errors are local device/WebGPU/cache messages — preserve them verbatim without cloud demand rewrites.
-        friendlyMsg =
-          rawMsg ||
-          'Browser AI (WebLLM) encountered a local initialization or generation error on this device.';
-      } else if (is503) {
-        if (isGemini) {
-          friendlyMsg =
-            'Google Gemini is currently experiencing high demand. Spikes in demand are usually temporary. Please try again in a few moments, or switch to Groq, OpenRouter, or Local AI below.';
-        } else {
-          friendlyMsg =
-            `${providerDisplayName} is currently experiencing high demand. Spikes in demand are usually temporary. Please try again in a few moments, or switch to another provider below.`;
-        }
-      } else if (isNotFound) {
-        friendlyMsg =
-          rawMsg ||
-          `The requested model for ${providerDisplayName} is unavailable or retired. Please choose another model or provider below.`;
-      } else if (is500) {
-        friendlyMsg =
-          rawMsg && !rawMsg.includes('Server request failed') && !rawMsg.includes('Internal Server Error')
-            ? `${providerDisplayName} encountered an internal error: ${rawMsg}. You can retry or switch to another provider below.`
-            : `${providerDisplayName} encountered an internal error (HTTP 500). Please try again in a moment, or switch to another provider below.`;
-      } else if (isAuthError) {
-        friendlyMsg =
-          `Authentication or permission error with ${providerDisplayName}. Please check your API key configuration or switch providers below.`;
-      } else if (isRateLimit) {
-        friendlyMsg =
-          `${providerDisplayName} rate limit or quota exceeded. Please wait a moment before trying again, or switch providers below.`;
-      } else if (!friendlyMsg) {
-        friendlyMsg = `An unexpected error occurred while communicating with ${providerDisplayName}.`;
-      }
-
-      const isInterrupted = targetText.trim().length > 0;
-      const errorContent = isInterrupted
-        ? `${targetText}\n\n*[Response interrupted: ${friendlyMsg}]*`
-        : friendlyMsg;
-
-      if (activeChatIdRef.current === targetChatId) {
-        let finalizedErrorMessage = null;
-        setMessages((previous) =>
-          previous.map((message) => {
-            if (message.id !== assistantMessageId) return message;
-            const normalized = normalizeAssistantMessage(message);
-            const updated = updateActiveAlternativeInMessage(normalized, {
-              content: errorContent,
-              modelUsed: activeModel || normalized.modelUsed,
-              provider: effectiveProvider || finalProvider || providerToUse || normalized.provider,
-              isStreaming: false,
-              isError: !isInterrupted,
-              isInterrupted,
-              failedPrompt: promptText,
-              failedProvider: effectiveProvider || finalProvider || providerToUse,
-              canSwitchProvider: error?.canFallback === false ? false : !isLocalProvider,
-              referencedAttachments: undefined
-            });
-            finalizedErrorMessage = updated;
-            return updated;
-          })
+        return atts.map((att) =>
+          sanitizeAttachmentForNetwork(att, { includeImageBytes: false })
         );
-
-        if (targetChatId && finalizedErrorMessage) {
-          await persistMessageSafe(targetChatId, finalizedErrorMessage, true);
-        }
-        setPersistenceError(friendlyMsg);
-      } else if (targetChatId) {
-        let existingTargetMsg = null;
-        setUserChats((chats) => {
-          const chat = chats.find((c) => c.id === targetChatId);
-          existingTargetMsg = chat?.messages?.find((m) => m.id === assistantMessageId);
-          return chats;
-        });
-
-        const normalized = normalizeAssistantMessage(existingTargetMsg || {
-          id: assistantMessageId,
-          sender: 'assistant',
-          provider: effectiveProvider || finalProvider || providerToUse,
-          modelUsed: activeModel,
-          content: errorContent
-        });
-
-        const updated = updateActiveAlternativeInMessage(normalized, {
-          content: errorContent,
-          modelUsed: activeModel || normalized.modelUsed,
-          provider: effectiveProvider || finalProvider || providerToUse || normalized.provider,
-          isStreaming: false,
-          isError: !isInterrupted,
-          isInterrupted,
-          failedPrompt: promptText,
-          failedProvider: effectiveProvider || finalProvider || providerToUse,
-          canSwitchProvider: error?.canFallback === false ? false : !isLocalProvider,
-          referencedAttachments: undefined
-        });
-
-        await persistMessageSafe(targetChatId, updated, true);
-      }
-
-      setIsLoading(false);
-      isSubmittingRef.current = false;
-    }
+      },
+      streamRequest: ({ signal, isRequestActive, attachments: reqAttachments, onStart, onChunk }) =>
+        streamAIMessage({
+          provider: providerToUse,
+          model: effectiveModelOverride,
+          mode: activeMode,
+          prompt: promptText,
+          history: historyContext,
+          username: username || currentUser?.displayName || null,
+          preferences: {
+            responseLength: settings?.responseLength || 'balanced',
+            beginnerFriendly: Boolean(settings?.beginnerFriendly)
+          },
+          signal,
+          isRequestActive,
+          conversationId: targetChatId,
+          attachments: reqAttachments,
+          isContinuation: multiPartParams.isContinuation,
+          partNumber: multiPartParams.partNumber,
+          originalPrompt: multiPartParams.originalPrompt,
+          previousContentSummary: multiPartParams.previousContentSummary,
+          onStart,
+          onChunk
+        }),
+      classifyError: classifyPromptError
+    });
   };
 
   // Submit a new message.
@@ -1514,20 +1272,37 @@ export default function ChatPage() {
 
     if ((!trimmed && !hasAttachments) || isLoading || isSubmittingRef.current) return false;
 
-    // Reject offline requests for cloud providers immediately with actionable feedback
-    if (!isBrowserOnline() && selectedProvider !== 'webllm' && selectedProvider !== 'ollama') {
-      const providerConfig = Array.isArray(PROVIDER_OPTIONS)
-        ? PROVIDER_OPTIONS.find((p) => p.id === selectedProvider)
-        : null;
-      const provName = providerConfig?.name || 'Cloud AI';
-      setPersistenceError(
-        `${provName} requires an internet connection. Switch to Browser AI (WebLLM) to chat offline on this device.`
-      );
+    // Reject offline requests for cloud providers immediately before mutating state
+    if (!guardOfflineProviderAction(selectedProvider)) {
       return false;
     }
 
-    isSubmittingRef.current = true;
-    setIsLoading(true);
+    const initialChatId = activeChatIdRef.current;
+    const submitProvider = selectedProvider;
+    const preflightEntry = requestControllerRef.current.beginRequest({
+      chatId: initialChatId,
+      provider: submitProvider,
+      phase: 'preflight'
+    });
+    const preflightRequestId = preflightEntry.requestId;
+
+    const isPreflightActive = () =>
+      requestControllerRef.current.isRequestActive(preflightRequestId) &&
+      activeChatIdRef.current === initialChatId;
+
+    const failPreflightIfActive = (errMsg) => {
+      if (!isPreflightActive()) return false;
+      requestControllerRef.current.markFinalized(preflightRequestId);
+      if (errMsg) {
+        setPersistenceError(errMsg);
+      }
+      if (!requestControllerRef.current.hasActiveRequest()) {
+        setLoadingAndSubmitting(false);
+      }
+      return false;
+    };
+
+    setLoadingAndSubmitting(true);
     setPersistenceError(null);
 
     let processedAttachments = [];
@@ -1540,19 +1315,20 @@ export default function ChatPage() {
         const MAX_PER_FILE_BYTES = 25 * 1024 * 1024;
         const oversized = filesToUpload.find((f) => f.file && f.file.size > MAX_PER_FILE_BYTES);
         if (oversized) {
-          setPersistenceError(`File '${oversized.name}' exceeds the maximum allowed size of 25MB.`);
-          setIsLoading(false);
-          isSubmittingRef.current = false;
-          return false;
+          return failPreflightIfActive(
+            `File '${oversized.name}' exceeds the maximum allowed size of 25MB.`
+          );
         }
 
-        const isWebLLM = selectedProvider === 'webllm';
+        const isWebLLM = submitProvider === 'webllm';
         const clientOnline = isBrowserOnline();
 
         // Safe browser-local path for Browser AI (WebLLM) when offline
         if (isWebLLM && !clientOnline) {
           const localExtractedAttachments = [];
           for (const att of filesToUpload) {
+            if (!isPreflightActive()) return false;
+
             // If already extracted, reuse existing extraction
             if (att.extraction?.status === 'ready' && att.extraction?.text) {
               await saveAttachmentBlob(att.id, att.file, {
@@ -1563,8 +1339,9 @@ export default function ChatPage() {
                 formattedSize: att.formattedSize,
                 extension: att.extension,
                 isImage: Boolean(att.isImage),
-                conversationId: activeChatIdRef.current || null
+                conversationId: initialChatId || null
               });
+              if (!isPreflightActive()) return false;
               localExtractedAttachments.push({
                 ...att,
                 status: 'ready',
@@ -1582,57 +1359,43 @@ export default function ChatPage() {
               extension: att.extension
             });
 
+            if (!isPreflightActive()) return false;
+
             if (extResult.isImage || extResult.status === 'unsupported_offline') {
-              setPersistenceError(
+              return failPreflightIfActive(
                 'Image text recognition (OCR) requires an internet connection. Connect to the internet to process image text, or attach a text document (PDF, DOCX, PPTX, TXT, MD, CSV, JSON, XML).'
               );
-              setIsLoading(false);
-              isSubmittingRef.current = false;
-              return false;
             }
 
             if (extResult.status === 'scanned_or_image_only') {
-              setPersistenceError(
+              return failPreflightIfActive(
                 extResult.warning ||
                   'No readable text could be extracted from this PDF. This document appears to be scanned or contains rasterized pages without a text layer. Please attach a text-based document or connect to the internet.'
               );
-              setIsLoading(false);
-              isSubmittingRef.current = false;
-              return false;
             }
 
             if (extResult.status === 'empty') {
-              setPersistenceError(`The attached file '${att.name}' is empty (0 bytes). Please attach a file with content.`);
-              setIsLoading(false);
-              isSubmittingRef.current = false;
-              return false;
+              return failPreflightIfActive(
+                `The attached file '${att.name}' is empty (0 bytes). Please attach a file with content.`
+              );
             }
 
             if (extResult.status === 'encrypted') {
-              setPersistenceError(
+              return failPreflightIfActive(
                 extResult.error || `The attached document '${att.name}' is password-protected or encrypted.`
               );
-              setIsLoading(false);
-              isSubmittingRef.current = false;
-              return false;
             }
 
             if (!extResult.success || extResult.status === 'unsupported_format' || extResult.status === 'corrupted' || extResult.status === 'error') {
-              setPersistenceError(
+              return failPreflightIfActive(
                 extResult.error || extResult.warning || `Cannot extract text locally from '${att.name}'. Supported offline formats: PDF, DOCX, PPTX, TXT, MD, CSV, TSV, JSON, XML.`
               );
-              setIsLoading(false);
-              isSubmittingRef.current = false;
-              return false;
             }
 
             if (!extResult.text || !extResult.text.trim()) {
-              setPersistenceError(
+              return failPreflightIfActive(
                 `No readable text content was found in '${att.name}'. Please attach a document containing text.`
               );
-              setIsLoading(false);
-              isSubmittingRef.current = false;
-              return false;
             }
 
             // Save binary to IndexedDB
@@ -1644,8 +1407,10 @@ export default function ChatPage() {
               formattedSize: att.formattedSize,
               extension: att.extension,
               isImage: Boolean(att.isImage),
-              conversationId: activeChatIdRef.current || null
+              conversationId: initialChatId || null
             });
+
+            if (!isPreflightActive()) return false;
 
             localExtractedAttachments.push({
               id: att.id || extResult.fileId,
@@ -1678,12 +1443,26 @@ export default function ChatPage() {
             }
           }, UPLOAD_TIMEOUT_MS);
 
+          const onRequestCancelled = () => {
+            try {
+              uploadController.abort(createAbortError('Attachment upload cancelled.'));
+            } catch (_) {
+              uploadController.abort();
+            }
+          };
+
+          if (preflightEntry.signal.aborted) {
+            onRequestCancelled();
+          } else {
+            preflightEntry.signal.addEventListener('abort', onRequestCancelled, { once: true });
+          }
+
           try {
             const formData = new FormData();
-            if (activeChatIdRef.current) {
-              formData.append('conversationId', activeChatIdRef.current);
+            if (initialChatId) {
+              formData.append('conversationId', initialChatId);
             }
-            formData.append('provider', selectedProvider || DEFAULT_PROVIDER);
+            formData.append('provider', submitProvider || DEFAULT_PROVIDER);
             formData.append('offline', String(!isBrowserOnline()));
             filesToUpload.forEach((att) => {
               formData.append('files', att.file, att.name);
@@ -1698,7 +1477,10 @@ export default function ChatPage() {
               });
             } finally {
               clearTimeout(uploadTimeoutId);
+              preflightEntry.signal.removeEventListener('abort', onRequestCancelled);
             }
+
+            if (!isPreflightActive()) return false;
 
             if (!uploadRes.ok) {
               let errorMsg = `Upload failed (${uploadRes.status})`;
@@ -1709,11 +1491,14 @@ export default function ChatPage() {
                 }
               } catch (_) {}
 
+              if (!isPreflightActive()) return false;
+
               // If Browser AI is selected and upload returned an error, attempt browser extraction fallback!
               if (isWebLLM) {
                 console.warn('Server upload endpoint failed for Browser AI, attempting local browser extraction fallback...');
                 const fallbackLocalAttachments = [];
                 for (const att of filesToUpload) {
+                  if (!isPreflightActive()) return false;
                   const extResult = await extractBrowserDocument(att.file, {
                     id: att.id,
                     name: att.name,
@@ -1721,6 +1506,7 @@ export default function ChatPage() {
                     mimeType: att.type || att.file.type,
                     extension: att.extension
                   });
+                  if (!isPreflightActive()) return false;
                   if (!extResult.success || !extResult.text) {
                     throw new Error(extResult.error || extResult.warning || `Cannot extract text locally from '${att.name}'.`);
                   }
@@ -1732,8 +1518,9 @@ export default function ChatPage() {
                     formattedSize: att.formattedSize,
                     extension: att.extension,
                     isImage: Boolean(att.isImage),
-                    conversationId: activeChatIdRef.current || null
+                    conversationId: initialChatId || null
                   });
+                  if (!isPreflightActive()) return false;
                   fallbackLocalAttachments.push({
                     id: att.id || extResult.fileId,
                     name: att.name || extResult.originalName,
@@ -1751,76 +1538,65 @@ export default function ChatPage() {
                 }
                 processedAttachments = fallbackLocalAttachments;
               } else {
-                setPersistenceError(errorMsg);
-                setIsLoading(false);
-                isSubmittingRef.current = false;
-                return false;
+                return failPreflightIfActive(errorMsg);
               }
             } else {
               const uploadData = await uploadRes.json();
-              processedAttachments = Array.isArray(uploadData?.attachments)
-                ? uploadData.attachments.map((proc, idx) => {
-                    const orig =
-                      filesToUpload[idx] ||
-                      filesToUpload.find(
-                        (f) => f.name === (proc.originalName || proc.name)
-                      );
-                    return {
-                      ...proc,
-                      file: orig?.file,
-                      previewUrl: orig?.previewUrl || proc.dataUrl,
-                      dataUrl: proc.dataUrl,
-                      base64: proc.base64 || orig?.base64,
-                      isImage: Boolean(proc.isImage || orig?.isImage)
-                    };
-                  })
+              if (!isPreflightActive()) return false;
+
+              const rawUploaded = Array.isArray(uploadData?.attachments)
+                ? uploadData.attachments
                 : [];
 
-              // Persist file blobs into IndexedDB for robust local preview/download across reloads
-              await Promise.all(
-                filesToUpload.map(async (attItem, i) => {
-                  const proc =
-                    processedAttachments[i] ||
-                    processedAttachments.find(
-                      (p) => (p.originalName || p.name) === attItem.name
+              // Persist file blobs into IndexedDB first so React message state never needs large base64/dataUrl strings
+              processedAttachments = await Promise.all(
+                rawUploaded.map(async (proc, idx) => {
+                  const orig =
+                    filesToUpload[idx] ||
+                    filesToUpload.find(
+                      (f) => f.name === (proc.originalName || proc.name)
                     );
-                  if (proc && proc.id && attItem.file) {
+                  const { base64: _b64, dataUrl: _dUrl, data: _rawData, ...cleanProc } = proc || {};
+                  let savedInIdb = false;
+
+                  if (cleanProc.id && orig?.file) {
                     try {
-                      await saveAttachmentBlob(proc.id, attItem.file, {
-                        name: proc.name || attItem.name,
-                        originalName: proc.originalName || attItem.name,
-                        mimeType: proc.type || attItem.file.type,
-                        size: proc.size || attItem.file.size,
-                        formattedSize: proc.formattedSize || attItem.formattedSize,
-                        extension: proc.extension || attItem.extension,
-                        isImage: Boolean(attItem.isImage),
-                        conversationId: activeChatIdRef.current || null
+                      savedInIdb = await saveAttachmentBlob(cleanProc.id, orig.file, {
+                        name: cleanProc.name || orig.name,
+                        originalName: cleanProc.originalName || orig.name,
+                        mimeType: cleanProc.type || cleanProc.mimeType || orig.file.type,
+                        size: cleanProc.size || orig.file.size,
+                        formattedSize: cleanProc.formattedSize || orig.formattedSize,
+                        extension: cleanProc.extension || orig.extension,
+                        isImage: Boolean(cleanProc.isImage || orig.isImage),
+                        conversationId: initialChatId || null
                       });
                     } catch (e) {
                       console.warn('Could not cache blob in IndexedDB:', e);
                     }
-
-                    // Attach base64 data for images under 3MB so stateless serverless environments have direct multimodal access
-                    if (attItem.isImage && attItem.file.size <= 3 * 1024 * 1024 && !proc.base64) {
-                      try {
-                        const b64 = await new Promise((resolve) => {
-                          const reader = new FileReader();
-                          reader.onload = () => resolve(reader.result);
-                          reader.onerror = () => resolve(null);
-                          reader.readAsDataURL(attItem.file);
-                        });
-                        if (b64) {
-                          proc.base64 = b64;
-                          if (!proc.dataUrl) proc.dataUrl = b64;
-                          if (!proc.previewUrl) proc.previewUrl = b64;
-                        }
-                      } catch (_) {}
-                    }
                   }
+
+                  const safePreviewUrl =
+                    typeof orig?.previewUrl === 'string' && orig.previewUrl.startsWith('blob:')
+                      ? orig.previewUrl
+                      : undefined;
+
+                  return {
+                    ...cleanProc,
+                    ...(savedInIdb ? {} : orig?.file ? { file: orig.file } : {}),
+                    ...(safePreviewUrl ? { previewUrl: safePreviewUrl } : {}),
+                    isImage: Boolean(cleanProc.isImage || orig?.isImage)
+                  };
                 })
               );
+
+              if (!isPreflightActive()) return false;
             }
           } catch (uploadErr) {
+            if (!isPreflightActive()) {
+              return false;
+            }
+
             console.error('File upload network error:', uploadErr);
 
             // If selectedProvider is Browser AI, gracefully fallback to browser-side text extraction!
@@ -1829,6 +1605,8 @@ export default function ChatPage() {
                 console.warn('Network upload failed for Browser AI, attempting local browser extraction fallback...');
                 const fallbackLocalAttachments = [];
                 for (const att of filesToUpload) {
+                  if (!isPreflightActive()) return false;
+
                   if (att.extraction?.status === 'ready' && att.extraction?.text) {
                     fallbackLocalAttachments.push({ ...att, status: 'ready' });
                     continue;
@@ -1841,6 +1619,8 @@ export default function ChatPage() {
                     mimeType: att.type || att.file.type,
                     extension: att.extension
                   });
+
+                  if (!isPreflightActive()) return false;
 
                   if (extResult.isImage || extResult.status === 'unsupported_offline') {
                     throw new Error('Image text recognition (OCR) requires an internet connection. Connect to the internet to process image text, or attach a text document (PDF, DOCX, PPTX, TXT, MD, CSV, JSON, XML).');
@@ -1866,8 +1646,10 @@ export default function ChatPage() {
                     formattedSize: att.formattedSize,
                     extension: att.extension,
                     isImage: Boolean(att.isImage),
-                    conversationId: activeChatIdRef.current || null
+                    conversationId: initialChatId || null
                   });
+
+                  if (!isPreflightActive()) return false;
 
                   fallbackLocalAttachments.push({
                     id: att.id || extResult.fileId,
@@ -1887,10 +1669,9 @@ export default function ChatPage() {
 
                 processedAttachments = fallbackLocalAttachments;
               } catch (fallbackErr) {
-                setPersistenceError(`Failed to process attachment: ${fallbackErr?.message || 'Local extraction failed.'}`);
-                setIsLoading(false);
-                isSubmittingRef.current = false;
-                return false;
+                return failPreflightIfActive(
+                  `Failed to process attachment: ${fallbackErr?.message || 'Local extraction failed.'}`
+                );
               }
             } else {
               let userMsg = uploadErr?.message || 'Network request failed';
@@ -1905,15 +1686,12 @@ export default function ChatPage() {
                   userMsg = 'Attachment upload was cancelled or timed out. Please try again.';
                 }
               } else if (userMsg.toLowerCase().includes('failed to fetch') || userMsg.toLowerCase().includes('networkerror')) {
-                userMsg = !isBrowserOnline() || selectedProvider === 'ollama'
+                userMsg = !isBrowserOnline() || submitProvider === 'ollama'
                   ? 'Could not reach the local Orvix backend server (/api/upload). Please verify the local server is running.'
                   : 'Network error while connecting to upload server. Please verify the server is running and check your connection.';
               }
 
-              setPersistenceError(`Failed to upload attachments: ${userMsg}`);
-              setIsLoading(false);
-              isSubmittingRef.current = false;
-              return false;
+              return failPreflightIfActive(`Failed to upload attachments: ${userMsg}`);
             }
           }
         }
@@ -1933,7 +1711,11 @@ export default function ChatPage() {
       }
     }
 
-    let currentChatId = activeChatIdRef.current;
+    if (!isPreflightActive()) {
+      return false;
+    }
+
+    let currentChatId = initialChatId;
 
     try {
       // Create a conversation only when the user sends their first message.
@@ -1947,11 +1729,13 @@ export default function ChatPage() {
 
         if (isCloudEnabled && currentUser?.uid) {
           try {
-            currentChatId = await createChatDocument(
+            const createdId = await createChatDocument(
               currentUser.uid,
               titleSnippet,
               activeMode
             );
+            if (!isPreflightActive()) return false;
+            currentChatId = createdId;
             skipNextChatLoadRef.current = currentChatId;
             // Ensure offline-created conversations appear immediately in the sidebar
             const cachedList = getCachedUserChats(currentUser.uid);
@@ -1959,6 +1743,7 @@ export default function ChatPage() {
               setUserChats(cachedList);
             }
           } catch (error) {
+            if (!isPreflightActive()) return false;
             console.warn('Could not create Firestore chat doc, falling back to local conversation:', error);
             currentChatId = `local-${Date.now()}`;
             skipNextChatLoadRef.current = currentChatId;
@@ -2014,6 +1799,7 @@ export default function ChatPage() {
         );
       }
 
+      const currentMessagesSnapshot = messagesRef.current;
       const now = Date.now();
 
       const userMessage = {
@@ -2030,7 +1816,7 @@ export default function ChatPage() {
       // Detect if user sent a continuation request (e.g., 'Continue', 'Send the rest', 'Next', 'Part 2')
       const isContinuation = isContinuationRequest(trimmed);
       const multiPartContext = isContinuation
-        ? resolveMultiPartContext(messages, trimmed)
+        ? resolveMultiPartContext(currentMessagesSnapshot, trimmed)
         : { isContinuation: false, partNumber: 1, originalPrompt: trimmed, previousContentSummary: '', referencedAttachments: [] };
 
       // Check if current message has attachments, or if we should carry forward attachments from the conversation
@@ -2038,11 +1824,11 @@ export default function ChatPage() {
       let activeAttachments = processedAttachments;
       if ((!activeAttachments || activeAttachments.length === 0) && isContinuation && Array.isArray(multiPartContext.referencedAttachments) && multiPartContext.referencedAttachments.length > 0) {
         activeAttachments = multiPartContext.referencedAttachments;
-      } else if ((!activeAttachments || activeAttachments.length === 0) && messages.length > 0) {
+      } else if ((!activeAttachments || activeAttachments.length === 0) && currentMessagesSnapshot.length > 0) {
         const found = [];
         const seenIds = new Set();
-        for (let i = messages.length - 1; i >= 0; i--) {
-          const m = messages[i];
+        for (let i = currentMessagesSnapshot.length - 1; i >= 0; i--) {
+          const m = currentMessagesSnapshot[i];
           const atts = Array.isArray(m.attachments) && m.attachments.length > 0
             ? m.attachments
             : Array.isArray(m.referencedAttachments) && m.referencedAttachments.length > 0
@@ -2063,7 +1849,7 @@ export default function ChatPage() {
       }
 
       const assistantMessageId =
-        `${selectedProvider}-${now}-assistant`;
+        `${submitProvider}-${now}-assistant`;
 
       const requestStartTime = performance.now();
       const initialAssistantMessage = normalizeAssistantMessage(
@@ -2071,7 +1857,7 @@ export default function ChatPage() {
           id: assistantMessageId,
           sender: 'assistant',
           parentMessageId: userMessage.id,
-          provider: selectedProvider,
+          provider: submitProvider,
           modelUsed: null,
           mode: activeMode || 'general',
           timestamp: new Date().toLocaleTimeString([], {
@@ -2086,11 +1872,11 @@ export default function ChatPage() {
         userMessage
       );
 
-      const validHistory = messages.filter(
+      const validHistory = currentMessagesSnapshot.filter(
         (message) => !message.isError
       );
 
-      setMessages((previous) => [
+      updateMessagesState((previous) => [
         ...previous,
         userMessage,
         initialAssistantMessage
@@ -2115,16 +1901,22 @@ export default function ChatPage() {
         validHistory,
         currentChatId,
         assistantMessageId,
-        null,
+        submitProvider,
         activeAttachments,
         multiPartContext,
-        requestStartTime
+        requestStartTime,
+        null,
+        preflightRequestId
       );
       return true;
     } catch (error) {
       console.error('Submission error:', error);
-      setIsLoading(false);
-      isSubmittingRef.current = false;
+      if (requestControllerRef.current.isRequestActive(preflightRequestId)) {
+        requestControllerRef.current.markFinalized(preflightRequestId);
+      }
+      if (!requestControllerRef.current.hasActiveRequest()) {
+        setLoadingAndSubmitting(false);
+      }
       return false;
     }
   };
@@ -2141,25 +1933,29 @@ export default function ChatPage() {
       return;
     }
 
-    isSubmittingRef.current = true;
-    setIsLoading(true);
+    const providerToUse = failedMessage.failedProvider || selectedProvider;
+    if (!guardOfflineProviderAction(providerToUse)) {
+      return;
+    }
+
+    setLoadingAndSubmitting(true);
 
     const currentChatId = activeChatIdRef.current;
-    const providerToUse = failedMessage.failedProvider || selectedProvider;
+    const currentMessagesSnapshot = messagesRef.current;
 
-    const updatedMessages = messages.filter(
+    const updatedMessages = currentMessagesSnapshot.filter(
       (message) => message.id !== failedMessage.id
     );
 
-    const failedIdx = messages.findIndex((m) => m.id === failedMessage.id);
-    const precedingUser = failedIdx > 0 ? messages[failedIdx - 1] : null;
+    const failedIdx = currentMessagesSnapshot.findIndex((m) => m.id === failedMessage.id);
+    const precedingUser = failedIdx > 0 ? currentMessagesSnapshot[failedIdx - 1] : null;
     let retryAttachments =
       failedMessage.referencedAttachments ||
       precedingUser?.attachments ||
       [];
-    if ((!retryAttachments || retryAttachments.length === 0) && messages.length > 0) {
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const m = messages[i];
+    if ((!retryAttachments || retryAttachments.length === 0) && currentMessagesSnapshot.length > 0) {
+      for (let i = currentMessagesSnapshot.length - 1; i >= 0; i--) {
+        const m = currentMessagesSnapshot[i];
         if (Array.isArray(m.attachments) && m.attachments.length > 0) {
           retryAttachments = m.attachments;
           break;
@@ -2191,7 +1987,7 @@ export default function ChatPage() {
       referencedAttachments: undefined
     };
 
-    setMessages([
+    updateMessagesState([
       ...updatedMessages,
       initialAssistantMessage
     ]);
@@ -2229,28 +2025,32 @@ export default function ChatPage() {
       return;
     }
 
+    if (!guardOfflineProviderAction(newProviderId)) {
+      return;
+    }
+
     handleSelectProvider(newProviderId);
 
     const requestStartTime = performance.now();
 
-    isSubmittingRef.current = true;
-    setIsLoading(true);
+    setLoadingAndSubmitting(true);
 
     const currentChatId = activeChatIdRef.current;
+    const currentMessagesSnapshot = messagesRef.current;
 
-    const updatedMessages = messages.filter(
+    const updatedMessages = currentMessagesSnapshot.filter(
       (message) => message.id !== failedMessage.id
     );
 
-    const failedSwitchIdx = messages.findIndex((m) => m.id === failedMessage.id);
-    const precedingSwitchUser = failedSwitchIdx > 0 ? messages[failedSwitchIdx - 1] : null;
+    const failedSwitchIdx = currentMessagesSnapshot.findIndex((m) => m.id === failedMessage.id);
+    const precedingSwitchUser = failedSwitchIdx > 0 ? currentMessagesSnapshot[failedSwitchIdx - 1] : null;
     let switchAttachments =
       failedMessage.referencedAttachments ||
       precedingSwitchUser?.attachments ||
       [];
-    if ((!switchAttachments || switchAttachments.length === 0) && messages.length > 0) {
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const m = messages[i];
+    if ((!switchAttachments || switchAttachments.length === 0) && currentMessagesSnapshot.length > 0) {
+      for (let i = currentMessagesSnapshot.length - 1; i >= 0; i--) {
+        const m = currentMessagesSnapshot[i];
         if (Array.isArray(m.attachments) && m.attachments.length > 0) {
           switchAttachments = m.attachments;
           break;
@@ -2280,7 +2080,7 @@ export default function ChatPage() {
       referencedAttachments: undefined
     };
 
-    setMessages([
+    updateMessagesState([
       ...updatedMessages,
       initialAssistantMessage
     ]);
@@ -2310,7 +2110,7 @@ export default function ChatPage() {
   const handleRestorePrompt = (promptText) => {
     setInputValue(promptText);
 
-    setMessages((previous) =>
+    updateMessagesState((previous) =>
       previous.filter(
         (message) => message.failedPrompt !== promptText
       )
@@ -2324,13 +2124,14 @@ export default function ChatPage() {
     if (isLoading || isSubmittingRef.current || !assistantMessage?.id) return;
 
     const currentChatId = activeChatIdRef.current;
-    const msgIndex = messages.findIndex((m) => m.id === assistantMessage.id);
+    const currentMessagesSnapshot = messagesRef.current;
+    const msgIndex = currentMessagesSnapshot.findIndex((m) => m.id === assistantMessage.id);
     if (msgIndex === -1) return;
 
     // Find the user prompt preceding this assistant message
     const precedingUserMessage = assistantMessage.parentMessageId
-      ? messages.find((m) => m.id === assistantMessage.parentMessageId)
-      : [...messages.slice(0, msgIndex)].reverse().find((m) => m.sender === 'user');
+      ? currentMessagesSnapshot.find((m) => m.id === assistantMessage.parentMessageId)
+      : [...currentMessagesSnapshot.slice(0, msgIndex)].reverse().find((m) => m.sender === 'user');
 
     if (!precedingUserMessage || (!precedingUserMessage.content && (!precedingUserMessage.attachments || precedingUserMessage.attachments.length === 0))) {
       console.warn('Cannot regenerate: preceding user prompt not found.');
@@ -2342,19 +2143,24 @@ export default function ChatPage() {
       (Array.isArray(precedingUserMessage.attachments) && precedingUserMessage.attachments.length > 0
         ? `[User attached ${precedingUserMessage.attachments.length} file: ${precedingUserMessage.attachments.map((a) => a.name || a.originalName).join(', ')}]`
         : '');
-    const userMsgIndex = messages.findIndex((m) => m.id === precedingUserMessage.id);
-    const validHistory = messages.slice(0, userMsgIndex).filter((m) => !m.isError);
+    const userMsgIndex = currentMessagesSnapshot.findIndex((m) => m.id === precedingUserMessage.id);
+    const validHistory = currentMessagesSnapshot.slice(0, userMsgIndex).filter((m) => !m.isError);
 
     // Identify the provider/model of the response currently being viewed
-    const normalizedTarget = normalizeAssistantMessage(assistantMessage, precedingUserMessage);
+    const latestAssistant = currentMessagesSnapshot[msgIndex] || assistantMessage;
+    const normalizedTarget = normalizeAssistantMessage(latestAssistant, precedingUserMessage);
     const activeAlt = getActiveAlternative(normalizedTarget);
-    const providerToUse = activeAlt?.provider || assistantMessage.provider || selectedProvider;
-    const modelToUse = activeAlt?.modelUsed || assistantMessage.modelUsed || null;
+    const providerToUse = activeAlt?.provider || latestAssistant.provider || selectedProvider;
+    const rawModelCandidate = activeAlt?.modelUsed || latestAssistant.modelUsed || null;
+    const modelToUse = sanitizeModelForProvider(providerToUse, rawModelCandidate);
+
+    if (!guardOfflineProviderAction(providerToUse)) {
+      return;
+    }
 
     const requestStartTime = performance.now();
 
-    isSubmittingRef.current = true;
-    setIsLoading(true);
+    setLoadingAndSubmitting(true);
     setPersistenceError(null);
 
     const targetAssistantId = assistantMessage.id;
@@ -2363,12 +2169,12 @@ export default function ChatPage() {
     persistedMessageIdsRef.current.delete(targetAssistantId);
 
     let precedingAttachments =
-      assistantMessage.referencedAttachments ||
+      latestAssistant.referencedAttachments ||
       precedingUserMessage?.attachments ||
       [];
-    if ((!precedingAttachments || precedingAttachments.length === 0) && messages.length > 0) {
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const m = messages[i];
+    if ((!precedingAttachments || precedingAttachments.length === 0) && currentMessagesSnapshot.length > 0) {
+      for (let i = currentMessagesSnapshot.length - 1; i >= 0; i--) {
+        const m = currentMessagesSnapshot[i];
         if (Array.isArray(m.attachments) && m.attachments.length > 0) {
           precedingAttachments = m.attachments;
           break;
@@ -2381,7 +2187,7 @@ export default function ChatPage() {
     }
 
     // Update active alternative in-place to streaming state using its own provider without replacing other alternatives
-    setMessages((previous) =>
+    updateMessagesState((previous) =>
       previous.map((m) => {
         if (m.id !== targetAssistantId) return m;
         const normalized = normalizeAssistantMessage(m, precedingUserMessage);
@@ -2426,12 +2232,13 @@ export default function ChatPage() {
     if (isLoading || isSubmittingRef.current || !assistantMessage?.id || !targetProvider) return;
 
     const currentChatId = activeChatIdRef.current;
-    const msgIndex = messages.findIndex((m) => m.id === assistantMessage.id);
+    const currentMessagesSnapshot = messagesRef.current;
+    const msgIndex = currentMessagesSnapshot.findIndex((m) => m.id === assistantMessage.id);
     if (msgIndex === -1) return;
 
     const precedingUserMessage = assistantMessage.parentMessageId
-      ? messages.find((m) => m.id === assistantMessage.parentMessageId)
-      : [...messages.slice(0, msgIndex)].reverse().find((m) => m.sender === 'user');
+      ? currentMessagesSnapshot.find((m) => m.id === assistantMessage.parentMessageId)
+      : [...currentMessagesSnapshot.slice(0, msgIndex)].reverse().find((m) => m.sender === 'user');
 
     if (!precedingUserMessage || (!precedingUserMessage.content && (!precedingUserMessage.attachments || precedingUserMessage.attachments.length === 0))) {
       console.warn('Cannot generate alternative: preceding user prompt not found.');
@@ -2443,13 +2250,18 @@ export default function ChatPage() {
       (Array.isArray(precedingUserMessage.attachments) && precedingUserMessage.attachments.length > 0
         ? `[User attached ${precedingUserMessage.attachments.length} file: ${precedingUserMessage.attachments.map((a) => a.name || a.originalName).join(', ')}]`
         : '');
-    const userMsgIndex = messages.findIndex((m) => m.id === precedingUserMessage.id);
-    const validHistory = messages.slice(0, userMsgIndex).filter((m) => !m.isError);
+    const userMsgIndex = currentMessagesSnapshot.findIndex((m) => m.id === precedingUserMessage.id);
+    const validHistory = currentMessagesSnapshot.slice(0, userMsgIndex).filter((m) => !m.isError);
 
     const chosenProvider = typeof targetProvider === 'object' && targetProvider?.provider
       ? targetProvider.provider
       : targetProvider;
-    const chosenModel = typeof targetProvider === 'object' && targetProvider?.model
+
+    if (!guardOfflineProviderAction(chosenProvider)) {
+      return;
+    }
+
+    const rawChosenModel = typeof targetProvider === 'object' && targetProvider?.model
       ? targetProvider.model
       : (chosenProvider === 'ollama'
           ? 'qwen2.5:1.5b'
@@ -2462,24 +2274,25 @@ export default function ChatPage() {
           : chosenProvider === 'cloudflare'
           ? '@cf/meta/llama-3.1-8b-instruct'
           : 'gemini-3.1-flash-lite');
+    const chosenModel = sanitizeModelForProvider(chosenProvider, rawChosenModel);
 
     const targetAssistantId = assistantMessage.id;
     const requestStartTime = performance.now();
 
-    isSubmittingRef.current = true;
-    setIsLoading(true);
+    setLoadingAndSubmitting(true);
     setPersistenceError(null);
 
     // Allow cache/Firestore overwrite for this message ID
     persistedMessageIdsRef.current.delete(targetAssistantId);
 
+    const latestAssistant = currentMessagesSnapshot[msgIndex] || assistantMessage;
     let precedingAttachments =
-      assistantMessage.referencedAttachments ||
+      latestAssistant.referencedAttachments ||
       precedingUserMessage?.attachments ||
       [];
-    if ((!precedingAttachments || precedingAttachments.length === 0) && messages.length > 0) {
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const m = messages[i];
+    if ((!precedingAttachments || precedingAttachments.length === 0) && currentMessagesSnapshot.length > 0) {
+      for (let i = currentMessagesSnapshot.length - 1; i >= 0; i--) {
+        const m = currentMessagesSnapshot[i];
         if (Array.isArray(m.attachments) && m.attachments.length > 0) {
           precedingAttachments = m.attachments;
           break;
@@ -2504,7 +2317,7 @@ export default function ChatPage() {
       referencedAttachments: undefined
     });
 
-    setMessages((previous) =>
+    updateMessagesState((previous) =>
       previous.map((m) => {
         if (m.id !== targetAssistantId) return m;
         const normalized = normalizeAssistantMessage(m, precedingUserMessage);
@@ -2556,31 +2369,7 @@ export default function ChatPage() {
   // Stop active AI response generation
   const handleStopGenerating = () => {
     stopSpeech();
-    isUserStoppedRef.current = true;
-
-    if (
-      selectedProvider === 'webllm' ||
-      webllmState.status === 'generating' ||
-      webllmState.status === 'downloading' ||
-      webllmState.status === 'loading'
-    ) {
-      stopWebLLMGeneration();
-    }
-
-    if (activeAbortControllerRef.current) {
-      try {
-        activeAbortControllerRef.current.abort();
-      } catch (_) {}
-      activeAbortControllerRef.current = null;
-    }
-
-    if (activeAnimationRef.current) {
-      activeAnimationRef.current();
-      activeAnimationRef.current = null;
-    }
-
-    setIsLoading(false);
-    isSubmittingRef.current = false;
+    cancelCurrentGeneration('stopped');
   };
 
   // Start inline editing mode for a user message
@@ -2606,30 +2395,46 @@ export default function ChatPage() {
 
     const requestStartTime = performance.now();
 
-    const userMsgIndex = messages.findIndex((m) => m.id === userMessageId);
+    const currentMessagesSnapshot = messagesRef.current;
+    const userMsgIndex = currentMessagesSnapshot.findIndex((m) => m.id === userMessageId);
     if (userMsgIndex === -1) return;
+
+    const editProvider = selectedProvider;
+    if (!guardOfflineProviderAction(editProvider)) {
+      return;
+    }
+
+    const initialChatId = activeChatIdRef.current;
+    const editPreflight = requestControllerRef.current.beginRequest({
+      chatId: initialChatId,
+      provider: editProvider,
+      phase: 'preflight'
+    });
+    const editRequestId = editPreflight.requestId;
 
     // Reset inline edit mode
     setEditingMessageId(null);
 
-    isSubmittingRef.current = true;
-    setIsLoading(true);
+    setLoadingAndSubmitting(true);
     setPersistenceError(null);
 
-    let currentChatId = activeChatIdRef.current;
+    let currentChatId = initialChatId;
 
     // Ensure we have an active chat ID
     if (!currentChatId) {
       const titleSnippet = generateChatTitle(trimmed);
       if (isCloudEnabled && currentUser?.uid) {
         try {
-          currentChatId = await createChatDocument(currentUser.uid, titleSnippet, activeMode);
+          const createdId = await createChatDocument(currentUser.uid, titleSnippet, activeMode);
+          if (!requestControllerRef.current.isRequestActive(editRequestId)) return;
+          currentChatId = createdId;
           skipNextChatLoadRef.current = currentChatId;
           const cachedList = getCachedUserChats(currentUser.uid);
           if (cachedList.length > 0) {
             setUserChats(cachedList);
           }
         } catch (error) {
+          if (!requestControllerRef.current.isRequestActive(editRequestId)) return;
           console.warn('Could not create Firestore chat doc for edit, using local fallback:', error);
           currentChatId = `local-${Date.now()}`;
           skipNextChatLoadRef.current = currentChatId;
@@ -2671,12 +2476,14 @@ export default function ChatPage() {
       sessionStorage.setItem('chatora_active_chat', currentChatId);
     }
 
+    if (!requestControllerRef.current.isRequestActive(editRequestId)) return;
+
     // 1. Context: identify all previous non-error messages strictly before this message
-    const earlierMessages = messages.slice(0, userMsgIndex);
+    const earlierMessages = currentMessagesSnapshot.slice(0, userMsgIndex);
     const validHistory = earlierMessages.filter((m) => !m.isError);
 
     // 2. Truncation: identify all contradictory later messages to be removed from the thread
-    const laterMessages = messages.slice(userMsgIndex + 1);
+    const laterMessages = currentMessagesSnapshot.slice(userMsgIndex + 1);
     const laterMessageIds = laterMessages.map((m) => m.id).filter(Boolean);
 
     // 3. Invalidate persistence cache for truncated message IDs
@@ -2685,8 +2492,19 @@ export default function ChatPage() {
     });
 
     // 4. Update the user message in-place with the edited prompt and current timestamp
+    //    (ensure transient base64/dataUrl fields cannot linger in React state or localStorage)
     const updatedUserMessage = {
-      ...messages[userMsgIndex],
+      ...currentMessagesSnapshot[userMsgIndex],
+      attachments: Array.isArray(currentMessagesSnapshot[userMsgIndex]?.attachments)
+        ? currentMessagesSnapshot[userMsgIndex].attachments.map((att) => {
+            if (!att || typeof att !== 'object') return att;
+            const { base64: _b64, dataUrl: _dUrl, data: _rawData, ...cleanAtt } = att;
+            if (typeof cleanAtt.previewUrl === 'string' && cleanAtt.previewUrl.startsWith('data:')) {
+              delete cleanAtt.previewUrl;
+            }
+            return cleanAtt;
+          })
+        : currentMessagesSnapshot[userMsgIndex]?.attachments,
       content: trimmed,
       timestamp: new Date().toLocaleTimeString([], {
         hour: '2-digit',
@@ -2699,13 +2517,13 @@ export default function ChatPage() {
 
     // 5. Create fresh assistant response placeholder
     const now = Date.now();
-    const assistantMessageId = `${selectedProvider}-${now}-assistant`;
+    const assistantMessageId = `${editProvider}-${now}-assistant`;
     const initialAssistantMessage = normalizeAssistantMessage(
       {
         id: assistantMessageId,
         sender: 'assistant',
         parentMessageId: updatedUserMessage.id,
-        provider: selectedProvider,
+        provider: editProvider,
         modelUsed: null,
         timestamp: new Date().toLocaleTimeString([], {
           hour: '2-digit',
@@ -2725,7 +2543,7 @@ export default function ChatPage() {
       updatedUserMessage,
       initialAssistantMessage
     ];
-    setMessages(nextMessages);
+    updateMessagesState(nextMessages);
 
     // 7. Persist changes to Cloud Firestore or Guest Storage
     if (isCloudEnabled && currentUser?.uid) {
@@ -2768,10 +2586,12 @@ export default function ChatPage() {
       validHistory,
       currentChatId,
       assistantMessageId,
-      null,
+      editProvider,
       updatedUserMessage.attachments || [],
       {},
-      requestStartTime
+      requestStartTime,
+      null,
+      editRequestId
     );
   };
 
@@ -2856,6 +2676,7 @@ export default function ChatPage() {
       onExportMarkdown={handleExportMarkdown}
       onExportText={handleExportText}
       hasExportableMessages={hasExportableMessages}
+      providerConfig={providerConfig}
     >
       {isOffline && !offlineBannerDismissed && (
         <div
@@ -3009,6 +2830,7 @@ export default function ChatPage() {
         onLoadWebLLMModel={handleLoadWebLLMModel}
         onCancelWebLLMLoad={handleCancelWebLLMLoad}
         onUnloadWebLLMModel={handleUnloadWebLLMModel}
+        providerConfig={providerConfig}
       />
     </Layout>
   );
