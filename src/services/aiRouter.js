@@ -32,7 +32,8 @@ export const PROVIDER_OPTIONS = [
   {
     id: AI_PROVIDERS.GEMINI,
     name: 'Gemini',
-    modelTag: 'Gemini 3.8 Flash',
+    modelTag: 'Gemini 2.5 Flash',
+    defaultModel: 'gemini-2.5-flash',
     description: 'Google Gemini'
   },
   {
@@ -428,6 +429,13 @@ export function parseRouterError(rawError, statusCode = 500, providerHint = null
       cleanMsg =
         'The attached image payload exceeds the supported request budget (3.0 MB max per image, 4.2 MB max total request). Please resize or compress the image and try again.';
     }
+  } else if (upperStatus === 'SAFETY_BLOCKED' || lowerMsg.includes('safety')) {
+    code = 400;
+    status = 'SAFETY_BLOCKED';
+    retryable = false;
+    if (!cleanMsg || cleanMsg.includes('Server request failed')) {
+      cleanMsg = "The response was blocked by Google Gemini's safety filters. Please rephrase your request.";
+    }
   } else if (code === 400 || upperStatus === 'INVALID_ARGUMENT') {
     code = 400;
     status = 'INVALID_ARGUMENT';
@@ -469,6 +477,12 @@ export function parseRouterError(rawError, statusCode = 500, providerHint = null
     err.canFallback = false;
   } else if (normalizedHint) {
     err.provider = normalizedHint;
+  }
+  if (isObjectInput && typeof rawError.canFallback === 'boolean') {
+    err.canFallback = rawError.canFallback;
+  }
+  if (isObjectInput && rawError.finishReason) {
+    err.finishReason = rawError.finishReason;
   }
   return err;
 }

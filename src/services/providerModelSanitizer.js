@@ -38,7 +38,7 @@ export const PROVIDER_DISPLAY_NAMES = Object.freeze({
 });
 
 export const PROVIDER_DEFAULT_MODELS = Object.freeze({
-  gemini: 'gemini-3.8-flash',
+  gemini: 'gemini-2.5-flash',
   groq: 'openai/gpt-oss-120b',
   openrouter: 'openrouter/free',
   cloudflare: '@cf/meta/llama-3.1-8b-instruct',
@@ -179,7 +179,7 @@ export function isDisplayOnlyModelLabel(model) {
 /**
  * Checks whether a clean, single-token model ID is structurally valid for a specific provider.
  * Rejects cross-provider model leakage (e.g., `@cf/...` sent to Gemini, `qwen2.5:1.5b` sent to Groq,
- * `Qwen2.5-...-MLC` sent to OpenRouter, `gemini-3.8-flash` sent to Cloudflare).
+ * `Qwen2.5-...-MLC` sent to OpenRouter, `gemini-2.5-flash` sent to Cloudflare).
  *
  * @param {string} provider
  * @param {string} candidateModel
@@ -206,6 +206,14 @@ export function checkModelCompatibilityForProvider(provider, candidateModel) {
 
   switch (normProvider) {
     case 'gemini': {
+      // Reject unreleased placeholder model gemini-3.8-flash
+      if (lower === 'gemini-3.8-flash' || lower === 'models/gemini-3.8-flash') {
+        return {
+          compatible: false,
+          normalizedModel: null,
+          reason: `Model "${trimmed}" is an invalid or unreleased Google Gemini model identifier. Please use a verified model such as "gemini-2.5-flash".`
+        };
+      }
       // Valid Gemini IDs: gemini-*, learnlm-*, gemma-*, or models/gemini-*
       if (/^(?:models\/)?(?:gemini|learnlm|gemma)-[a-z0-9._-]+$/i.test(trimmed) && !/-mlc$/i.test(trimmed)) {
         return { compatible: true, normalizedModel: trimmed };

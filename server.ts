@@ -767,7 +767,26 @@ export function parseGeminiError(err: any, provider = 'gemini'): {
     };
   }
 
-  // 6. Model Not Found / Decommissioned Model
+  // 6. Safety Filter Block
+  if (
+    lowerMsg.includes('safety') ||
+    lowerMsg.includes('blocked due to safety') ||
+    lowerMsg.includes('candidate was blocked') ||
+    upperStatus === 'SAFETY' ||
+    upperStatus === 'SAFETY_BLOCKED'
+  ) {
+    return {
+      statusCode: 400,
+      status: 'SAFETY_BLOCKED',
+      category: 'request validation error',
+      isUnavailable: false,
+      isRetryable: false,
+      message: "The response was blocked by Google Gemini's safety filters. Please rephrase your request.",
+      retryAfterSeconds
+    };
+  }
+
+  // 7. Model Not Found / Decommissioned Model
   if (
     statusCode === 404 ||
     upperStatus === 'NOT_FOUND' ||
@@ -3230,7 +3249,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
           : availableDocs.length > 0
           ? generateSimulatedDocumentResponse(prompt, prepDoc)
           : generateSimulatedResponse(prompt, cleanUsername, preferences, mode);
-        const demoModel = availableDocs.length > 0 ? 'Document Analyzer (demo)' : 'gemini-3.1-flash-lite (demo)';
+        const demoModel = availableDocs.length > 0 ? 'Document Analyzer (demo)' : 'gemini-2.5-flash (demo)';
         if (!shouldStream) {
           return res.json({
             text,
@@ -3285,15 +3304,20 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
       const imageParts: Array<{ mimeType: string; data: string }> = validatedGeminiImageParts;
       const contents = formatGeminiHistory(history, effectivePrompt, 12, imageParts);
-      // Attempt sequence: max 3 attempts total (initial attempt + up to 2 retries)
-      // Uses the validated Gemini model if specified, falling back to gemini-3.8-flash and gemini-flash-latest
-      const requestedGeminiModel = validatedClientModel || 'gemini-3.1-flash-lite';
-
-      const attemptPlan = [
-        { model: requestedGeminiModel, attemptNum: 1 },
-        { model: requestedGeminiModel === 'gemini-3.8-flash' ? 'gemini-3.1-flash-lite' : 'gemini-3.8-flash', attemptNum: 2 },
-        { model: 'gemini-flash-latest', attemptNum: 3 }
-      ];
+      // Attempt sequence: max 3 attempts total (initial attempt + valid fallbacks)
+      // Uses the validated Gemini model if specified, falling back to gemini-flash-latest
+      const requestedGeminiModel = validatedClientModel || 'gemini-2.5-flash';
+      const fallbackCandidates = ['gemini-2.5-flash', 'gemini-flash-latest'];
+      const uniquePlanModels = [requestedGeminiModel];
+      for (const cand of fallbackCandidates) {
+        if (!uniquePlanModels.includes(cand)) {
+          uniquePlanModels.push(cand);
+        }
+      }
+      const attemptPlan = uniquePlanModels.map((m, idx) => ({
+        model: m,
+        attemptNum: idx + 1
+      }));
       const maxAttempts = attemptPlan.length;
 
       let targetGeminiTokens = 4096;
@@ -3328,15 +3352,52 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
             if (upstreamGuard.isClientClosed()) return;
 
-            if (response && response.text) {
-              let finalText = response.text;
-              if (isLikelyLarge && !isContinuation && !responseHasContinuationNotice(finalText)) {
+            const candidate = response?.candidates?.[0];
+            const finishReason = candidate?.finishReason || (response as any)?.promptFeedback?.blockReason;
+
+            // Handle safety filter block
+            if (finishReason === 'SAFETY' || (response as any)?.promptFeedback?.blockReason === 'SAFETY') {
+              return res.status(400).json({
+                error: "The response was blocked by Google Gemini's safety filters. Please rephrase your request.",
+                code: 400,
+                status: 'SAFETY_BLOCKED',
+                provider: 'gemini',
+                model,
+                retryable: false,
+                canFallback: true,
+                finishReason: 'SAFETY'
+              });
+            }
+
+            let finalText = '';
+            try {
+              finalText = response?.text || '';
+            } catch (textErr: any) {
+              if (String(textErr?.message || '').toLowerCase().includes('safety')) {
+                return res.status(400).json({
+                  error: "The response was blocked by Google Gemini's safety filters. Please rephrase your request.",
+                  code: 400,
+                  status: 'SAFETY_BLOCKED',
+                  provider: 'gemini',
+                  model,
+                  retryable: false,
+                  canFallback: true,
+                  finishReason: 'SAFETY'
+                });
+              }
+            }
+
+            if (finalText) {
+              const isTruncated = finishReason === 'MAX_TOKENS';
+              if ((isTruncated || isLikelyLarge) && !isContinuation && !responseHasContinuationNotice(finalText)) {
                 finalText += CONTINUATION_NOTICES.PART_1;
               }
               return res.json({
                 text: finalText,
                 modelUsed: model,
-                provider: 'gemini'
+                provider: 'gemini',
+                ...(finishReason ? { finishReason } : {}),
+                ...(isTruncated ? { truncated: true } : {})
               });
             }
           } catch (err: any) {
@@ -3346,7 +3407,10 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
             const parsed = parseGeminiError(err, 'gemini');
             lastParsedErr = parsed;
             const hasMoreAttempts = i < attemptPlan.length - 1;
-            const willRetry = parsed.isRetryable && hasMoreAttempts && !upstreamGuard.isClientClosed();
+
+            const isModelNotFound = parsed.statusCode === 404 || parsed.status === 'NOT_FOUND';
+            const willAdvanceFallback = isModelNotFound && hasMoreAttempts;
+            const willRetry = (parsed.isRetryable || willAdvanceFallback) && hasMoreAttempts && !upstreamGuard.isClientClosed();
 
             logAIDiagnostic({
               category: parsed.category,
@@ -3362,7 +3426,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
               willRetry
             });
 
-            if (!parsed.isRetryable) {
+            if (!parsed.isRetryable && !willAdvanceFallback) {
               return res.status(parsed.statusCode).json({
                 error: parsed.message,
                 code: parsed.statusCode,
@@ -3376,6 +3440,10 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
             }
 
             if (willRetry) {
+              if (willAdvanceFallback) {
+                // Immediately try fallback model without delay
+                continue;
+              }
               const delay = getBackoffWithJitter(attemptNum, parsed.retryAfterSeconds);
               const continueExecution = await sleepWithAbort(delay, () => upstreamGuard.isClientClosed());
               if (!continueExecution) return;
@@ -3398,7 +3466,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
           code: fallbackErr.statusCode,
           status: fallbackErr.status,
           provider: 'gemini',
-          model: 'gemini-3.8-flash',
+          model: requestedGeminiModel,
           retryable: fallbackErr.isRetryable,
           serverRetriesExhausted: true,
           canFallback: true,
@@ -3436,6 +3504,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
             const iterator = responseStream[Symbol.asyncIterator]();
             let fullText = '';
+            let lastFinishReason: string | null = null;
 
             try {
               while (true) {
@@ -3443,6 +3512,13 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
                 const { done, value } = await iterator.next();
                 if (upstreamGuard.isClientClosed() || res.writableEnded) break;
                 if (done) break;
+
+                const candidate = value?.candidates?.[0];
+                const finishReason = candidate?.finishReason;
+                if (finishReason) {
+                  lastFinishReason = finishReason;
+                }
+
                 const chunkText = value?.text;
                 if (chunkText) {
                   fullText += chunkText;
@@ -3453,11 +3529,35 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
               stopHeartbeat();
 
               if (!upstreamGuard.isClientClosed() && !res.writableEnded) {
-                if (isLikelyLarge && !isContinuation && !responseHasContinuationNotice(fullText)) {
+                // If blocked by SAFETY with no text, send error
+                if (lastFinishReason === 'SAFETY' && fullText.trim().length === 0) {
+                  sendSSE(res, {
+                    type: 'error',
+                    error: "The response was blocked by Google Gemini's safety filters. Please rephrase your request.",
+                    code: 400,
+                    status: 'SAFETY_BLOCKED',
+                    provider: 'gemini',
+                    model,
+                    retryable: false,
+                    finishReason: 'SAFETY'
+                  });
+                  res.end();
+                  return;
+                }
+
+                const isTruncated = lastFinishReason === 'MAX_TOKENS';
+                if ((isTruncated || isLikelyLarge) && !isContinuation && !responseHasContinuationNotice(fullText)) {
                   sendSSE(res, { type: 'chunk', text: CONTINUATION_NOTICES.PART_1 });
                   fullText += CONTINUATION_NOTICES.PART_1;
                 }
-                sendSSE(res, { type: 'done', text: fullText, modelUsed: model, provider: 'gemini' });
+                sendSSE(res, {
+                  type: 'done',
+                  text: fullText,
+                  modelUsed: model,
+                  provider: 'gemini',
+                  ...(lastFinishReason ? { finishReason: lastFinishReason } : {}),
+                  ...(isTruncated ? { truncated: true } : {})
+                });
                 res.end();
               }
               return;
@@ -3489,7 +3589,8 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
                   provider: 'gemini',
                   model,
                   retryable: false,
-                  partial: fullText.length > 0
+                  partial: fullText.length > 0,
+                  ...(parsedMid.status === 'SAFETY_BLOCKED' ? { finishReason: 'SAFETY' } : {})
                 });
                 res.end();
               }
@@ -3503,7 +3604,10 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
             const parsed = parseGeminiError(initialErr, 'gemini');
             lastParsedErr = parsed;
             const hasMoreAttempts = i < attemptPlan.length - 1;
-            const willRetry = parsed.isRetryable && hasMoreAttempts && !upstreamGuard.isClientClosed();
+
+            const isModelNotFound = parsed.statusCode === 404 || parsed.status === 'NOT_FOUND';
+            const willAdvanceFallback = isModelNotFound && hasMoreAttempts;
+            const willRetry = (parsed.isRetryable || willAdvanceFallback) && hasMoreAttempts && !upstreamGuard.isClientClosed();
 
             logAIDiagnostic({
               category: parsed.category,
@@ -3519,7 +3623,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
               willRetry
             });
 
-            if (!parsed.isRetryable) {
+            if (!parsed.isRetryable && !willAdvanceFallback) {
               return res.status(parsed.statusCode).json({
                 error: parsed.message,
                 code: parsed.statusCode,
@@ -3533,6 +3637,10 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
             }
 
             if (willRetry) {
+              if (willAdvanceFallback) {
+                // Immediately try fallback model without delay
+                continue;
+              }
               const delay = getBackoffWithJitter(attemptNum, parsed.retryAfterSeconds);
               const continueExecution = await sleepWithAbort(delay, () => upstreamGuard.isClientClosed());
               if (!continueExecution) return;
@@ -3555,7 +3663,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
           code: finalErr.statusCode,
           status: finalErr.status,
           provider: 'gemini',
-          model: 'gemini-3.8-flash',
+          model: requestedGeminiModel,
           retryable: finalErr.isRetryable,
           serverRetriesExhausted: true,
           canFallback: true,

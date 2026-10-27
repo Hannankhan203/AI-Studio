@@ -2273,7 +2273,7 @@ export default function ChatPage() {
           ? 'openrouter/free'
           : chosenProvider === 'cloudflare'
           ? '@cf/meta/llama-3.1-8b-instruct'
-          : 'gemini-3.1-flash-lite');
+          : 'gemini-2.5-flash');
     const chosenModel = sanitizeModelForProvider(chosenProvider, rawChosenModel);
 
     const targetAssistantId = assistantMessage.id;
