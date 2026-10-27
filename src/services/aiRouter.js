@@ -314,6 +314,14 @@ export function parseRouterError(rawError, statusCode = 500, providerHint = null
     lowerMsg.includes('11434') ||
     lowerMsg.includes('ollama');
 
+  const isWebLLMContext =
+    normalizedHint === AI_PROVIDERS.WEBLLM ||
+    (isObjectInput && normalizeProviderId(rawError.provider) === AI_PROVIDERS.WEBLLM) ||
+    lowerMsg.includes('webllm') ||
+    lowerMsg.includes('browser ai') ||
+    upperStatus.startsWith('WEBLLM_') ||
+    upperStatus.startsWith('WEBGPU_');
+
   // 3. Dedicated Ollama local connection, timeout, & missing model handling
   if (isOllamaContext) {
     if (code === 504 || upperStatus === 'DEADLINE_EXCEEDED') {
@@ -326,18 +334,17 @@ export function parseRouterError(rawError, statusCode = 500, providerHint = null
       }
     } else {
       code = code === 404 ? 404 : code === 400 ? 400 : 503;
-      status = code === 404 ? 'NOT_FOUND' : code === 400 ? 'INVALID_ARGUMENT' : 'NETWORK_ERROR';
+      status = (isObjectInput && rawError.status) ? String(rawError.status) : (code === 404 ? 'NOT_FOUND' : code === 400 ? 'INVALID_ARGUMENT' : 'NETWORK_ERROR');
       retryable = false;
-      if (
+      const isGeneric =
         !cleanMsg ||
-        isNetwork ||
         cleanMsg === 'Service Unavailable' ||
         cleanMsg === 'Bad Gateway' ||
         cleanMsg === 'Not Found' ||
         cleanMsg.includes('Server request failed') ||
-        cleanMsg.includes('Stream connection was closed')
-      ) {
-        if (code === 404 || lowerMsg.includes('not found') || lowerMsg.includes('model')) {
+        cleanMsg.includes('Stream connection was closed');
+      if (isGeneric || (!cleanMsg.includes('Unable to connect') && (lowerMsg === 'failed to fetch' || lowerMsg === 'fetch failed'))) {
+        if (code === 404 || (code !== 503 && (lowerMsg.includes('not found') || lowerMsg.includes('model not found')))) {
           cleanMsg =
             'The requested Ollama model was not found. Please ensure it is installed locally using "ollama pull qwen2.5:1.5b".';
         } else if (lowerMsg === 'failed to fetch' || lowerMsg === 'fetch failed') {
@@ -482,6 +489,9 @@ export function parseRouterError(rawError, statusCode = 500, providerHint = null
   if (isOllamaContext) {
     err.provider = AI_PROVIDERS.OLLAMA;
     err.canFallback = false;
+  } else if (isWebLLMContext) {
+    err.provider = AI_PROVIDERS.WEBLLM;
+    err.canFallback = false;
   } else if (code === 413 || status === 'PAYLOAD_TOO_LARGE') {
     if (normalizedHint) err.provider = normalizedHint;
     err.canFallback = false;
@@ -490,6 +500,9 @@ export function parseRouterError(rawError, statusCode = 500, providerHint = null
   }
   if (isObjectInput && typeof rawError.canFallback === 'boolean') {
     err.canFallback = rawError.canFallback;
+  }
+  if (isObjectInput && Array.isArray(rawError.suggestedProviders)) {
+    err.suggestedProviders = rawError.suggestedProviders;
   }
   if (isObjectInput && rawError.finishReason) {
     err.finishReason = rawError.finishReason;
@@ -1016,7 +1029,6 @@ export async function streamAIMessage({
       const canRetryTransient =
         normalizedErr?.retryable === true &&
         !normalizedErr?.serverRetriesExhausted &&
-        normalizedProvider !== AI_PROVIDERS.OLLAMA &&
         clientAttempt < maxClientAttempts;
 
       if (canRetryTransient) {

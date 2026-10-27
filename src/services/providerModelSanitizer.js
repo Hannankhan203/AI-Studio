@@ -64,6 +64,13 @@ export const OPENROUTER_DYNAMIC_ROUTERS = Object.freeze([
 
 export const CLOUDFLARE_DEFAULT_MODEL = '@cf/meta/llama-3.1-8b-instruct';
 
+export const WEBLLM_SUPPORTED_MODELS = Object.freeze([
+  'Qwen2.5-1.5B-Instruct-q4f16_1-MLC',
+  'Qwen2.5-1.5B-Instruct-q4f32_1-MLC',
+  'Qwen2.5-0.5B-Instruct-q4f16_1-MLC',
+  'Qwen2.5-0.5B-Instruct-q4f32_1-MLC'
+]);
+
 export const RETIRED_GROQ_MODELS = Object.freeze([
   'llama3-70b-8192',
   'llama3-8b-8192',
@@ -420,20 +427,28 @@ export function checkModelCompatibilityForProvider(provider, candidateModel) {
     }
 
     case 'ollama': {
-      // Ollama local tags (`qwen2.5:1.5b`, `llama3.2:latest`, etc.) — reject cloud/WebLLM IDs
+      // Reject cross-provider model IDs (Cloudflare, Gemini, OpenRouter, WebLLM, Groq chat & Whisper transcription)
       if (
-        trimmed.includes('/') ||
         lower.startsWith('@') ||
         lower.startsWith('gemini-') ||
-        lower.endsWith('-mlc')
+        lower.startsWith('models/') ||
+        lower.startsWith('openrouter/') ||
+        lower.endsWith('-mlc') ||
+        GROQ_TRANSCRIPTION_MODEL_SET.has(lower) ||
+        lower.startsWith('whisper-') ||
+        lower.startsWith('distil-whisper') ||
+        GROQ_CHAT_MODELS.includes(lower) ||
+        RETIRED_GROQ_MODEL_SET.has(lower)
       ) {
         return {
           compatible: false,
           normalizedModel: null,
-          reason: `Model "${trimmed}" is not a valid Local AI (Ollama) model tag.`
+          reason: `Model "${trimmed}" belongs to another provider and is not valid for Local AI (Ollama).`
         };
       }
-      if (/^[a-z0-9][a-z0-9._-]*(?::[a-z0-9._-]+)?$/i.test(trimmed)) {
+      // Valid Ollama model format: standard tag (`qwen2.5:1.5b`, `llama3.2:latest`, `deepseek-r1:8b`)
+      // or namespaced model tag (`library/llama3.2:1b`, `user/custom-model:latest`)
+      if (/^(?:[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*(?::[a-z0-9._-]+)?$/i.test(trimmed)) {
         return { compatible: true, normalizedModel: trimmed };
       }
       return {
@@ -444,9 +459,39 @@ export function checkModelCompatibilityForProvider(provider, candidateModel) {
     }
 
     case 'webllm': {
-      // WebLLM MLC browser models end with `-MLC`
+      // Reject cross-provider model IDs (Gemini, Groq chat & Whisper transcription, OpenRouter, Cloudflare, Ollama tags)
+      if (
+        lower.startsWith('@') ||
+        lower.startsWith('gemini-') ||
+        lower.startsWith('models/') ||
+        lower.startsWith('openrouter/') ||
+        lower.includes(':') ||
+        GROQ_TRANSCRIPTION_MODEL_SET.has(lower) ||
+        lower.startsWith('whisper-') ||
+        lower.startsWith('distil-whisper') ||
+        GROQ_CHAT_MODELS.includes(lower) ||
+        RETIRED_GROQ_MODEL_SET.has(lower)
+      ) {
+        return {
+          compatible: false,
+          normalizedModel: null,
+          reason: `Model "${trimmed}" belongs to another provider and is not valid for Browser AI (WebLLM).`
+        };
+      }
+      // Match against verified supported WebLLM models (case-insensitive)
+      const matched = WEBLLM_SUPPORTED_MODELS.find(
+        (m) => m.toLowerCase() === lower
+      );
+      if (matched) {
+        return { compatible: true, normalizedModel: matched };
+      }
+      // Reject arbitrary unverified MLC model IDs
       if (/^[a-z0-9][a-z0-9._-]*-MLC$/i.test(trimmed)) {
-        return { compatible: true, normalizedModel: trimmed };
+        return {
+          compatible: false,
+          normalizedModel: null,
+          reason: `Model "${trimmed}" is not in the supported Browser AI (WebLLM) model registry for this project.`
+        };
       }
       return {
         compatible: false,

@@ -165,6 +165,40 @@ let activeInitAbortReject = null;
 let generationQueuePromise = Promise.resolve();
 let isGeneratingNow = false;
 let manualStopRequested = false;
+let customWorkerFactory = null;
+let customEngineFactory = null;
+
+export function setWebLLMWorkerFactoryForTesting(factory) {
+  customWorkerFactory = factory;
+}
+
+export function setWebLLMEngineFactoryForTesting(factory) {
+  customEngineFactory = factory;
+}
+
+export function resetWebLLMRuntimeForTesting() {
+  customWorkerFactory = null;
+  customEngineFactory = null;
+  webllmModulePromise = null;
+  terminateWorkerImmediate();
+  generationQueuePromise = Promise.resolve();
+  isGeneratingNow = false;
+  manualStopRequested = false;
+  activeInitPromise = null;
+  activeInitModelId = null;
+  activeInitAbortReject = null;
+  updateEngineState({
+    status: 'idle',
+    modelId: DEFAULT_WEBLLM_MODEL_ID,
+    progress: 0,
+    progressPercent: null,
+    progressText: '',
+    timeElapsed: 0,
+    isCached: false,
+    hasShaderF16: null,
+    error: null
+  });
+}
 
 const stateListeners = new Set();
 
@@ -428,10 +462,16 @@ export async function checkWebGPUSupport() {
  * @returns {string}
  */
 export function resolveWebLLMModelId(requestedModelId, options = {}) {
-  const baseId =
+  const rawId =
     requestedModelId && typeof requestedModelId === 'string' && requestedModelId.trim()
       ? requestedModelId.trim()
       : DEFAULT_WEBLLM_MODEL_ID;
+
+  // Case-insensitive lookup against verified catalog keys
+  const catalogKey = Object.keys(WEBLLM_MODEL_CATALOG).find(
+    (k) => k.toLowerCase() === rawId.toLowerCase()
+  );
+  const baseId = catalogKey || rawId;
 
   const { hasShaderF16 = true, allowF32Fallback = true } = options;
   const catalogEntry = WEBLLM_MODEL_CATALOG[baseId];
@@ -640,7 +680,7 @@ function isFatalEngineError(rawErr) {
   );
 }
 
-function normalizeWebLLMError(rawErr, { modelId = DEFAULT_WEBLLM_MODEL_ID, phase = 'generate', wasCached = false } = {}) {
+export function normalizeWebLLMError(rawErr, { modelId = DEFAULT_WEBLLM_MODEL_ID, phase = 'generate', wasCached = false } = {}) {
   if (rawErr instanceof WebLLMError) {
     return rawErr;
   }
@@ -734,6 +774,21 @@ function normalizeWebLLMError(rawErr, { modelId = DEFAULT_WEBLLM_MODEL_ID, phase
       {
         code: !isClientOnline() ? WEBLLM_ERROR_CODES.OFFLINE_UNCACHED : WEBLLM_ERROR_CODES.DOWNLOAD_FAILED,
         httpCode: 503,
+        retryable: true,
+        cause: rawErr
+      }
+    );
+  if (
+    lower.includes('worker crashed') ||
+    lower.includes('worker error') ||
+    lower.includes('webllm_worker_crashed') ||
+    lower.includes('communication with the browser ai worker failed')
+  ) {
+    return new WebLLMError(
+      'The dedicated Browser AI worker encountered an unexpected error. Please retry to restart the engine.',
+      {
+        code: WEBLLM_ERROR_CODES.WORKER_CRASHED,
+        httpCode: 500,
         retryable: true,
         cause: rawErr
       }
@@ -887,6 +942,23 @@ export async function ensureWebLLMEngine(options = {}) {
   });
 
   const catalogEntry = WEBLLM_MODEL_CATALOG[resolvedModelId];
+  if (!catalogEntry) {
+    const unsuppErr = new WebLLMError(
+      `Unsupported Browser AI model "${requestedModelId || resolvedModelId}". Please select a supported Qwen model.`,
+      {
+        code: WEBLLM_ERROR_CODES.UNSUPPORTED_MODEL,
+        httpCode: 400,
+        retryable: false
+      }
+    );
+    updateEngineState({
+      status: 'error',
+      modelId: resolvedModelId,
+      error: unsuppErr.message
+    });
+    throw unsuppErr;
+  }
+
   if (catalogEntry?.prefersShaderF16 && !gpuSupport.hasShaderF16) {
     const f16Err = new WebLLMError(
       `Your GPU adapter does not support WebGPU shader-f16 required by ${catalogEntry.label}.`,
@@ -950,18 +1022,36 @@ export async function ensureWebLLMEngine(options = {}) {
       });
     }
     try {
-      return await activeInitPromise;
+      if (!signal) {
+        return await activeInitPromise;
+      }
+      return await Promise.race([
+        activeInitPromise,
+        new Promise((_, reject) => {
+          if (signal.aborted) {
+            reject(createAbortError());
+            return;
+          }
+          signal.addEventListener('abort', () => reject(createAbortError()), { once: true });
+        })
+      ]);
     } finally {
       if (unsub) unsub();
     }
   }
 
-  // If another model was previously loaded or initializing, clean it up before loading the new model
-  if (activeInitPromise) {
+  // If another model was previously initializing, abort it immediately before loading the new model
+  if (activeInitPromise && activeInitModelId !== resolvedModelId) {
+    if (activeInitAbortReject) {
+      const rejectPrior = activeInitAbortReject;
+      activeInitAbortReject = null;
+      terminateWorkerImmediate();
+      rejectPrior(createAbortError('Model initialization cancelled (switched model).'));
+    }
     try {
       await activeInitPromise;
     } catch (_) {
-      // Ignore prior init error before re-initializing
+      // Ignore prior init error
     }
   }
   if (engineInstance && loadedModelId && loadedModelId !== resolvedModelId) {
@@ -1044,10 +1134,12 @@ export async function ensureWebLLMEngine(options = {}) {
 
       // 4. Spawn dedicated ES module Web Worker
       terminateWorkerImmediate();
-      const worker = new Worker(new URL('../workers/webllmWorker.js', import.meta.url), {
-        type: 'module',
-        name: 'orvix-webllm-worker'
-      });
+      const worker = typeof customWorkerFactory === 'function'
+        ? customWorkerFactory()
+        : new Worker(new URL('../workers/webllmWorker.js', import.meta.url), {
+            type: 'module',
+            name: 'orvix-webllm-worker'
+          });
       workerInstance = worker;
 
       const workerCrashPromise = new Promise((_, reject) => {
@@ -1152,18 +1244,26 @@ export async function ensureWebLLMEngine(options = {}) {
         context_window_size: catalogEntry?.contextWindowSize || 4096
       };
 
-      const createdEngine = await Promise.race([
-        webllm.CreateWebWorkerMLCEngine(
-          worker,
-          resolvedModelId,
-          {
-            initProgressCallback: handleInitProgress,
-            logLevel: 'WARN'
-          },
-          chatOpts
-        ),
-        workerCrashPromise
-      ]);
+      const createdEngine = typeof customEngineFactory === 'function'
+        ? await customEngineFactory({
+            worker,
+            modelId: resolvedModelId,
+            handleInitProgress,
+            chatOpts,
+            signal
+          })
+        : await Promise.race([
+            webllm.CreateWebWorkerMLCEngine(
+              worker,
+              resolvedModelId,
+              {
+                initProgressCallback: handleInitProgress,
+                logLevel: 'WARN'
+              },
+              chatOpts
+            ),
+            workerCrashPromise
+          ]);
 
       activeInitAbortReject = null;
 
