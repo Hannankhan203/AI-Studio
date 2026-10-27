@@ -206,14 +206,6 @@ export function checkModelCompatibilityForProvider(provider, candidateModel) {
 
   switch (normProvider) {
     case 'gemini': {
-      // Reject unreleased placeholder model gemini-3.8-flash
-      if (lower === 'gemini-3.8-flash' || lower === 'models/gemini-3.8-flash') {
-        return {
-          compatible: false,
-          normalizedModel: null,
-          reason: `Model "${trimmed}" is an invalid or unreleased Google Gemini model identifier. Please use a verified model such as "gemini-2.5-flash".`
-        };
-      }
       // Valid Gemini IDs: gemini-*, learnlm-*, gemma-*, or models/gemini-*
       if (/^(?:models\/)?(?:gemini|learnlm|gemma)-[a-z0-9._-]+$/i.test(trimmed) && !/-mlc$/i.test(trimmed)) {
         return { compatible: true, normalizedModel: trimmed };

@@ -1,8 +1,10 @@
 /**
- * Phase 4C — Gemini Provider Hardening Test Suite
+ * Phase 4C — Gemini Provider Hardening & Model Validation Correction Test Suite
  *
  * Validates:
- * 1. Verified model selection: active Gemini requests use only valid model IDs; gemini-3.8-flash is rejected or replaced.
+ * 1. Documented model validation: documented Gemini IDs (gemini-2.5-flash, gemini-3.8-flash, gemini-flash-latest)
+ *    pass client sanitizer and server validation; display labels, demo suffixes, and cross-provider models are rejected;
+ *    verified gemini-2.5-flash default is maintained.
  * 2. Model-not-found fallback: 404 from primary Gemini model triggers fallback to next valid model without repeating failing model.
  * 3. Exhausted fallback behavior: when all fallbacks fail with 404, returns structured 404 error (NOT_FOUND) with canFallback: true.
  * 4. Retry limits & non-retryable errors: 401/403/400 errors do not trigger fallback or retry loops.
@@ -10,6 +12,7 @@
  * 6. Initial-response timeout: requests exceeding header timeout return HTTP 504 DEADLINE_EXCEEDED; active SSE streams continue past header timeout.
  * 7. Finish reason handling: SAFETY blocks produce descriptive user error (SAFETY_BLOCKED); MAX_TOKENS truncation is signaled.
  * 8. Multimodal Vision & OCR integration: valid model IDs passed to Gemini vision endpoints respecting 3 MB / 4.2 MB limits.
+ * 9. Separation of concerns: documentation-based structural validation is distinguished from runtime API access/credentials.
  */
 
 import assert from 'node:assert/strict';
@@ -95,9 +98,9 @@ async function runAsyncTest(name, fn) {
 console.log('=== Phase 4C: Gemini Provider Hardening Test Suite ===\n');
 
 // ----------------------------------------------------------------------------
-// Test 1: Verified model selection
+// Test 1: Documented Gemini model validation and verified default model selection
 // ----------------------------------------------------------------------------
-runTest('1. Verified model selection: gemini-3.8-flash rejected and replaced with verified gemini-2.5-flash', () => {
+runTest('1. Documented Gemini model validation and verified default model selection', () => {
   // 1a. Default model check
   assert.strictEqual(
     PROVIDER_DEFAULT_MODELS.gemini,
@@ -109,7 +112,6 @@ runTest('1. Verified model selection: gemini-3.8-flash rejected and replaced wit
   const geminiOption = PROVIDER_OPTIONS.find((p) => p.id === AI_PROVIDERS.GEMINI);
   assert.ok(geminiOption, 'Gemini provider option must exist');
   assert.strictEqual(geminiOption.defaultModel, 'gemini-2.5-flash');
-  assert.ok(!geminiOption.modelTag.includes('3.8'), 'modelTag must not reference 3.8');
 
   // 1c. Document context provider profile check
   assert.strictEqual(
@@ -118,35 +120,66 @@ runTest('1. Verified model selection: gemini-3.8-flash rejected and replaced wit
     'PROVIDER_PROFILES.gemini.modelTag must be gemini-2.5-flash'
   );
 
-  // 1d. Client sanitization rejects gemini-3.8-flash
-  const sanitizedClient = sanitizeModelForProvider('gemini', 'gemini-3.8-flash');
-  assert.strictEqual(sanitizedClient, null, 'Client sanitizer must reject gemini-3.8-flash (returning null)');
-
-  // 1e. Server validation strictly rejects gemini-3.8-flash with HTTP 400 INVALID_MODEL
-  const serverVal = validateServerModelForProvider('gemini', 'gemini-3.8-flash');
-  assert.strictEqual(serverVal.valid, false, 'Server validator must reject gemini-3.8-flash');
-  assert.strictEqual(serverVal.status, 'INVALID_MODEL');
-  assert.strictEqual(serverVal.code, 400);
-
-  // 1f. Valid Gemini models are accepted
-  const validModels = ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-flash-latest'];
-  for (const m of validModels) {
-    const check = checkModelCompatibilityForProvider('gemini', m);
-    assert.strictEqual(check.compatible, true, `Model ${m} must be compatible`);
-    assert.strictEqual(check.normalizedModel, m);
-
-    const sVal = validateServerModelForProvider('gemini', m);
-    assert.strictEqual(sVal.valid, true, `Server validator must accept ${m}`);
-    assert.strictEqual(sVal.model, m);
+  // 1d. Documented Gemini models are accepted by client sanitizer
+  const documentedModels = ['gemini-2.5-flash', 'gemini-3.8-flash', 'gemini-flash-latest', 'gemini-2.5-pro'];
+  for (const m of documentedModels) {
+    const sanitizedClient = sanitizeModelForProvider('gemini', m);
+    assert.strictEqual(sanitizedClient, m, `Client sanitizer must accept documented model ${m}`);
   }
 
-  // 1g. Codebase source scan: no active gemini-3.8-flash usage remaining
-  const serverSrc = fs.readFileSync(path.join(ROOT_DIR, 'server.ts'), 'utf8');
-  assert.ok(!serverSrc.includes("'gemini-3.8-flash'"), 'server.ts must not contain gemini-3.8-flash');
-  assert.ok(!serverSrc.includes('"gemini-3.8-flash"'), 'server.ts must not contain "gemini-3.8-flash"');
+  // 1e. Documented Gemini models are accepted by server validator
+  for (const m of documentedModels) {
+    const serverVal = validateServerModelForProvider('gemini', m);
+    assert.strictEqual(serverVal.valid, true, `Server validator must accept documented model ${m}`);
+    assert.strictEqual(serverVal.model, m);
+  }
 
+  // 1f. Display labels, demo suffixes, and synthetic tags are strictly rejected
+  const invalidLabels = [
+    'gemini 3.8 flash',
+    'gemini 2.5 flash',
+    'gemini-3.8-flash (demo)',
+    'gemini-2.5-flash (demo)',
+    'Document Analyzer',
+    'document analyzer (demo)'
+  ];
+  for (const lbl of invalidLabels) {
+    const sanitized = sanitizeModelForProvider('gemini', lbl);
+    assert.strictEqual(sanitized, null, `Client sanitizer must reject label "${lbl}"`);
+
+    const serverVal = validateServerModelForProvider('gemini', lbl);
+    assert.strictEqual(serverVal.valid, false, `Server validator must reject label "${lbl}"`);
+    assert.strictEqual(serverVal.status, 'INVALID_MODEL');
+    assert.strictEqual(serverVal.code, 400);
+  }
+
+  // 1g. Cross-provider models are strictly rejected (no cross-provider leakage)
+  const crossProviderModels = [
+    { provider: 'gemini', model: '@cf/meta/llama-3.1-8b-instruct' },
+    { provider: 'gemini', model: 'openai/gpt-oss-120b' },
+    { provider: 'gemini', model: 'qwen2.5:1.5b' },
+    { provider: 'gemini', model: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC' },
+    { provider: 'groq', model: 'gemini-3.8-flash' },
+    { provider: 'openrouter', model: 'gemini-3.8-flash' },
+    { provider: 'cloudflare', model: 'gemini-3.8-flash' },
+    { provider: 'ollama', model: 'gemini-3.8-flash' },
+    { provider: 'webllm', model: 'gemini-3.8-flash' }
+  ];
+  for (const { provider, model } of crossProviderModels) {
+    const sanitized = sanitizeModelForProvider(provider, model);
+    assert.strictEqual(sanitized, null, `Client sanitizer must reject cross-provider model ${model} for ${provider}`);
+
+    const serverVal = validateServerModelForProvider(provider, model);
+    assert.strictEqual(serverVal.valid, false, `Server validator must reject cross-provider model ${model} for ${provider}`);
+    assert.strictEqual(serverVal.status, 'INVALID_MODEL');
+    assert.strictEqual(serverVal.code, 400);
+  }
+
+  // 1h. Verified default model and fallback alignment in services
+  assert.strictEqual(PROVIDER_DEFAULT_MODELS.gemini, 'gemini-2.5-flash');
   const ocrSrc = fs.readFileSync(path.join(ROOT_DIR, 'src/services/imageOcrService.js'), 'utf8');
-  assert.ok(!ocrSrc.includes('gemini-3.8-flash'), 'imageOcrService.js must not contain gemini-3.8-flash');
+  assert.ok(ocrSrc.includes("'gemini-2.5-flash'"), 'imageOcrService.js must use verified gemini-2.5-flash');
+  assert.ok(ocrSrc.includes("'gemini-flash-latest'"), 'imageOcrService.js must include gemini-flash-latest fallback');
 });
 
 // ----------------------------------------------------------------------------
@@ -201,19 +234,34 @@ await runAsyncTest('2. Model-not-found fallback: HTTP 404 on primary model advan
     assert.strictEqual(parsed404.isRetryable, false);
 
     // Verify fallback plan generation in server logic:
-    // When requesting primary model 'gemini-2.5-flash', the plan has distinct fallbacks
-    const requested = 'gemini-2.5-flash';
+    // When requesting primary model 'gemini-3.8-flash', the plan progresses across distinct models
+    const requested38 = 'gemini-3.8-flash';
     const fallbackCandidates = ['gemini-2.5-flash', 'gemini-flash-latest'];
-    const uniquePlanModels = [requested];
+    const uniquePlanModels38 = [requested38];
     for (const cand of fallbackCandidates) {
-      if (!uniquePlanModels.includes(cand)) {
-        uniquePlanModels.push(cand);
+      if (!uniquePlanModels38.includes(cand)) {
+        uniquePlanModels38.push(cand);
       }
     }
-    assert.deepStrictEqual(uniquePlanModels, ['gemini-2.5-flash', 'gemini-flash-latest']);
-    assert.strictEqual(uniquePlanModels[0], 'gemini-2.5-flash');
-    assert.strictEqual(uniquePlanModels[1], 'gemini-flash-latest');
-    assert.notStrictEqual(uniquePlanModels[0], uniquePlanModels[1], 'Failing model must not be repeated');
+    assert.deepStrictEqual(uniquePlanModels38, ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-flash-latest']);
+    assert.strictEqual(uniquePlanModels38[0], 'gemini-3.8-flash');
+    assert.strictEqual(uniquePlanModels38[1], 'gemini-2.5-flash');
+    assert.strictEqual(uniquePlanModels38[2], 'gemini-flash-latest');
+    assert.notStrictEqual(uniquePlanModels38[0], uniquePlanModels38[1], 'Failing model must not be repeated');
+    assert.notStrictEqual(uniquePlanModels38[1], uniquePlanModels38[2], 'Fallback models must be distinct');
+
+    // When requesting primary model 'gemini-2.5-flash', the plan has distinct fallbacks
+    const requested25 = 'gemini-2.5-flash';
+    const uniquePlanModels25 = [requested25];
+    for (const cand of fallbackCandidates) {
+      if (!uniquePlanModels25.includes(cand)) {
+        uniquePlanModels25.push(cand);
+      }
+    }
+    assert.deepStrictEqual(uniquePlanModels25, ['gemini-2.5-flash', 'gemini-flash-latest']);
+    assert.strictEqual(uniquePlanModels25[0], 'gemini-2.5-flash');
+    assert.strictEqual(uniquePlanModels25[1], 'gemini-flash-latest');
+    assert.notStrictEqual(uniquePlanModels25[0], uniquePlanModels25[1], 'Failing model must not be repeated');
   } finally {
     mockServer.close();
   }
@@ -424,18 +472,57 @@ runTest('7. Finish reason handling: SAFETY blocks produce descriptive user error
 runTest('8. Vision & OCR integration: valid Gemini vision models and payload limits intact', () => {
   // 8a. Vision capability check
   assert.strictEqual(isVisionCapableProvider('gemini', 'gemini-2.5-flash'), true);
+  assert.strictEqual(isVisionCapableProvider('gemini', 'gemini-3.8-flash'), true);
   assert.strictEqual(isVisionCapableProvider('gemini', 'gemini-flash-latest'), true);
 
-  // 8b. OCR service candidate models check
+  // 8b. OCR service candidate models check: verified production models
   const ocrSrc = fs.readFileSync(path.join(ROOT_DIR, 'src/services/imageOcrService.js'), 'utf8');
-  assert.ok(ocrSrc.includes("'gemini-2.5-flash'"), 'imageOcrService.js must use gemini-2.5-flash');
-  assert.ok(ocrSrc.includes("'gemini-flash-latest'"), 'imageOcrService.js must use gemini-flash-latest');
-  assert.ok(!ocrSrc.includes('gemini-3.8-flash'), 'imageOcrService.js must not include gemini-3.8-flash');
+  assert.ok(ocrSrc.includes("'gemini-2.5-flash'"), 'imageOcrService.js must use verified gemini-2.5-flash');
+  assert.ok(ocrSrc.includes("'gemini-flash-latest'"), 'imageOcrService.js must include gemini-flash-latest fallback');
 
   // 8c. Payload limit preservation (3.0 MB max image, 4.2 MB total budget)
   const serverSrc = fs.readFileSync(path.join(ROOT_DIR, 'server.ts'), 'utf8');
   assert.ok(serverSrc.includes('MAX_CHAT_REQUEST_BYTES'), 'server.ts must enforce MAX_CHAT_REQUEST_BYTES (4.2 MB)');
   assert.ok(serverSrc.includes('MAX_VISION_IMAGE_BYTES'), 'server.ts must enforce MAX_VISION_IMAGE_BYTES (3.0 MB)');
+});
+
+// ----------------------------------------------------------------------------
+// Test 9: Separation of concerns: documentation-based validation vs runtime access
+// ----------------------------------------------------------------------------
+runTest('9. Separation of concerns: documentation-based validation vs runtime access', () => {
+  // 9a. Documented catalog models pass structural validation independently of network/credentials
+  const catalogModels = ['gemini-2.5-flash', 'gemini-3.8-flash', 'gemini-flash-latest', 'gemini-2.5-pro'];
+  for (const m of catalogModels) {
+    const val = validateServerModelForProvider('gemini', m);
+    assert.strictEqual(val.valid, true, `${m} must pass structural validation`);
+    assert.strictEqual(val.code, undefined);
+  }
+
+  // 9b. Non-catalog / malformed identifiers fail with HTTP 400 INVALID_MODEL
+  const malformed = ['gemini 3.8 flash', 'gemini 2.5 flash', '@cf/meta/llama-3.1-8b-instruct', 'qwen2.5:1.5b'];
+  for (const m of malformed) {
+    const val = validateServerModelForProvider('gemini', m);
+    assert.strictEqual(val.valid, false, `${m} must fail structural validation`);
+    assert.strictEqual(val.code, 400);
+    assert.strictEqual(val.status, 'INVALID_MODEL');
+  }
+
+  // 9c. Runtime errors (404, 401, 403, 504) are categorized distinctly and never conflated with 400 INVALID_MODEL
+  const notFoundErr = evalGeminiError({ status: 404, message: 'models/gemini-custom is not found' }, 'gemini');
+  assert.strictEqual(notFoundErr.statusCode, 404);
+  assert.strictEqual(notFoundErr.status, 'NOT_FOUND');
+
+  const authErr = evalGeminiError({ status: 401, message: 'API_KEY_INVALID' }, 'gemini');
+  assert.strictEqual(authErr.statusCode, 401);
+  assert.strictEqual(authErr.status, 'UNAUTHENTICATED');
+
+  const permErr = evalGeminiError({ status: 403, message: 'PERMISSION_DENIED: billing disabled' }, 'gemini');
+  assert.strictEqual(permErr.statusCode, 403);
+  assert.strictEqual(permErr.status, 'PERMISSION_DENIED');
+
+  const timeoutErr = evalGeminiError({ status: 504, name: 'TimeoutError', message: 'Deadline exceeded' }, 'gemini');
+  assert.strictEqual(timeoutErr.statusCode, 504);
+  assert.strictEqual(timeoutErr.status, 'DEADLINE_EXCEEDED');
 });
 
 // ----------------------------------------------------------------------------

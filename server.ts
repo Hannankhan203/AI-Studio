@@ -2453,8 +2453,23 @@ app.post(['/api/transcribe', '/transcribe'], (req, res) => {
       });
     }
 
+    // Transcription model validation (separate audio transcription models from chat-completion models)
+    const VALID_GROQ_TRANSCRIPTION_MODELS = ['whisper-large-v3-turbo', 'whisper-large-v3'];
+    const requestedTranscriptionModel = req.body?.model ? String(req.body.model).trim() : '';
+    const selectedTranscriptionModel = requestedTranscriptionModel || 'whisper-large-v3-turbo';
+
+    if (requestedTranscriptionModel && !VALID_GROQ_TRANSCRIPTION_MODELS.includes(requestedTranscriptionModel)) {
+      return res.status(400).json({
+        success: false,
+        error: `Model '${requestedTranscriptionModel}' is not a valid audio transcription model. Valid models are: ${VALID_GROQ_TRANSCRIPTION_MODELS.join(', ')}.`,
+        code: 'INVALID_TRANSCRIPTION_MODEL',
+        fallbackAvailable: false
+      });
+    }
+
     // Minimum audio payload size check if no transcript is provided
-    if (!incomingTranscript && (!audioFile || !audioFile.buffer || audioFile.buffer.length < 100)) {
+    const hasAudioPayload = Boolean(audioFile && audioFile.buffer && audioFile.buffer.length >= 100);
+    if (!incomingTranscript && !hasAudioPayload) {
       return res.status(400).json({
         success: false,
         error: 'The recorded audio is empty or too short to transcribe.',
@@ -2475,107 +2490,8 @@ app.post(['/api/transcribe', '/transcribe'], (req, res) => {
     const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || '';
     const hasGemini = Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY');
 
-    // High-accuracy transcript refinement path for mobile native-live dictation:
-    // When incomingTranscript is provided from live dictation session
-    if (incomingTranscript) {
-      if (hasGemini || hasGroq) {
-        try {
-          const refinePrompt = `You are a high-accuracy speech-to-text transcript polisher for AI conversation and programming.
-TASK:
-Refine the provided spoken transcript verbatim.
-Preserve exact words, speaker intent, and technical vocabulary (e.g. Orvix, JavaScript, TypeScript, React, Node.js, Python, palindrome, algorithms, async/await, promises, functions, arrow functions, var, const, let, objects, arrays, callbacks, ECMAScript, code).
-Fix verbal punctuation ("period" -> ".", "comma" -> ",", "question mark" -> "?"), sentence capitalization, and obvious phonetic slips.
-${isoLang ? `Spoken language: ${isoLang}.` : ''}
-Output ONLY the refined transcript. No quotes, no markdown fences, no explanatory commentary.
-
-Spoken transcript:
-"${incomingTranscript}"`;
-
-          let refinedText = '';
-
-          if (hasGemini) {
-            try {
-              const ai = new GoogleGenAI({
-                apiKey: geminiKey,
-                httpOptions: {
-                  headers: {
-                    'User-Agent': 'aistudio-build'
-                  }
-                }
-              });
-              // 6s timeout so mobile dictation never hangs
-              const timeoutPromise = new Promise<never>((_, reject) =>
-                setTimeout(() => reject(new Error('Refine timeout')), 6000)
-              );
-              const genPromise = ai.models.generateContent({
-                model: 'gemini-2.5-flash',
-                contents: [{ role: 'user', parts: [{ text: refinePrompt }] }]
-              });
-              const geminiRes = await Promise.race([genPromise, timeoutPromise]);
-              refinedText = (geminiRes?.text || '').trim();
-            } catch (gErr) {
-              console.warn('[Transcribe] Gemini refine error, falling back to local polisher:', gErr);
-            }
-          } else if (hasGroq) {
-            try {
-              const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-                method: 'POST',
-                headers: {
-                  Authorization: `Bearer ${groqKey}`,
-                  'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                  model: 'llama-3.3-70b-versatile',
-                  messages: [{ role: 'user', content: refinePrompt }],
-                  temperature: 0.1,
-                  max_tokens: 1024
-                })
-              });
-              if (groqRes.ok) {
-                const data: any = await groqRes.json();
-                refinedText = (data?.choices?.[0]?.message?.content || '').trim();
-              }
-            } catch (grErr) {
-              console.warn('[Transcribe] Groq refine error:', grErr);
-            }
-          }
-
-          if (refinedText) {
-            if (refinedText.startsWith('```')) {
-              refinedText = refinedText.replace(/^```[a-zA-Z0-9_-]*\n?/i, '').replace(/\n?```$/i, '').trim();
-            }
-            refinedText = refinedText.replace(/^["'«»“](.*)["'«»”]$/s, '$1').trim();
-
-            return res.status(200).json({
-              success: true,
-              text: refinedText,
-              language: isoLang || 'en',
-              duration: 0,
-              model: 'whisper-large-v3-turbo',
-              provider: 'groq',
-              highAccuracy: true
-            });
-          }
-        } catch (refineErr) {
-          console.warn('[Transcribe] AI transcript refinement failed, using local polisher:', refineErr);
-        }
-      }
-
-      // Fast, deterministic local speech polisher fallback
-      const cleanRefined = polishSpokenTranscript(incomingTranscript);
-      return res.status(200).json({
-        success: true,
-        text: cleanRefined || incomingTranscript,
-        language: isoLang || 'en',
-        duration: 0,
-        model: 'whisper-large-v3-turbo',
-        provider: 'groq',
-        highAccuracy: true
-      });
-    }
-
-    // Primary Audio Transcription Path: Groq Whisper Large v3 Turbo
-    if (hasGroq) {
+    // Primary Audio Transcription Path: When audio payload is present, execute genuine Groq Whisper transcription
+    if (hasAudioPayload && hasGroq) {
       try {
         const mime = (audioFile.mimetype || 'audio/webm').toLowerCase();
         let fileExt = '.webm';
@@ -2591,7 +2507,7 @@ Spoken transcript:
         const formData = new FormData();
         const audioBlob = new Blob([new Uint8Array(audioFile.buffer)], { type: mime });
         formData.append('file', audioBlob, safeFilename);
-        formData.append('model', 'whisper-large-v3-turbo');
+        formData.append('model', selectedTranscriptionModel);
         formData.append('temperature', '0');
         formData.append('response_format', 'verbose_json');
         if (isoLang) {
@@ -2620,7 +2536,7 @@ Spoken transcript:
             text: transcriptText,
             language: result.language || isoLang || 'en',
             duration: result.duration || 0,
-            model: 'whisper-large-v3-turbo',
+            model: selectedTranscriptionModel,
             provider: 'groq',
             highAccuracy: true
           });
@@ -2631,7 +2547,7 @@ Spoken transcript:
         logAIDiagnostic({
           category: 'provider API error',
           provider: 'groq',
-          model: 'whisper-large-v3-turbo',
+          model: selectedTranscriptionModel,
           phase: 'dispatch',
           upstreamStatus: errStatus,
           sanitizedMessage: `Groq Whisper failed: ${errText.slice(0, 200)}`
@@ -2652,11 +2568,11 @@ Spoken transcript:
         }
       } catch (groqErr: any) {
         logAIDiagnostic({
-          category: groqErr?.name === 'AbortError' ? 'provider timeout' : 'provider network failure',
+          category: 'provider API error',
           provider: 'groq',
-          model: 'whisper-large-v3-turbo',
+          model: selectedTranscriptionModel,
           phase: 'dispatch',
-          sanitizedMessage: groqErr?.message || 'Groq request failed'
+          sanitizedMessage: groqErr?.message || 'Groq Whisper network error'
         });
 
         if (!hasGemini) {
@@ -2673,8 +2589,8 @@ Spoken transcript:
       }
     }
 
-    // Secondary Transcription Path: Gemini Audio Recognition Fallback
-    if (hasGemini) {
+    // Secondary Audio Path: Gemini Audio Recognition Fallback when audio payload exists
+    if (hasAudioPayload && hasGemini) {
       try {
         const ai = new GoogleGenAI({
           apiKey: geminiKey,
@@ -2741,6 +2657,112 @@ Output ONLY the transcription text. Do not summarize, do not translate, do not a
           fallbackAvailable: true
         });
       }
+    }
+
+    // High-accuracy transcript refinement path for mobile native-live dictation:
+    // When no audio payload is provided, but incomingTranscript is provided
+    if (incomingTranscript) {
+      if (hasGemini || hasGroq) {
+        try {
+          const refinePrompt = `You are a high-accuracy speech-to-text transcript polisher for AI conversation and programming.
+TASK:
+Refine the provided spoken transcript verbatim.
+Preserve exact words, speaker intent, and technical vocabulary (e.g. Orvix, JavaScript, TypeScript, React, Node.js, Python, palindrome, algorithms, async/await, promises, functions, arrow functions, var, const, let, objects, arrays, callbacks, ECMAScript, code).
+Fix verbal punctuation ("period" -> ".", "comma" -> ",", "question mark" -> "?"), sentence capitalization, and obvious phonetic slips.
+${isoLang ? `Spoken language: ${isoLang}.` : ''}
+Output ONLY the refined transcript. No quotes, no markdown fences, no explanatory commentary.
+
+Spoken transcript:
+"${incomingTranscript}"`;
+
+          let refinedText = '';
+          let polisherModelUsed = 'local-polisher';
+          let polisherProviderUsed = 'local';
+
+          if (hasGemini) {
+            try {
+              const ai = new GoogleGenAI({
+                apiKey: geminiKey,
+                httpOptions: {
+                  headers: {
+                    'User-Agent': 'aistudio-build'
+                  }
+                }
+              });
+              const timeoutPromise = new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error('Refine timeout')), 6000)
+              );
+              const genPromise = ai.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: [{ role: 'user', parts: [{ text: refinePrompt }] }]
+              });
+              const geminiRes = await Promise.race([genPromise, timeoutPromise]);
+              refinedText = (geminiRes?.text || '').trim();
+              polisherModelUsed = 'gemini-2.5-flash';
+              polisherProviderUsed = 'gemini';
+            } catch (gErr) {
+              console.warn('[Transcribe] Gemini refine error, falling back to Groq or local polisher:', gErr);
+            }
+          }
+
+          if (!refinedText && hasGroq) {
+            try {
+              const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bearer ${groqKey}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  model: 'openai/gpt-oss-120b',
+                  messages: [{ role: 'user', content: refinePrompt }],
+                  temperature: 0.1,
+                  max_tokens: 1024
+                })
+              });
+              if (groqRes.ok) {
+                const data: any = await groqRes.json();
+                refinedText = (data?.choices?.[0]?.message?.content || '').trim();
+                polisherModelUsed = data?.model || 'openai/gpt-oss-120b';
+                polisherProviderUsed = 'groq';
+              }
+            } catch (grErr) {
+              console.warn('[Transcribe] Groq refine error:', grErr);
+            }
+          }
+
+          if (refinedText) {
+            if (refinedText.startsWith('```')) {
+              refinedText = refinedText.replace(/^```[a-zA-Z0-9_-]*\n?/i, '').replace(/\n?```$/i, '').trim();
+            }
+            refinedText = refinedText.replace(/^["'«»“](.*)["'«»”]$/s, '$1').trim();
+
+            return res.status(200).json({
+              success: true,
+              text: refinedText,
+              language: isoLang || 'en',
+              duration: 0,
+              model: polisherModelUsed,
+              provider: polisherProviderUsed,
+              highAccuracy: true
+            });
+          }
+        } catch (refineErr) {
+          console.warn('[Transcribe] AI transcript refinement failed, using local polisher:', refineErr);
+        }
+      }
+
+      // Fast, deterministic local speech polisher fallback
+      const cleanRefined = polishSpokenTranscript(incomingTranscript);
+      return res.status(200).json({
+        success: true,
+        text: cleanRefined || incomingTranscript,
+        language: isoLang || 'en',
+        duration: 0,
+        model: 'local-polisher',
+        provider: 'local',
+        highAccuracy: true
+      });
     }
 
     // If neither provider key is configured
@@ -3744,7 +3766,18 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
       });
 
       const GROQ_ACTIVE_MODEL = 'openai/gpt-oss-120b';
-      const selectedModel = validatedClientModel || GROQ_ACTIVE_MODEL;
+      const requestedGroqModel = validatedClientModel || GROQ_ACTIVE_MODEL;
+      const groqFallbackCandidates = ['openai/gpt-oss-120b', 'llama-3.1-8b-instant'];
+      const uniqueGroqPlanModels = [requestedGroqModel];
+      for (const cand of groqFallbackCandidates) {
+        if (!uniqueGroqPlanModels.includes(cand)) {
+          uniqueGroqPlanModels.push(cand);
+        }
+      }
+      const groqAttemptPlan = uniqueGroqPlanModels.map((m, idx) => ({
+        model: m,
+        attemptNum: idx + 1
+      }));
 
       let groqMaxTokens = 2560;
       if (preferences?.responseLength === 'detailed' || isLikelyLarge || isContinuation) {
@@ -3754,198 +3787,306 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
       }
 
       if (!shouldStream) {
-        try {
-          const groqRes = await upstreamGuard.fetchUpstream(
-            'https://api.groq.com/openai/v1/chat/completions',
-            {
-              method: 'POST',
-              headers: {
-                Authorization: `Bearer ${apiKey}`,
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify({
-                model: selectedModel,
-                messages,
-                max_tokens: groqMaxTokens,
-                temperature: 0.7
-              })
-            },
-            { provider: 'groq' }
-          );
+        let lastParsedErr: any = null;
+        let lastFailedModel = requestedGroqModel;
 
-          if (!groqRes.ok) {
-            const errText = await groqRes.text();
-            const parsed = parseGeminiError({ status: groqRes.status, message: errText }, 'groq');
-            let friendlyError = parsed.message;
-            if (errText.includes('context_length_exceeded') || errText.includes('maximum context length') || errText.includes('tokens')) {
-              friendlyError = 'The attached document exceeds Groq\'s context length limit. Please switch to Google Gemini (which supports 1M tokens) or ask about specific pages or slides.';
+        for (let i = 0; i < groqAttemptPlan.length; i++) {
+          if (upstreamGuard.isClientClosed()) return;
+          const { model: currentModel, attemptNum } = groqAttemptPlan[i];
+          lastFailedModel = currentModel;
+
+          try {
+            const groqRes = await upstreamGuard.fetchUpstream(
+              'https://api.groq.com/openai/v1/chat/completions',
+              {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bearer ${apiKey}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  model: currentModel,
+                  messages,
+                  max_tokens: groqMaxTokens,
+                  temperature: 0.7
+                })
+              },
+              { provider: 'groq' }
+            );
+
+            if (!groqRes.ok) {
+              const errText = await groqRes.text();
+              const parsed = parseGeminiError({ status: groqRes.status, message: errText }, 'groq');
+              let friendlyError = parsed.message;
+              if (errText.includes('context_length_exceeded') || errText.includes('maximum context length') || errText.includes('tokens')) {
+                friendlyError = 'The attached document exceeds Groq\'s context length limit. Please switch to Google Gemini (which supports 1M tokens) or ask about specific pages or slides.';
+              }
+              lastParsedErr = { ...parsed, message: friendlyError };
+
+              const hasMoreAttempts = i < groqAttemptPlan.length - 1;
+              const isModelNotFound = groqRes.status === 404 || parsed.status === 'NOT_FOUND';
+              const willAdvanceFallback = isModelNotFound && hasMoreAttempts;
+
+              logAIDiagnostic({
+                category: parsed.category,
+                provider: 'groq',
+                model: currentModel,
+                phase: 'non-streaming',
+                attempt: attemptNum,
+                upstreamStatus: groqRes.status,
+                sanitizedMessage: friendlyError
+              });
+
+              if (willAdvanceFallback) {
+                continue;
+              }
+
+              return res.status(groqRes.status).json({
+                error: friendlyError,
+                code: groqRes.status,
+                status: parsed.status,
+                category: parsed.category,
+                provider: 'groq',
+                model: currentModel,
+                retryable: parsed.isRetryable,
+                canFallback: true,
+                suggestedProviders: getConfiguredFallbackProviders('groq', isServerless)
+              });
             }
+
+            const data = await groqRes.json();
+            if (upstreamGuard.isClientClosed()) return;
+            let finalText = data?.choices?.[0]?.message?.content || '';
+            const finishReason = data?.choices?.[0]?.finish_reason;
+
+            // Transparent continuation if output limit reached
+            if (finishReason === 'length' && finalText.length > 60 && !upstreamGuard.isClientClosed()) {
+              try {
+                const contMessages = [
+                  ...messages,
+                  { role: 'assistant', content: finalText },
+                  { role: 'user', content: 'Please continue directly from where you stopped. Complete any unfinished sentences, items, or sections without repeating previous text.' }
+                ];
+                const contRes = await upstreamGuard.fetchUpstream(
+                  'https://api.groq.com/openai/v1/chat/completions',
+                  {
+                    method: 'POST',
+                    headers: {
+                      Authorization: `Bearer ${apiKey}`,
+                      'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                      model: currentModel,
+                      messages: contMessages,
+                      max_tokens: Math.min(2048, groqMaxTokens),
+                      temperature: 0.7
+                    })
+                  },
+                  { provider: 'groq' }
+                );
+                if (contRes.ok) {
+                  const contData = await contRes.json();
+                  const contText = contData?.choices?.[0]?.message?.content;
+                  if (contText) {
+                    finalText += (finalText.endsWith(' ') || contText.startsWith(' ') ? '' : ' ') + contText;
+                  }
+                }
+              } catch (_) {}
+            }
+
+            if (upstreamGuard.isClientClosed()) return;
+            if (isLikelyLarge && !isContinuation && !responseHasContinuationNotice(finalText)) {
+              finalText += CONTINUATION_NOTICES.PART_1;
+            }
+            return res.json({
+              text: finalText,
+              modelUsed: data.model || currentModel,
+              provider: 'groq'
+            });
+          } catch (fetchErr: any) {
+            if (upstreamGuard.isClientDisconnected(fetchErr)) {
+              return;
+            }
+            const parsed = parseGeminiError(fetchErr, 'groq');
+            lastParsedErr = parsed;
+            const hasMoreAttempts = i < groqAttemptPlan.length - 1;
+            const isModelNotFound = parsed.statusCode === 404 || parsed.status === 'NOT_FOUND';
+            const willAdvanceFallback = isModelNotFound && hasMoreAttempts;
+
             logAIDiagnostic({
               category: parsed.category,
               provider: 'groq',
-              model: selectedModel,
+              model: currentModel,
               phase: 'non-streaming',
-              upstreamStatus: groqRes.status,
-              sanitizedMessage: friendlyError
+              attempt: attemptNum,
+              upstreamStatus: parsed.statusCode,
+              sanitizedMessage: parsed.message
             });
-            return res.status(groqRes.status).json({
-              error: friendlyError,
-              code: groqRes.status,
+
+            if (willAdvanceFallback) {
+              continue;
+            }
+
+            return res.status(parsed.statusCode).json({
+              error: parsed.message,
+              code: parsed.statusCode,
               status: parsed.status,
               category: parsed.category,
               provider: 'groq',
-              model: selectedModel,
+              model: currentModel,
               retryable: parsed.isRetryable,
               canFallback: true,
               suggestedProviders: getConfiguredFallbackProviders('groq', isServerless)
             });
           }
-
-          const data = await groqRes.json();
-          if (upstreamGuard.isClientClosed()) return;
-          let finalText = data?.choices?.[0]?.message?.content || '';
-          const finishReason = data?.choices?.[0]?.finish_reason;
-
-          // Transparent continuation if output limit reached
-          if (finishReason === 'length' && finalText.length > 60 && !upstreamGuard.isClientClosed()) {
-            try {
-              const contMessages = [
-                ...messages,
-                { role: 'assistant', content: finalText },
-                { role: 'user', content: 'Please continue directly from where you stopped. Complete any unfinished sentences, items, or sections without repeating previous text.' }
-              ];
-              const contRes = await upstreamGuard.fetchUpstream(
-                'https://api.groq.com/openai/v1/chat/completions',
-                {
-                  method: 'POST',
-                  headers: {
-                    Authorization: `Bearer ${apiKey}`,
-                    'Content-Type': 'application/json'
-                  },
-                  body: JSON.stringify({
-                    model: selectedModel,
-                    messages: contMessages,
-                    max_tokens: Math.min(2048, groqMaxTokens),
-                    temperature: 0.7
-                  })
-                },
-                { provider: 'groq' }
-              );
-              if (contRes.ok) {
-                const contData = await contRes.json();
-                const contText = contData?.choices?.[0]?.message?.content;
-                if (contText) {
-                  finalText += (finalText.endsWith(' ') || contText.startsWith(' ') ? '' : ' ') + contText;
-                }
-              }
-            } catch (_) {}
-          }
-
-          if (upstreamGuard.isClientClosed()) return;
-          if (isLikelyLarge && !isContinuation && !responseHasContinuationNotice(finalText)) {
-            finalText += CONTINUATION_NOTICES.PART_1;
-          }
-          return res.json({
-            text: finalText,
-            modelUsed: data.model || selectedModel,
-            provider: 'groq'
-          });
-        } catch (fetchErr: any) {
-          if (upstreamGuard.isClientDisconnected(fetchErr)) {
-            return;
-          }
-          const parsed = parseGeminiError(fetchErr, 'groq');
-          logAIDiagnostic({
-            category: parsed.category,
-            provider: 'groq',
-            model: selectedModel,
-            phase: 'non-streaming',
-            upstreamStatus: parsed.statusCode,
-            sanitizedMessage: parsed.message
-          });
-          return res.status(parsed.statusCode).json({
-            error: parsed.message,
-            code: parsed.statusCode,
-            status: parsed.status,
-            category: parsed.category,
-            provider: 'groq',
-            model: selectedModel,
-            retryable: parsed.isRetryable,
-            canFallback: true,
-            suggestedProviders: getConfiguredFallbackProviders('groq', isServerless)
-          });
         }
+
+        if (upstreamGuard.isClientClosed()) return;
+
+        const fallbackErr = lastParsedErr || {
+          statusCode: 404,
+          status: 'NOT_FOUND',
+          message: 'The requested Groq model was not found and all fallback options were exhausted.',
+          isRetryable: false
+        };
+        return res.status(fallbackErr.statusCode).json({
+          error: fallbackErr.message,
+          code: fallbackErr.statusCode,
+          status: fallbackErr.status,
+          provider: 'groq',
+          model: lastFailedModel,
+          retryable: false,
+          serverRetriesExhausted: true,
+          canFallback: true,
+          suggestedProviders: getConfiguredFallbackProviders('groq', isServerless)
+        });
       } else {
         // Genuine streaming via Groq OpenAI-compatible SSE
-        let groqRes: Response;
-        try {
-          groqRes = await upstreamGuard.fetchUpstream(
-            'https://api.groq.com/openai/v1/chat/completions',
-            {
-              method: 'POST',
-              headers: {
-                Authorization: `Bearer ${apiKey}`,
-                'Content-Type': 'application/json'
+        let groqRes: Response | null = null;
+        let selectedModel = requestedGroqModel;
+        let lastParsedErr: any = null;
+
+        for (let i = 0; i < groqAttemptPlan.length; i++) {
+          if (upstreamGuard.isClientClosed()) return;
+          const { model: currentModel, attemptNum } = groqAttemptPlan[i];
+          selectedModel = currentModel;
+
+          try {
+            const attemptRes = await upstreamGuard.fetchUpstream(
+              'https://api.groq.com/openai/v1/chat/completions',
+              {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bearer ${apiKey}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  model: currentModel,
+                  messages,
+                  max_tokens: groqMaxTokens,
+                  temperature: 0.7,
+                  stream: true
+                })
               },
-              body: JSON.stringify({
-                model: selectedModel,
-                messages,
-                max_tokens: groqMaxTokens,
-                temperature: 0.7,
-                stream: true
-              })
-            },
-            { provider: 'groq' }
-          );
-        } catch (fetchErr: any) {
-          if (upstreamGuard.isClientDisconnected(fetchErr)) {
-            return;
+              { provider: 'groq' }
+            );
+
+            if (!attemptRes.ok) {
+              const errText = await attemptRes.text();
+              const parsed = parseGeminiError({ status: attemptRes.status, message: errText }, 'groq');
+              let friendlyError = parsed.message;
+              if (errText.includes('context_length_exceeded') || errText.includes('maximum context length') || errText.includes('tokens')) {
+                friendlyError = 'The attached document exceeds Groq\'s context length limit. Please switch to Google Gemini (which supports 1M tokens) or ask about specific pages or slides.';
+              }
+              lastParsedErr = { ...parsed, message: friendlyError };
+
+              const hasMoreAttempts = i < groqAttemptPlan.length - 1;
+              const isModelNotFound = attemptRes.status === 404 || parsed.status === 'NOT_FOUND';
+              const willAdvanceFallback = isModelNotFound && hasMoreAttempts;
+
+              logAIDiagnostic({
+                category: parsed.category,
+                provider: 'groq',
+                model: currentModel,
+                phase: 'pre-stream',
+                attempt: attemptNum,
+                upstreamStatus: attemptRes.status,
+                sanitizedMessage: friendlyError
+              });
+
+              if (willAdvanceFallback) {
+                continue;
+              }
+
+              return res.status(attemptRes.status).json({
+                error: friendlyError,
+                code: attemptRes.status,
+                status: parsed.status,
+                category: parsed.category,
+                provider: 'groq',
+                model: currentModel,
+                retryable: parsed.isRetryable,
+                canFallback: true,
+                suggestedProviders: getConfiguredFallbackProviders('groq', isServerless)
+              });
+            }
+
+            groqRes = attemptRes;
+            break;
+          } catch (fetchErr: any) {
+            if (upstreamGuard.isClientDisconnected(fetchErr)) {
+              return;
+            }
+            const parsed = parseGeminiError(fetchErr, 'groq');
+            lastParsedErr = parsed;
+            const hasMoreAttempts = i < groqAttemptPlan.length - 1;
+            const isModelNotFound = parsed.statusCode === 404 || parsed.status === 'NOT_FOUND';
+            const willAdvanceFallback = isModelNotFound && hasMoreAttempts;
+
+            logAIDiagnostic({
+              category: parsed.category,
+              provider: 'groq',
+              model: currentModel,
+              phase: 'pre-stream',
+              attempt: attemptNum,
+              upstreamStatus: parsed.statusCode,
+              sanitizedMessage: parsed.message
+            });
+
+            if (willAdvanceFallback) {
+              continue;
+            }
+
+            return res.status(parsed.statusCode).json({
+              error: parsed.message,
+              code: parsed.statusCode,
+              status: parsed.status,
+              category: parsed.category,
+              provider: 'groq',
+              model: currentModel,
+              retryable: parsed.isRetryable,
+              canFallback: true,
+              suggestedProviders: getConfiguredFallbackProviders('groq', isServerless)
+            });
           }
-          const parsed = parseGeminiError(fetchErr, 'groq');
-          logAIDiagnostic({
-            category: parsed.category,
-            provider: 'groq',
-            model: selectedModel,
-            phase: 'pre-stream',
-            upstreamStatus: parsed.statusCode,
-            sanitizedMessage: parsed.message
-          });
-          return res.status(parsed.statusCode).json({
-            error: parsed.message,
-            code: parsed.statusCode,
-            status: parsed.status,
-            category: parsed.category,
-            provider: 'groq',
-            model: selectedModel,
-            retryable: parsed.isRetryable,
-            canFallback: true,
-            suggestedProviders: getConfiguredFallbackProviders('groq', isServerless)
-          });
         }
 
-        if (!groqRes.ok) {
-          const errText = await groqRes.text();
-          const parsed = parseGeminiError({ status: groqRes.status, message: errText }, 'groq');
-          let friendlyError = parsed.message;
-          if (errText.includes('context_length_exceeded') || errText.includes('maximum context length') || errText.includes('tokens')) {
-            friendlyError = 'The attached document exceeds Groq\'s context length limit. Please switch to Google Gemini (which supports 1M tokens) or ask about specific pages or slides.';
-          }
-          logAIDiagnostic({
-            category: parsed.category,
+        if (!groqRes) {
+          if (upstreamGuard.isClientClosed()) return;
+          const fallbackErr = lastParsedErr || {
+            statusCode: 404,
+            status: 'NOT_FOUND',
+            message: 'The requested Groq model was not found and all fallback options were exhausted.',
+            isRetryable: false
+          };
+          return res.status(fallbackErr.statusCode).json({
+            error: fallbackErr.message,
+            code: fallbackErr.statusCode,
+            status: fallbackErr.status,
             provider: 'groq',
             model: selectedModel,
-            phase: 'pre-stream',
-            upstreamStatus: groqRes.status,
-            sanitizedMessage: friendlyError
-          });
-          return res.status(groqRes.status).json({
-            error: friendlyError,
-            code: groqRes.status,
-            status: parsed.status,
-            category: parsed.category,
-            provider: 'groq',
-            model: selectedModel,
-            retryable: parsed.isRetryable,
+            retryable: false,
+            serverRetriesExhausted: true,
             canFallback: true,
             suggestedProviders: getConfiguredFallbackProviders('groq', isServerless)
           });
@@ -3956,13 +4097,15 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         const stopHeartbeat = startSSEHeartbeat(res);
         sendSSE(res, { type: 'start', modelUsed: selectedModel, provider: 'groq' });
 
+        let fullText = '';
         try {
           const reader = groqRes.body!.getReader();
           const decoder = new TextDecoder();
           let buffer = '';
-          let fullText = '';
           let modelUsed = selectedModel;
           let lastFinishReason: string | null = null;
+          let currentEventType: string | null = null;
+          let streamFailed = false;
 
           while (true) {
             if (upstreamGuard.isClientClosed() || res.writableEnded) {
@@ -3981,11 +4124,100 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
             for (const line of lines) {
               const trimmed = line.trim();
-              if (!trimmed || !trimmed.startsWith('data:')) continue;
+              if (!trimmed || trimmed.startsWith(':')) continue;
+
+              if (trimmed.startsWith('event:')) {
+                currentEventType = trimmed.slice(6).trim();
+                continue;
+              }
+
+              if (!trimmed.startsWith('data:')) continue;
               const dataStr = trimmed.slice(5).trim();
               if (dataStr === '[DONE]') continue;
+
+              // Upstream SSE error frame detection (e.g. event: error or data: {"error": ...})
+              if (currentEventType === 'error') {
+                streamFailed = true;
+                let parsedErrMessage = 'Groq streaming connection encountered an upstream error.';
+                let parsedErrCode = 500;
+                let parsedErrStatus = 'STREAM_ERROR';
+                try {
+                  const errJson = JSON.parse(dataStr);
+                  if (errJson?.error) {
+                    parsedErrMessage = typeof errJson.error === 'string' ? errJson.error : errJson.error.message || parsedErrMessage;
+                    parsedErrCode = Number(errJson.error.code) || Number(errJson.error.status) || 500;
+                    parsedErrStatus = String(errJson.error.type || errJson.error.status || 'STREAM_ERROR');
+                  }
+                } catch (_) {
+                  if (dataStr) parsedErrMessage = dataStr;
+                }
+
+                stopHeartbeat();
+                try { await reader.cancel(); } catch (_) {}
+                logAIDiagnostic({
+                  category: 'streaming failure',
+                  provider: 'groq',
+                  model: selectedModel,
+                  phase: 'mid-stream',
+                  upstreamStatus: parsedErrCode,
+                  sanitizedMessage: parsedErrMessage
+                });
+
+                if (!res.writableEnded) {
+                  sendSSE(res, {
+                    type: 'error',
+                    error: parsedErrMessage,
+                    code: parsedErrCode,
+                    status: parsedErrStatus,
+                    provider: 'groq',
+                    model: selectedModel,
+                    retryable: false,
+                    canFallback: true,
+                    partial: fullText.length > 0,
+                    partialText: fullText.length > 0 ? fullText : undefined
+                  });
+                  res.end();
+                }
+                return;
+              }
+
               try {
                 const parsed = JSON.parse(dataStr);
+                if (parsed.error) {
+                  streamFailed = true;
+                  const errMsg = typeof parsed.error === 'string' ? parsed.error : parsed.error.message || 'Groq stream encountered an error.';
+                  const errCode = Number(parsed.error.code) || 500;
+                  const errStatus = String(parsed.error.type || parsed.error.status || 'STREAM_ERROR');
+
+                  stopHeartbeat();
+                  try { await reader.cancel(); } catch (_) {}
+                  logAIDiagnostic({
+                    category: 'streaming failure',
+                    provider: 'groq',
+                    model: selectedModel,
+                    phase: 'mid-stream',
+                    upstreamStatus: errCode,
+                    sanitizedMessage: errMsg
+                  });
+
+                  if (!res.writableEnded) {
+                    sendSSE(res, {
+                      type: 'error',
+                      error: errMsg,
+                      code: errCode,
+                      status: errStatus,
+                      provider: 'groq',
+                      model: selectedModel,
+                      retryable: false,
+                      canFallback: true,
+                      partial: fullText.length > 0,
+                      partialText: fullText.length > 0 ? fullText : undefined
+                    });
+                    res.end();
+                  }
+                  return;
+                }
+
                 if (parsed.model) modelUsed = parsed.model;
                 const finishReason = parsed?.choices?.[0]?.finish_reason;
                 if (finishReason) lastFinishReason = finishReason;
@@ -4001,25 +4233,49 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
           // Process trailing bytes and buffer
           const finalBytes = decoder.decode();
           if (finalBytes) buffer += finalBytes;
-          if (!upstreamGuard.isClientClosed() && buffer && buffer.trim().startsWith('data:')) {
-            const dataStr = buffer.trim().slice(5).trim();
-            if (dataStr !== '[DONE]') {
-              try {
-                const parsed = JSON.parse(dataStr);
-                if (parsed.model) modelUsed = parsed.model;
-                const finishReason = parsed?.choices?.[0]?.finish_reason;
-                if (finishReason) lastFinishReason = finishReason;
-                const delta = parsed?.choices?.[0]?.delta?.content;
-                if (delta) {
-                  fullText += delta;
-                  sendSSE(res, { type: 'chunk', text: delta });
-                }
-              } catch (_) {}
+          if (!upstreamGuard.isClientClosed() && buffer && buffer.trim()) {
+            const trimmedBuf = buffer.trim();
+            if (trimmedBuf.startsWith('data:')) {
+              const dataStr = trimmedBuf.slice(5).trim();
+              if (dataStr !== '[DONE]') {
+                try {
+                  const parsed = JSON.parse(dataStr);
+                  if (parsed.error) {
+                    streamFailed = true;
+                    const errMsg = typeof parsed.error === 'string' ? parsed.error : parsed.error.message || 'Groq stream encountered an error.';
+                    stopHeartbeat();
+                    if (!res.writableEnded) {
+                      sendSSE(res, {
+                        type: 'error',
+                        error: errMsg,
+                        code: Number(parsed.error.code) || 500,
+                        status: String(parsed.error.type || parsed.error.status || 'STREAM_ERROR'),
+                        provider: 'groq',
+                        model: selectedModel,
+                        retryable: false,
+                        canFallback: true,
+                        partial: fullText.length > 0,
+                        partialText: fullText.length > 0 ? fullText : undefined
+                      });
+                      res.end();
+                    }
+                    return;
+                  }
+                  if (parsed.model) modelUsed = parsed.model;
+                  const finishReason = parsed?.choices?.[0]?.finish_reason;
+                  if (finishReason) lastFinishReason = finishReason;
+                  const delta = parsed?.choices?.[0]?.delta?.content;
+                  if (delta) {
+                    fullText += delta;
+                    sendSSE(res, { type: 'chunk', text: delta });
+                  }
+                } catch (_) {}
+              }
             }
           }
 
           // Continuation if finish_reason indicates token truncation
-          if ((lastFinishReason === 'length' || lastFinishReason === 'max_tokens') && !upstreamGuard.isClientClosed() && !res.writableEnded && fullText.length > 60) {
+          if (!streamFailed && (lastFinishReason === 'length' || lastFinishReason === 'max_tokens') && !upstreamGuard.isClientClosed() && !res.writableEnded && fullText.length > 60) {
             try {
               const contMessages = [
                 ...messages,
@@ -4048,6 +4304,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
               if (contRes.ok && contRes.body) {
                 const contReader = contRes.body.getReader();
                 let contBuffer = '';
+                let contEventType: string | null = null;
                 while (true) {
                   if (upstreamGuard.isClientClosed() || res.writableEnded) {
                     try { await contReader.cancel(); } catch (_) {}
@@ -4060,11 +4317,26 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
                   contBuffer = cLines.pop() || '';
                   for (const cLine of cLines) {
                     const cTrimmed = cLine.trim();
+                    if (!cTrimmed || cTrimmed.startsWith(':')) continue;
+                    if (cTrimmed.startsWith('event:')) {
+                      contEventType = cTrimmed.slice(6).trim();
+                      continue;
+                    }
                     if (!cTrimmed.startsWith('data:')) continue;
                     const cData = cTrimmed.slice(5).trim();
                     if (cData === '[DONE]') continue;
+
+                    if (contEventType === 'error') {
+                      try { await contReader.cancel(); } catch (_) {}
+                      break;
+                    }
+
                     try {
                       const cParsed = JSON.parse(cData);
+                      if (cParsed.error) {
+                        try { await contReader.cancel(); } catch (_) {}
+                        break;
+                      }
                       const cDelta = cParsed?.choices?.[0]?.delta?.content;
                       if (cDelta) {
                         fullText += cDelta;
@@ -4078,7 +4350,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
           }
 
           stopHeartbeat();
-          if (!upstreamGuard.isClientClosed() && !res.writableEnded) {
+          if (!streamFailed && !upstreamGuard.isClientClosed() && !res.writableEnded) {
             if (isLikelyLarge && !isContinuation && !responseHasContinuationNotice(fullText)) {
               sendSSE(res, { type: 'chunk', text: CONTINUATION_NOTICES.PART_1 });
               fullText += CONTINUATION_NOTICES.PART_1;
@@ -4106,7 +4378,9 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
               code: 503,
               status: 'STREAM_FAILED',
               provider: 'groq',
-              retryable: false
+              retryable: false,
+              partial: fullText.length > 0,
+              partialText: fullText.length > 0 ? fullText : undefined
             });
             res.end();
           }

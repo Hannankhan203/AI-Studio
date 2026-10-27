@@ -40,6 +40,7 @@ export const PROVIDER_OPTIONS = [
     id: AI_PROVIDERS.GROQ,
     name: 'Groq',
     modelTag: 'GPT OSS 120B',
+    defaultModel: 'openai/gpt-oss-120b',
     description: 'Ultra-fast inference'
   },
   {
