@@ -1144,4 +1144,524 @@ test('Phase 2C Test 7: Phase 2A/2B image OCR behavior and rawImageDataToBmp conv
   assert.strictEqual(groqPrep.directAnswer, 'No readable text detected in this image.');
 });
 
+// ----------------------------------------------------------------------------
+// 9. Phase 2D: Text Document Extraction Reliability (DOCX, PPTX, TXT, CSV, JSON, XML)
+// ----------------------------------------------------------------------------
+
+async function buildTestDocxZip() {
+  const zip = new JSZip();
+
+  zip.file(
+    '[Content_Types].xml',
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>`
+  );
+
+  zip.file(
+    '_rels/.rels',
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>`
+  );
+
+  const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+            xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+            xmlns:v="urn:schemas-microsoft-com:vml"
+            mc:Ignorable="wps">
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Project Architecture &amp; Specifications</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:r><w:t>This is a standard paragraph with Unicode symbols: Café, résumé, and em-dash — confirmed.</w:t></w:r>
+    </w:p>
+    <w:tbl>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>Service</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>Protocol | Port</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>Status</w:t></w:r></w:p></w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>WebLLM</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>WebGPU | Local</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>Active</w:t></w:r></w:p></w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>OCR Engine</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>Tesseract | Offline</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>Verified</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+    <!-- AlternateContent with Choice (DrawingML wps) and Fallback (VML) -->
+    <mc:AlternateContent>
+      <mc:Choice Requires="wps">
+        <wps:txbx>
+          <w:txbxContent>
+            <w:p><w:r><w:t>DrawingML Architecture Sidebar Note</w:t></w:r></w:p>
+          </w:txbxContent>
+        </wps:txbx>
+      </mc:Choice>
+      <mc:Fallback>
+        <v:textbox>
+          <w:txbxContent>
+            <w:p><w:r><w:t>DrawingML Architecture Sidebar Note</w:t></w:r></w:p>
+          </w:txbxContent>
+        </v:textbox>
+      </mc:Fallback>
+    </mc:AlternateContent>
+    <!-- Standalone text box -->
+    <w:p>
+      <w:r>
+        <w:txbxContent>
+          <w:p><w:r><w:t>Standalone Callout: Zero Cloud Leakage</w:t></w:r></w:p>
+        </w:txbxContent>
+      </w:r>
+    </w:p>
+  </w:body>
+</w:document>`;
+
+  zip.file('word/document.xml', documentXml);
+  return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+}
+
+async function buildTestPptxZip() {
+  const zip = new JSZip();
+
+  zip.file(
+    '[Content_Types].xml',
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+  <Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+  <Override PartName="/ppt/slides/slide2.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+</Types>`
+  );
+
+  zip.file(
+    '_rels/.rels',
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+</Relationships>`
+  );
+
+  zip.file(
+    'ppt/_rels/presentation.xml.rels',
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide2.xml"/>
+</Relationships>`
+  );
+
+  zip.file(
+    'ppt/presentation.xml',
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+                xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:sldIdLst>
+    <p:sldId id="256" r:id="rId1"/>
+    <p:sldId id="257" r:id="rId2"/>
+  </p:sldIdLst>
+</p:presentation>`
+  );
+
+  // Slide 1: Title, grouped shape text, and table inside p:graphicFrame
+  const slide1Xml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr>
+        <p:cNvPr id="1" name=""/>
+        <p:cNvGrpSpPr/>
+        <p:grpSpPr/>
+      </p:nvGrpSpPr>
+      <!-- Title shape -->
+      <p:sp>
+        <p:nvSpPr>
+          <p:cNvPr id="2" name="Title 1"/>
+          <p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr>
+          <p:nvPr><p:ph type="title"/></p:nvPr>
+        </p:nvSpPr>
+        <p:txBody>
+          <a:bodyPr/>
+          <a:p><a:r><a:t>Quarterly Technical Review</a:t></a:r></a:p>
+        </p:txBody>
+      </p:sp>
+      <!-- Grouped shapes -->
+      <p:grpSp>
+        <p:nvGrpSpPr>
+          <p:cNvPr id="3" name="KPI Group"/>
+          <p:cNvGrpSpPr/>
+          <p:grpSpPr/>
+        </p:nvGrpSpPr>
+        <p:sp>
+          <p:txBody>
+            <a:bodyPr/>
+            <a:p><a:r><a:t>System Availability: 99.98%</a:t></a:r></a:p>
+          </p:txBody>
+        </p:sp>
+        <p:sp>
+          <p:txBody>
+            <a:bodyPr/>
+            <a:p><a:r><a:t>Average Inference: 38ms</a:t></a:r></a:p>
+          </p:txBody>
+        </p:sp>
+      </p:grpSp>
+      <!-- Table in graphicFrame -->
+      <p:graphicFrame>
+        <p:nvGraphicFramePr>
+          <p:cNvPr id="4" name="Benchmark Table"/>
+          <p:cNvGraphicFramePr/>
+          <p:nvPr/>
+        </p:nvGraphicFramePr>
+        <a:graphic>
+          <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table">
+            <a:tbl>
+              <a:tr>
+                <a:tc><a:txBody><a:p><a:r><a:t>Component</a:t></a:r></a:p></a:txBody></a:tc>
+                <a:tc><a:txBody><a:p><a:r><a:t>Throughput | Latency</a:t></a:r></a:p></a:txBody></a:tc>
+              </a:tr>
+              <a:tr>
+                <a:tc><a:txBody><a:p><a:r><a:t>WebLLM Worker</a:t></a:r></a:p></a:txBody></a:tc>
+                <a:tc><a:txBody><a:p><a:r><a:t>18 tok/s | &lt; 50ms</a:t></a:r></a:p></a:txBody></a:tc>
+              </a:tr>
+            </a:tbl>
+          </a:graphicData>
+        </a:graphic>
+      </p:graphicFrame>
+    </p:spTree>
+  </p:cSld>
+</p:sld>`;
+
+  // Slide 2: Title-only slide to confirm it is preserved and not classified as [Empty slide]
+  const slide2Xml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr>
+        <p:cNvPr id="1" name=""/>
+        <p:cNvGrpSpPr/>
+        <p:grpSpPr/>
+      </p:nvGrpSpPr>
+      <p:sp>
+        <p:nvSpPr>
+          <p:cNvPr id="2" name="Title Slide 2"/>
+          <p:cNvSpPr/>
+          <p:nvPr><p:ph type="title"/></p:nvPr>
+        </p:nvSpPr>
+        <p:txBody>
+          <a:bodyPr/>
+          <a:p><a:r><a:t>Roadmap &amp; Milestones 2026</a:t></a:r></a:p>
+        </p:txBody>
+      </p:sp>
+    </p:spTree>
+  </p:cSld>
+</p:sld>`;
+
+  zip.file('ppt/slides/slide1.xml', slide1Xml);
+  zip.file('ppt/slides/slide2.xml', slide2Xml);
+  return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+}
+
+await test('Phase 2D Test 1: DOCX extraction preserves headings, paragraphs, formatted tables, and text boxes without duplicate fallback content', async () => {
+  const docxBytes = await buildTestDocxZip();
+  const result = await extractDocumentContent(
+    docxBytes,
+    'spec.docx',
+    '.docx',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'test-docx-1'
+  );
+
+  assert.strictEqual(result.status, 'ready');
+  assert.strictEqual(result.success, true);
+  assert.strictEqual(result.format, 'DOCX');
+
+  // Verify Heading & Unicode
+  assert.ok(result.text.includes('Project Architecture & Specifications'), 'Must extract heading');
+  assert.ok(result.text.includes('Café, résumé, and em-dash — confirmed.'), 'Must preserve Unicode characters');
+
+  // Verify Markdown table structure and alignment
+  assert.ok(/\|\s*Service\s*\|\s*Protocol \\\| Port\s*\|\s*Status\s*\|/.test(result.text), 'Table header must be preserved as Markdown');
+  assert.ok(/\|\s*WebLLM\s*\|\s*WebGPU \\\| Local\s*\|\s*Active\s*\|/.test(result.text), 'Table data row must be preserved');
+  assert.ok(/\|\s*OCR Engine\s*\|\s*Tesseract \\\| Offline\s*\|\s*Verified\s*\|/.test(result.text), 'Second table row must be preserved');
+
+  // Verify DrawingML Text Box content is extracted
+  assert.ok(result.text.includes('DrawingML Architecture Sidebar Note'), 'DrawingML textbox text must be extracted');
+
+  // Verify mc:Fallback does NOT duplicate the text box content
+  const matches = (result.text.match(/DrawingML Architecture Sidebar Note/g) || []).length;
+  assert.strictEqual(matches, 1, 'DrawingML textbox text must appear exactly once, not duplicated from mc:Fallback');
+
+  // Verify standalone textbox is extracted
+  assert.ok(result.text.includes('Standalone Callout: Zero Cloud Leakage'), 'Standalone textbox must be extracted');
+});
+
+await test('Phase 2D Test 2: PPTX extraction preserves slide titles, ordinary text, grouped shapes, and tables in reading order', async () => {
+  const pptxBytes = await buildTestPptxZip();
+  const result = await extractDocumentContent(
+    pptxBytes,
+    'review.pptx',
+    '.pptx',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'test-pptx-1'
+  );
+
+  assert.strictEqual(result.status, 'ready');
+  assert.strictEqual(result.success, true);
+  assert.strictEqual(result.format, 'PPTX');
+  assert.strictEqual(result.slideCount, 2);
+
+  // Slide 1 checks
+  assert.ok(result.text.includes('--- Slide 1: Quarterly Technical Review ---'), 'Slide 1 title header must be present');
+  assert.ok(result.text.includes('System Availability: 99.98%'), 'Grouped shape 1 text must be extracted');
+  assert.ok(result.text.includes('Average Inference: 38ms'), 'Grouped shape 2 text must be extracted');
+
+  // Verify table in graphicFrame extracted with escaped pipes in cells
+  assert.ok(/\|\s*Component\s*\|\s*Throughput \\\| Latency\s*\|/.test(result.text), 'Table header with escaped pipe must be formatted');
+  assert.ok(/\|\s*WebLLM Worker\s*\|\s*18 tok\/s \\\| < 50ms\s*\|/.test(result.text), 'Table row with pipe and < entity must be decoded/escaped');
+
+  // Slide 2 checks: Title-only slide must NOT be classified as [Empty slide]
+  assert.ok(result.text.includes('--- Slide 2: Roadmap & Milestones 2026 ---'), 'Slide 2 title must be preserved');
+  assert.ok(!result.text.includes('[Empty slide]'), 'Title-only slide must NOT be labeled as [Empty slide]');
+  assert.ok(result.slides[1].charCount > 0, 'Slide 2 must have non-zero charCount');
+  assert.ok(result.totalCharacters > 0, 'Total characters must be computed correctly');
+});
+
+await test('Phase 2D Test 3: TXT and LOG extraction preserves line breaks, indentation, Unicode, and handles odd-length UTF-16 BE safely', async () => {
+  // UTF-8 plain text with CRLF, LF, tabs, and Unicode
+  const textContent = 'Line 1: UTF-8 Check 🚀\r\n\tIndented Line 2: 日本語とEspañol\nLine 3: Final line.';
+  const txtResult = await extractDocumentContent(
+    Buffer.from(textContent, 'utf8'),
+    'system.log',
+    '.log',
+    'text/plain',
+    'test-log-1'
+  );
+
+  assert.strictEqual(txtResult.status, 'ready');
+  assert.strictEqual(txtResult.success, true);
+  assert.strictEqual(txtResult.format, 'LOG');
+  assert.ok(txtResult.text.includes('Line 1: UTF-8 Check 🚀'));
+  assert.ok(txtResult.text.includes('\tIndented Line 2: 日本語とEspañol'));
+  assert.ok(txtResult.text.includes('Line 3: Final line.'));
+
+  // Test odd-length UTF-16 BE buffer: Must NOT throw RangeError on swap16
+  const utf16beWithBom = Buffer.from([0xfe, 0xff, 0x00, 0x48, 0x00, 0x69, 0x00, 0x21, 0xff]); // 9 bytes (odd length!)
+  const utf16Result = await extractDocumentContent(
+    utf16beWithBom,
+    'odd_utf16be.txt',
+    '.txt',
+    'text/plain',
+    'test-txt-utf16'
+  );
+
+  assert.strictEqual(utf16Result.status, 'ready');
+  assert.strictEqual(utf16Result.success, true);
+  assert.ok(utf16Result.text.includes('Hi!'), 'Must safely decode UTF-16 BE without crashing on odd byte length');
+});
+
+await test('Phase 2D Test 4: CSV and TSV extraction preserves row boundaries, quoted fields with embedded commas/newlines, and escapes pipe characters in Markdown tables', async () => {
+  const csvContent = `"ID","Service | Feature","Description","Active"\n"1","WebLLM | Engine","Supports Qwen2.5 1.5B\nand 0.5B models","true"\n"2","OCR | Tesseract","Runs offline in browser\nand server","true"`;
+  const csvResult = await extractDocumentContent(
+    Buffer.from(csvContent, 'utf8'),
+    'services.csv',
+    '.csv',
+    'text/csv',
+    'test-csv-1'
+  );
+
+  assert.strictEqual(csvResult.status, 'ready');
+  assert.strictEqual(csvResult.success, true);
+  assert.strictEqual(csvResult.format, 'CSV');
+  assert.strictEqual(csvResult.rowCount, 2);
+  assert.strictEqual(csvResult.columnCount, 4);
+
+  // Markdown table must have pipe characters inside data escaped as \|
+  assert.ok(csvResult.text.includes('WebLLM \\| Engine'), 'Pipe inside quoted cell must be escaped');
+  assert.ok(csvResult.text.includes('OCR \\| Tesseract'), 'Pipe inside quoted cell must be escaped');
+
+  // Verify browser parser function behaves identically
+  const browserTable = parseDelimitedText(csvContent, ',');
+  assert.strictEqual(browserTable.rowCount, 2);
+  assert.ok(browserTable.markdownTable.includes('WebLLM \\| Engine'));
+
+  // Test TSV
+  const tsvContent = `Col1\tCol2\tCol3\nValA\tValB\tValC`;
+  const tsvResult = await extractDocumentContent(
+    Buffer.from(tsvContent, 'utf8'),
+    'data.tsv',
+    '.tsv',
+    'text/tab-separated-values',
+    'test-tsv-1'
+  );
+  assert.strictEqual(tsvResult.status, 'ready');
+  assert.strictEqual(tsvResult.format, 'TSV');
+  assert.ok(tsvResult.text.includes('| Col1 | Col2 | Col3 |'));
+});
+
+await test('Phase 2D Test 5: JSON extraction handles nested objects, arrays, Unicode strings, and preserves complete structured data', async () => {
+  const complexData = {
+    app: 'Orvix AI',
+    version: '2.4.0',
+    features: ['offline-first', 'webllm-gpu', 'image-ocr', 'scanned-pdf'],
+    unicodeLabel: 'Café & 🚀 Rocket',
+    nestedConfig: {
+      storage: {
+        quotaBytes: 104857600,
+        encrypted: false
+      },
+      tags: [1, 2, 3]
+    },
+    nullableValue: null
+  };
+
+  const jsonBytes = Buffer.from(JSON.stringify(complexData, null, 2), 'utf8');
+  const jsonResult = await extractDocumentContent(
+    jsonBytes,
+    'config.json',
+    '.json',
+    'application/json',
+    'test-json-1'
+  );
+
+  assert.strictEqual(jsonResult.status, 'ready');
+  assert.strictEqual(jsonResult.success, true);
+  assert.strictEqual(jsonResult.format, 'JSON');
+  assert.ok(jsonResult.text.includes('"app": "Orvix AI"'));
+  assert.ok(jsonResult.text.includes('"version": "2.4.0"'));
+  assert.ok(jsonResult.text.includes('Café & 🚀 Rocket'));
+  assert.ok(jsonResult.text.includes('"quotaBytes": 104857600'));
+});
+
+await test('Phase 2D Test 6: XML extraction safely decodes XML/HTML entities without double-decoding cascade and unwraps CDATA blocks', async () => {
+  const xmlContent = `<?xml version="1.0" encoding="UTF-8"?>
+<catalog>
+  <book id="bk101">
+    <author>Gambardella, Matthew</author>
+    <title>XML Developer's &amp; Architecture Guide</title>
+    <description>Learn how to use &lt;container&gt; elements &amp; entities like &quot;quotes&quot; and &apos;single quotes&apos;.</description>
+    <cascade_simulation>&amp;lt;not_a_tag&amp;gt;</cascade_simulation>
+    <code_sample><![CDATA[function parse<T>(input: T): void { console.log("Unescaped <tag> & symbols"); }]]></code_sample>
+  </book>
+</catalog>`;
+
+  const xmlResult = await extractDocumentContent(
+    Buffer.from(xmlContent, 'utf8'),
+    'catalog.xml',
+    '.xml',
+    'application/xml',
+    'test-xml-1'
+  );
+
+  assert.strictEqual(xmlResult.status, 'ready');
+  assert.strictEqual(xmlResult.success, true);
+  assert.strictEqual(xmlResult.format, 'XML');
+
+  // Verify standard entities decoded
+  assert.ok(xmlResult.text.includes("XML Developer's & Architecture Guide"));
+  assert.ok(xmlResult.text.includes('Learn how to use <container> elements & entities like "quotes" and \'single quotes\'.'));
+
+  // Verify single-pass decoding does not double-decode &amp;lt; to <
+  assert.ok(
+    xmlResult.text.includes('&lt;not_a_tag&gt;'),
+    '&amp;lt; must be decoded to &lt; only, not cascading into unescaped <'
+  );
+
+  // Verify CDATA block content is unwrapped and preserved
+  assert.ok(
+    xmlResult.text.includes('function parse<T>(input: T): void { console.log("Unescaped <tag> & symbols"); }'),
+    'CDATA text must be preserved without losing inner content'
+  );
+});
+
+await test('Phase 2D Test 7: Invalid, corrupted, or unsupported files retain explicit error handling without silent classification as successful empty documents', async () => {
+  // Corrupted DOCX (not a zip)
+  const corruptDocx = Buffer.from('NOT A ZIP FILE - CORRUPTED DOCX');
+  const docxErr = await extractDocumentContent(corruptDocx, 'broken.docx', '.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'corrupt-docx');
+  assert.strictEqual(docxErr.status, 'corrupted');
+  assert.strictEqual(docxErr.success, false);
+  assert.ok(docxErr.error.includes('Failed to parse DOCX document'));
+
+  // Corrupted PPTX (not a zip)
+  const corruptPptx = Buffer.from('NOT A ZIP FILE - CORRUPTED PPTX');
+  const pptxErr = await extractDocumentContent(corruptPptx, 'broken.pptx', '.pptx', 'application/vnd.openxmlformats-officedocument.presentationml.presentation', 'corrupt-pptx');
+  assert.strictEqual(pptxErr.status, 'corrupted');
+  assert.strictEqual(pptxErr.success, false);
+  assert.ok(pptxErr.error.includes('Failed to parse PPTX'));
+
+  // Unsupported binary file
+  const unsuppBinary = Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x01, 0x01]);
+  const unsuppErr = await extractDocumentContent(unsuppBinary, 'program.exe', '.exe', 'application/x-msdownload', 'unsupp-bin');
+  assert.strictEqual(unsuppErr.status, 'unsupported_format');
+  assert.strictEqual(unsuppErr.success, false);
+
+  // 0-byte empty file
+  const emptyBuf = Buffer.alloc(0);
+  const emptyRes = await extractDocumentContent(emptyBuf, 'empty.txt', '.txt', 'text/plain', 'empty-txt');
+  assert.strictEqual(emptyRes.status, 'empty');
+  assert.strictEqual(emptyRes.success, false);
+  assert.strictEqual(emptyRes.text, '');
+});
+
+await test('Phase 2D Test 8: Extracted DOCX and PPTX content reaches prepareDocumentContext with accurate metadata, slide/table boundaries, and limits', async () => {
+  const docxBytes = await buildTestDocxZip();
+  const docxDoc = await extractDocumentContent(
+    docxBytes,
+    'spec.docx',
+    '.docx',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'test-docx-prep'
+  );
+
+  const pptxBytes = await buildTestPptxZip();
+  const pptxDoc = await extractDocumentContent(
+    pptxBytes,
+    'review.pptx',
+    '.pptx',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'test-pptx-prep'
+  );
+
+  // Deliver to Gemini provider
+  const geminiPrep = prepareDocumentContext('Summarize the attached documents', [docxDoc, pptxDoc], {
+    provider: 'gemini'
+  });
+  assert.strictEqual(geminiPrep.directAnswer, undefined, 'Must not reject valid text documents');
+  assert.ok(geminiPrep.formattedContext.includes('spec.docx'));
+  assert.ok(geminiPrep.formattedContext.includes('Project Architecture & Specifications'));
+  assert.ok(/\|\s*Service\s*\|\s*Protocol \\\| Port\s*\|\s*Status\s*\|/.test(geminiPrep.formattedContext));
+  assert.ok(geminiPrep.formattedContext.includes('DrawingML Architecture Sidebar Note'));
+  assert.ok(geminiPrep.formattedContext.includes('review.pptx'));
+  assert.ok(geminiPrep.formattedContext.includes('--- Slide 1: Quarterly Technical Review ---'));
+  assert.ok(geminiPrep.formattedContext.includes('System Availability: 99.98%'));
+  assert.ok(geminiPrep.formattedContext.includes('--- Slide 2: Roadmap & Milestones 2026 ---'));
+
+  // Deliver to Groq (text-only) provider
+  const groqPrep = prepareDocumentContext('What is on slide 1?', [pptxDoc], {
+    provider: 'groq'
+  });
+  assert.strictEqual(groqPrep.directAnswer, undefined);
+  assert.ok(groqPrep.formattedContext.includes('review.pptx'));
+  assert.ok(groqPrep.formattedContext.includes('Quarterly Technical Review'));
+});
+
 console.log(`\nAll ${passedTests} offline reliability tests passed successfully!`);
+try {
+  await discardOcrWorker();
+} catch (_) {}
+process.exit(0);
+

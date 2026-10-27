@@ -58,20 +58,23 @@ export function truncateSafely(text, limit = MAX_EXTRACTED_CHARACTERS) {
  */
 export function decodeXmlEntities(str) {
   if (!str || typeof str !== 'string') return '';
-  return str
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&#(\d+);/g, (_, dec) => {
-      const code = parseInt(dec, 10);
-      return !isNaN(code) && code > 0 ? String.fromCharCode(code) : '';
-    })
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => {
-      const code = parseInt(hex, 16);
-      return !isNaN(code) && code > 0 ? String.fromCharCode(code) : '';
-    });
+  return str.replace(/&(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);/gi, (match) => {
+    const lower = match.toLowerCase();
+    if (lower === '&amp;') return '&';
+    if (lower === '&lt;') return '<';
+    if (lower === '&gt;') return '>';
+    if (lower === '&quot;') return '"';
+    if (lower === '&apos;') return "'";
+    if (lower.startsWith('&#x')) {
+      const code = parseInt(lower.slice(3, -1), 16);
+      return !isNaN(code) && code > 0 ? String.fromCodePoint(code) : match;
+    }
+    if (lower.startsWith('&#')) {
+      const code = parseInt(lower.slice(2, -1), 10);
+      return !isNaN(code) && code > 0 ? String.fromCodePoint(code) : match;
+    }
+    return match;
+  });
 }
 
 /**
@@ -212,13 +215,13 @@ export function parseDelimitedText(rawText, delimiter) {
   const colWidths = new Array(maxCols).fill(3);
   for (const row of rows) {
     for (let c = 0; c < maxCols; c++) {
-      const cellClean = (row[c] || '').replace(/[\r\n]+/g, ' ');
+      const cellClean = (row[c] || '').replace(/[\r\n]+/g, ' ').replace(/\|/g, '\\|');
       colWidths[c] = Math.max(colWidths[c], Math.min(cellClean.length, 40));
     }
   }
 
   const headerRow = '| ' + Array.from({ length: maxCols }, (_, i) => {
-    const h = (headers[i] || `Col ${i + 1}`).replace(/[\r\n]+/g, ' ');
+    const h = (headers[i] || `Col ${i + 1}`).replace(/[\r\n]+/g, ' ').replace(/\|/g, '\\|');
     return h.padEnd(colWidths[i] || 3);
   }).join(' | ') + ' |';
 
@@ -226,7 +229,7 @@ export function parseDelimitedText(rawText, delimiter) {
 
   const previewData = dataRows.slice(0, 10).map((row) => {
     return '| ' + Array.from({ length: maxCols }, (_, i) => {
-      const c = (row[i] || '').replace(/[\r\n]+/g, '<br>');
+      const c = (row[i] || '').replace(/[\r\n]+/g, '<br>').replace(/\|/g, '\\|');
       return c.padEnd(colWidths[i] || 3);
     }).join(' | ') + ' |';
   });
@@ -299,6 +302,8 @@ function extractDelimitedDocument(text, ext) {
     status: 'ready',
     success: true,
     text: tableData.markdownTable || cleanText,
+    rowCount: tableData.rowCount,
+    columnCount: tableData.columnCount,
     table: tableData
   };
 }
@@ -373,7 +378,9 @@ function extractXmlDocument(text) {
   }
 
   try {
-    let structured = cleanText
+    const unwrappedCdata = cleanText.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/gi, '$1');
+
+    let structured = unwrappedCdata
       .replace(/<\/(?:p|div|section|article|item|entry|row|record|message|h[1-6]|li|title)>/gi, '\n')
       .replace(/<(?:br|hr)\s*\/?>/gi, '\n')
       .replace(/<[^>]+>/g, ' ');
@@ -487,23 +494,200 @@ async function extractPdfDocument(arrayBuffer) {
 }
 
 /**
- * Extracts text boxes from Word document XML (both DrawingML wps:txbx / w:txbxContent and VML v:textbox)
+ * Converts Mammoth HTML output into clean, structured Markdown,
+ * preserving tables as aligned Markdown tables, headings, lists, blockquotes, and text.
+ * @param {string} html
+ * @returns {string}
+ */
+export function convertMammothHtmlToMarkdown(html) {
+  if (!html || typeof html !== 'string') return '';
+
+  // 1. Process HTML tables into standard aligned Markdown tables
+  let res = html.replace(/<table\b[^>]*>([\s\S]*?)<\/table>/gi, (_, tableContent) => {
+    const rows = [];
+    const trRegex = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
+    let trMatch;
+    while ((trMatch = trRegex.exec(tableContent)) !== null) {
+      const rowContent = trMatch[1];
+      const cells = [];
+      const cellRegex = /<(?:td|th)\b[^>]*>([\s\S]*?)<\/(?:td|th)>/gi;
+      let cellMatch;
+      while ((cellMatch = cellRegex.exec(rowContent)) !== null) {
+        const cellText = cellMatch[1]
+          .replace(/<br\s*\/?>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .replace(/\|/g, '\\|');
+        cells.push(cellText);
+      }
+      if (cells.length > 0 && cells.some((c) => c.length > 0)) {
+        rows.push(cells);
+      }
+    }
+
+    if (rows.length === 0) return '';
+
+    const maxCols = Math.max(...rows.map((r) => r.length));
+    const colWidths = new Array(maxCols).fill(3);
+    for (const r of rows) {
+      for (let c = 0; c < maxCols; c++) {
+        colWidths[c] = Math.max(colWidths[c], Math.min((r[c] || '').length, 40));
+      }
+    }
+
+    const header = rows[0];
+    const dataRows = rows.slice(1);
+    const headerLine =
+      '| ' +
+      Array.from({ length: maxCols }, (_, i) => (header[i] || `Col ${i + 1}`).padEnd(colWidths[i])).join(' | ') +
+      ' |';
+    const dividerLine = '| ' + colWidths.map((w) => '-'.repeat(w)).join(' | ') + ' |';
+    const rowLines = dataRows.map(
+      (r) => '| ' + Array.from({ length: maxCols }, (_, i) => (r[i] || '').padEnd(colWidths[i])).join(' | ') + ' |'
+    );
+
+    return '\n\n' + [headerLine, dividerLine, ...rowLines].join('\n') + '\n\n';
+  });
+
+  // 2. Headings (h1 - h6)
+  res = res.replace(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi, (_, level, content) => {
+    const text = content.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    return '\n\n' + '#'.repeat(Number(level)) + ' ' + text + '\n\n';
+  });
+
+  // 3. Lists (ul/ol)
+  res = res.replace(/<ul\b[^>]*>([\s\S]*?)<\/ul>/gi, (_, content) => {
+    const items = [];
+    const liRegex = /<li\b[^>]*>([\s\S]*?)<\/li>/gi;
+    let liMatch;
+    while ((liMatch = liRegex.exec(content)) !== null) {
+      const text = liMatch[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      if (text) items.push('- ' + text);
+    }
+    return '\n\n' + items.join('\n') + '\n\n';
+  });
+
+  res = res.replace(/<ol\b[^>]*>([\s\S]*?)<\/ol>/gi, (_, content) => {
+    const items = [];
+    const liRegex = /<li\b[^>]*>([\s\S]*?)<\/li>/gi;
+    let liMatch;
+    let idx = 1;
+    while ((liMatch = liRegex.exec(content)) !== null) {
+      const text = liMatch[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      if (text) items.push(`${idx++}. ` + text);
+    }
+    return '\n\n' + items.join('\n') + '\n\n';
+  });
+
+  // 4. Blockquotes
+  res = res.replace(/<blockquote\b[^>]*>([\s\S]*?)<\/blockquote>/gi, (_, content) => {
+    const lines = content.replace(/<p\b[^>]*>([\s\S]*?)<\/p>/gi, '$1\n').replace(/<[^>]+>/g, ' ').trim().split('\n');
+    return '\n\n' + lines.map((l) => '> ' + l.trim()).join('\n') + '\n\n';
+  });
+
+  // 5. Code & Pre
+  res = res.replace(/<pre\b[^>]*><code\b[^>]*>([\s\S]*?)<\/code><\/pre>/gi, '\n\n```\n$1\n```\n\n');
+  res = res.replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi, '`$1`');
+
+  // 6. Inline text styling
+  res = res.replace(/<strong\b[^>]*>([\s\S]*?)<\/strong>/gi, '**$1**');
+  res = res.replace(/<b\b[^>]*>([\s\S]*?)<\/b>/gi, '**$1**');
+  res = res.replace(/<em\b[^>]*>([\s\S]*?)<\/em>/gi, '*$1*');
+  res = res.replace(/<i\b[^>]*>([\s\S]*?)<\/i>/gi, '*$1*');
+
+  // 7. Links
+  res = res.replace(/<a\b[^>]*href=["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi, '[$2]($1)');
+
+  // 8. Paragraphs & line breaks
+  res = res.replace(/<p\b[^>]*>([\s\S]*?)<\/p>/gi, (_, content) => {
+    const clean = content.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '').trim();
+    return clean ? '\n\n' + clean + '\n\n' : '';
+  });
+
+  // 9. Strip any leftover tags, decode entities, and normalize multiple blank lines
+  res = res.replace(/<[^>]+>/g, '');
+  res = decodeXmlEntities(res);
+  res = res.replace(/\n{3,}/g, '\n\n').trim();
+  return res;
+}
+
+/**
+ * Extracts text boxes from Word document XML (DrawingML wps:txbx / w:txbxContent, VML v:textbox, and a:txBody)
+ * Filters out duplicate fallback representations within mc:AlternateContent.
  * @param {string} xml
  * @returns {Array<string>}
  */
-function extractDocxTextBoxes(xml) {
+export function extractDocxTextBoxes(xml) {
   if (!xml) return [];
+  // Strip mc:Fallback when mc:Choice is present to avoid duplicating text
+  let cleanXml = xml;
+  if (cleanXml.includes('<mc:Choice') && cleanXml.includes('<mc:Fallback')) {
+    cleanXml = cleanXml.replace(/<mc:Fallback\b[^>]*>([\s\S]*?)<\/mc:Fallback>/gi, '');
+  }
+
   const boxes = [];
-  const txbxRegex = /<(?:w:txbxContent|v:textbox)\b[^>]*>([\s\S]*?)<\/(?:w:txbxContent|v:textbox)>/gi;
+  const txbxRegex =
+    /<(?:w:txbxContent|v:textbox|wps:txbx|a:txBody)\b[^>]*>([\s\S]*?)<\/(?:w:txbxContent|v:textbox|wps:txbx|a:txBody)>/gi;
   let match;
-  while ((match = txbxRegex.exec(xml)) !== null) {
+  while ((match = txbxRegex.exec(cleanXml)) !== null) {
     const boxXml = match[1];
-    const pRegex = /<w:p\b[^>]*>([\s\S]*?)<\/w:p>/gi;
-    let pMatch;
     const boxParagraphs = [];
+
+    // Extract table rows if a table exists inside the text box
+    const tblRegex = /<w:tbl\b[^>]*>([\s\S]*?)<\/w:tbl>/gi;
+    let tblMatch;
+    while ((tblMatch = tblRegex.exec(boxXml)) !== null) {
+      const tableXml = tblMatch[1];
+      const trRegex = /<w:tr\b[^>]*>([\s\S]*?)<\/w:tr>/gi;
+      let trMatch;
+      const tableRows = [];
+      while ((trMatch = trRegex.exec(tableXml)) !== null) {
+        const tcRegex = /<w:tc\b[^>]*>([\s\S]*?)<\/w:tc>/gi;
+        let tcMatch;
+        const cells = [];
+        while ((tcMatch = tcRegex.exec(trMatch[1])) !== null) {
+          const tRegex = /<w:t\b[^>]*>([\s\S]*?)<\/w:t>/gi;
+          const tokens = [];
+          let tMatch;
+          while ((tMatch = tRegex.exec(tcMatch[1])) !== null) {
+            tokens.push(tMatch[1]);
+          }
+          cells.push(decodeXmlEntities(tokens.join('')).trim());
+        }
+        if (cells.length > 0 && cells.some((c) => c.length > 0)) {
+          tableRows.push(cells);
+        }
+      }
+      if (tableRows.length > 0) {
+        const maxCols = Math.max(...tableRows.map((r) => r.length));
+        const colWidths = new Array(maxCols).fill(3);
+        for (const r of tableRows) {
+          for (let c = 0; c < maxCols; c++) {
+            colWidths[c] = Math.max(colWidths[c], Math.min((r[c] || '').length, 40));
+          }
+        }
+        const header = tableRows[0];
+        const dataRows = tableRows.slice(1);
+        const headerLine =
+          '| ' +
+          Array.from({ length: maxCols }, (_, i) => (header[i] || `Col ${i + 1}`).padEnd(colWidths[i])).join(' | ') +
+          ' |';
+        const dividerLine = '| ' + colWidths.map((w) => '-'.repeat(w)).join(' | ') + ' |';
+        const rowLines = dataRows.map(
+          (r) => '| ' + Array.from({ length: maxCols }, (_, i) => (r[i] || '').padEnd(colWidths[i])).join(' | ') + ' |'
+        );
+        boxParagraphs.push([headerLine, dividerLine, ...rowLines].join('\n'));
+      }
+    }
+
+    const pRegex = /<(?:w:p|a:p)\b[^>]*>([\s\S]*?)<\/(?:w:p|a:p)>/gi;
+    let pMatch;
     while ((pMatch = pRegex.exec(boxXml)) !== null) {
-      const pXml = pMatch[1];
-      const tRegex = /<w:t\b[^>]*>([\s\S]*?)<\/w:t>/gi;
+      let pXml = pMatch[1];
+      pXml = pXml.replace(/<(?:w:tab|a:tab)\s*\/?>/gi, ' ');
+      pXml = pXml.replace(/<(?:w:br|a:br)\s*\/?>/gi, '\n');
+      const tRegex = /<(?:w:t|a:t)\b[^>]*>([\s\S]*?)<\/(?:w:t|a:t)>/gi;
       const textTokens = [];
       let tMatch;
       while ((tMatch = tRegex.exec(pXml)) !== null) {
@@ -521,20 +705,59 @@ function extractDocxTextBoxes(xml) {
 
 /**
  * Browser-side DOCX extraction using lazy-loaded mammoth with text box preservation
- * Preserves headings, lists, tables, paragraphs, and text boxes (w:txbxContent)
+ * Preserves headings, lists, tables and their cells in readable Markdown, paragraphs, and text boxes (w:txbxContent)
  * @param {ArrayBuffer} arrayBuffer
  */
 async function extractDocxDocument(arrayBuffer) {
   try {
+    const jszipModule = await import('jszip');
+    const JSZip = jszipModule.default || jszipModule;
+
+    // 1. Verify docx package integrity as a valid ZIP archive containing word/document.xml
+    let zip;
+    try {
+      zip = await JSZip.loadAsync(arrayBuffer);
+    } catch (zipErr) {
+      return {
+        status: 'corrupted',
+        success: false,
+        text: '',
+        error: `Failed to parse DOCX document: ${zipErr?.message || 'Invalid or corrupted Word document package.'}`
+      };
+    }
+
+    if (!zip.files['word/document.xml']) {
+      return {
+        status: 'corrupted',
+        success: false,
+        text: '',
+        error: 'Failed to parse DOCX document: Missing word/document.xml in archive.'
+      };
+    }
+
     const mammothModule = await import('mammoth');
     const mammoth = mammothModule.default || mammothModule;
 
     let markdown = '';
+
+    // 2. Primary path: convert to HTML first to preserve table structures with cell alignments
     try {
-      const res = await mammoth.convertToMarkdown({ arrayBuffer });
-      markdown = (res?.value || '').trim();
+      const htmlResult = await mammoth.convertToHtml({ arrayBuffer });
+      const rawHtml = htmlResult?.value || '';
+      if (rawHtml.trim()) {
+        markdown = convertMammothHtmlToMarkdown(rawHtml);
+      }
     } catch (_) {}
 
+    // 3. Secondary fallback: convert to Markdown directly
+    if (!markdown) {
+      try {
+        const res = await mammoth.convertToMarkdown({ arrayBuffer });
+        markdown = (res?.value || '').trim();
+      } catch (_) {}
+    }
+
+    // 4. Tertiary fallback: extract raw text
     if (!markdown) {
       try {
         const raw = await mammoth.extractRawText({ arrayBuffer });
@@ -542,12 +765,9 @@ async function extractDocxDocument(arrayBuffer) {
       } catch (_) {}
     }
 
-    // Inspect docx package via JSZip for text boxes (DrawingML / VML) that Mammoth does not capture
+    // 5. Inspect docx package via existing JSZip instance for DrawingML / VML text boxes that Mammoth does not capture
     let textBoxes = [];
     try {
-      const jszipModule = await import('jszip');
-      const JSZip = jszipModule.default || jszipModule;
-      const zip = await JSZip.loadAsync(arrayBuffer);
       const docXmlFiles = Object.keys(zip.files).filter((fname) =>
         /^word\/(?:document|header\d+|footer\d+)\.xml$/.test(fname)
       );
@@ -555,7 +775,7 @@ async function extractDocxDocument(arrayBuffer) {
         const xml = await zip.files[xmlPath].async('text');
         const extractedBoxes = extractDocxTextBoxes(xml);
         for (const box of extractedBoxes) {
-          if (box && !markdown.includes(box) && !textBoxes.includes(box)) {
+          if (box && !markdown.includes(box) && !textBoxes.some((existing) => existing === box || existing.includes(box))) {
             textBoxes.push(box);
           }
         }
@@ -599,10 +819,11 @@ async function extractDocxDocument(arrayBuffer) {
 
 /**
  * Formats a PPTX DrawingML table (<a:tbl>) into a readable Markdown table
+ * Preserves multi-paragraph cells with <br> and escapes pipe characters.
  * @param {string} tblXml
  * @returns {string}
  */
-function extractTableFromPptxXml(tblXml) {
+export function extractTableFromPptxXml(tblXml) {
   const rows = [];
   const trRegex = /<a:tr\b[^>]*>([\s\S]*?)<\/a:tr>/gi;
   let trMatch;
@@ -613,13 +834,22 @@ function extractTableFromPptxXml(tblXml) {
     const cells = [];
     while ((tcMatch = tcRegex.exec(trContent)) !== null) {
       const tcContent = tcMatch[1];
-      const tRegex = /<a:t\b[^>]*>([\s\S]*?)<\/a:t>/gi;
-      let tMatch;
-      const cellTokens = [];
-      while ((tMatch = tRegex.exec(tcContent)) !== null) {
-        cellTokens.push(tMatch[1]);
+      const pRegex = /<a:p\b[^>]*>([\s\S]*?)<\/a:p>/gi;
+      let pMatch;
+      const cellParagraphs = [];
+      while ((pMatch = pRegex.exec(tcContent)) !== null) {
+        let pXml = pMatch[1].replace(/<a:br\s*\/?>/gi, '\n').replace(/<a:tab\s*\/?>/gi, ' ');
+        const tRegex = /<a:t\b[^>]*>([\s\S]*?)<\/a:t>/gi;
+        let tMatch;
+        const cellTokens = [];
+        while ((tMatch = tRegex.exec(pXml)) !== null) {
+          cellTokens.push(tMatch[1]);
+        }
+        const pText = decodeXmlEntities(cellTokens.join('')).trim();
+        if (pText) cellParagraphs.push(pText);
       }
-      cells.push(decodeXmlEntities(cellTokens.join('')).trim());
+      const cellValue = cellParagraphs.join('<br>').replace(/\|/g, '\\|');
+      cells.push(cellValue);
     }
     if (cells.length > 0 && cells.some((c) => c.length > 0)) {
       rows.push(cells);
@@ -639,16 +869,23 @@ function extractTableFromPptxXml(tblXml) {
 
   const header = rows[0];
   const dataRows = rows.slice(1);
-  const headerLine = '| ' + Array.from({ length: maxCols }, (_, i) => {
-    return ((header[i] || `Col ${i + 1}`).replace(/[\r\n]+/g, ' ')).padEnd(colWidths[i] || 3);
-  }).join(' | ') + ' |';
+  const headerLine =
+    '| ' +
+    Array.from({ length: maxCols }, (_, i) => {
+      return ((header[i] || `Col ${i + 1}`).replace(/[\r\n]+/g, ' ')).padEnd(colWidths[i] || 3);
+    }).join(' | ') +
+    ' |';
 
   const dividerLine = '| ' + colWidths.map((w) => '-'.repeat(w)).join(' | ') + ' |';
 
   const rowLines = dataRows.map((r) => {
-    return '| ' + Array.from({ length: maxCols }, (_, i) => {
-      return ((r[i] || '').replace(/[\r\n]+/g, ' ')).padEnd(colWidths[i] || 3);
-    }).join(' | ') + ' |';
+    return (
+      '| ' +
+      Array.from({ length: maxCols }, (_, i) => {
+        return ((r[i] || '').replace(/[\r\n]+/g, ' ')).padEnd(colWidths[i] || 3);
+      }).join(' | ') +
+      ' |'
+    );
   });
 
   return [headerLine, dividerLine, ...rowLines].join('\n');
@@ -656,7 +893,8 @@ function extractTableFromPptxXml(tblXml) {
 
 /**
  * Browser-side PPTX extraction using lazy-loaded jszip
- * Extracts slide-by-slide text, tables (p:graphicFrame), grouped shapes, and speaker notes
+ * Extracts slide-by-slide text, tables (p:graphicFrame), grouped shapes (p:grpSp), and speaker notes
+ * in natural reading order with slide title retention.
  * @param {ArrayBuffer} arrayBuffer
  */
 async function extractPptxDocument(arrayBuffer) {
@@ -695,46 +933,128 @@ async function extractPptxDocument(arrayBuffer) {
       const slideNum = i + 1;
       const slideXml = await zip.files[slidePath].async('text');
 
+      // 1. Locate slide title if present in a title placeholder shape
       let slideTitle = undefined;
-      const paragraphs = [];
-      const tableTexts = [];
-
-      // 1. Extract slide tables from <p:graphicFrame> / <a:tbl>
-      const tblRegex = /<a:tbl\b[^>]*>([\s\S]*?)<\/a:tbl>/gi;
-      let tblMatch;
-      while ((tblMatch = tblRegex.exec(slideXml)) !== null) {
-        const mdTable = extractTableFromPptxXml(tblMatch[1]);
-        if (mdTable) {
-          tableTexts.push(mdTable);
+      const titleShapeRegex = /<p:sp\b[^>]*>[\s\S]*?<p:ph\b[^>]*\btype=["'](?:title|ctrTitle)["'][\s\S]*?<\/p:sp>/gi;
+      const titleShapeMatch = titleShapeRegex.exec(slideXml);
+      if (titleShapeMatch) {
+        const titleParas = [];
+        const pRegex = /<a:p\b[^>]*>([\s\S]*?)<\/a:p>/gi;
+        let pMatch;
+        while ((pMatch = pRegex.exec(titleShapeMatch[0])) !== null) {
+          let pXml = pMatch[1].replace(/<a:br\s*\/?>/gi, '\n').replace(/<a:tab\s*\/?>/gi, ' ');
+          const tRegex = /<a:t\b[^>]*>([\s\S]*?)<\/a:t>/gi;
+          const tokens = [];
+          let tMatch;
+          while ((tMatch = tRegex.exec(pXml)) !== null) {
+            tokens.push(tMatch[1]);
+          }
+          const text = decodeXmlEntities(tokens.join('')).trim();
+          if (text) titleParas.push(text);
+        }
+        if (titleParas.length > 0) {
+          slideTitle = titleParas.join(' ');
         }
       }
 
-      // 2. Extract slide title and text from all shapes (standalone & in grouped <p:grpSp>)
-      const spRegex = /<p:sp\b[^>]*>([\s\S]*?)<\/p:sp>/gi;
-      let spMatch;
-      while ((spMatch = spRegex.exec(slideXml)) !== null) {
-        const spXml = spMatch[1];
-        const isTitleShape = /<p:ph\b[^>]*\btype=["'](?:title|ctrTitle)["']/i.test(spXml);
+      // 2. Iterate through slide elements in document order (<p:graphicFrame>, <p:sp>, <p:grpSp>)
+      const slideElements = [];
+      const elementRegex = /<(p:graphicFrame|p:sp|p:grpSp)\b[^>]*>([\s\S]*?)<\/\1>/gi;
+      let elemMatch;
+      while ((elemMatch = elementRegex.exec(slideXml)) !== null) {
+        const tag = elemMatch[1];
+        const content = elemMatch[2];
 
+        // Case A: Table inside <p:graphicFrame> (or directly <a:tbl>)
+        if (tag === 'p:graphicFrame') {
+          const tblMatch = /<a:tbl\b[^>]*>([\s\S]*?)<\/a:tbl>/i.exec(content);
+          if (tblMatch) {
+            const mdTable = extractTableFromPptxXml(tblMatch[1]);
+            if (mdTable) {
+              slideElements.push(mdTable);
+            }
+          } else {
+            const pRegex = /<a:p\b[^>]*>([\s\S]*?)<\/a:p>/gi;
+            let pMatch;
+            const extraParas = [];
+            while ((pMatch = pRegex.exec(content)) !== null) {
+              let pXml = pMatch[1].replace(/<a:br\s*\/?>/gi, '\n').replace(/<a:tab\s*\/?>/gi, ' ');
+              const tRegex = /<a:t\b[^>]*>([\s\S]*?)<\/a:t>/gi;
+              const tokens = [];
+              let tMatch;
+              while ((tMatch = tRegex.exec(pXml)) !== null) {
+                tokens.push(tMatch[1]);
+              }
+              const pText = decodeXmlEntities(tokens.join('')).trim();
+              if (pText) extraParas.push(pText);
+            }
+            if (extraParas.length > 0) {
+              slideElements.push(extraParas.join('\n'));
+            }
+          }
+          continue;
+        }
+
+        // Case B: Grouped shapes <p:grpSp>
+        if (tag === 'p:grpSp') {
+          // Extract tables if any exist inside the group
+          const tblRegex = /<a:tbl\b[^>]*>([\s\S]*?)<\/a:tbl>/gi;
+          let tblMatch;
+          while ((tblMatch = tblRegex.exec(content)) !== null) {
+            const mdTable = extractTableFromPptxXml(tblMatch[1]);
+            if (mdTable) {
+              slideElements.push(mdTable);
+            }
+          }
+          // Extract child shapes inside grouped shape
+          const childSpRegex = /<p:sp\b[^>]*>([\s\S]*?)<\/p:sp>/gi;
+          let childSpMatch;
+          const groupParas = [];
+          while ((childSpMatch = childSpRegex.exec(content)) !== null) {
+            const pRegex = /<a:p\b[^>]*>([\s\S]*?)<\/a:p>/gi;
+            let pMatch;
+            while ((pMatch = pRegex.exec(childSpMatch[1])) !== null) {
+              let pXml = pMatch[1].replace(/<a:br\s*\/?>/gi, '\n').replace(/<a:tab\s*\/?>/gi, ' ');
+              const tRegex = /<a:t\b[^>]*>([\s\S]*?)<\/a:t>/gi;
+              const tokens = [];
+              let tMatch;
+              while ((tMatch = tRegex.exec(pXml)) !== null) {
+                tokens.push(tMatch[1]);
+              }
+              const pText = decodeXmlEntities(tokens.join('')).trim();
+              if (pText) groupParas.push(pText);
+            }
+          }
+          if (groupParas.length > 0) {
+            slideElements.push(groupParas.join('\n'));
+          }
+          continue;
+        }
+
+        // Case C: Standard shape <p:sp>
+        const isTitleShape = /<p:ph\b[^>]*\btype=["'](?:title|ctrTitle)["']/i.test(content);
         const pRegex = /<a:p\b[^>]*>([\s\S]*?)<\/a:p>/gi;
         let pMatch;
-        while ((pMatch = pRegex.exec(spXml)) !== null) {
-          const pXml = pMatch[1];
+        const shapeParas = [];
+        while ((pMatch = pRegex.exec(content)) !== null) {
+          let pXml = pMatch[1].replace(/<a:br\s*\/?>/gi, '\n').replace(/<a:tab\s*\/?>/gi, ' ');
           const tRegex = /<a:t\b[^>]*>([\s\S]*?)<\/a:t>/gi;
-          const textTokens = [];
+          const tokens = [];
           let tMatch;
           while ((tMatch = tRegex.exec(pXml)) !== null) {
-            textTokens.push(tMatch[1]);
+            tokens.push(tMatch[1]);
           }
-          const candidate = decodeXmlEntities(textTokens.join('')).trim();
-          if (candidate) {
-            if (isTitleShape && !slideTitle) {
-              slideTitle = candidate;
-            }
-            if (!isTitleShape || paragraphs.length > 0) {
-              paragraphs.push(candidate);
+          const pText = decodeXmlEntities(tokens.join('')).trim();
+          if (pText) {
+            if (isTitleShape && pText === slideTitle) {
+              // Avoid duplicating the exact title line in body elements
+            } else {
+              shapeParas.push(pText);
             }
           }
+        }
+        if (shapeParas.length > 0) {
+          slideElements.push(shapeParas.join('\n'));
         }
       }
 
@@ -759,25 +1079,21 @@ async function extractPptxDocument(arrayBuffer) {
         } catch (_) {}
       }
 
-      const bodyElements = [];
-      if (paragraphs.length > 0) {
-        bodyElements.push(paragraphs.join('\n'));
-      }
-      if (tableTexts.length > 0) {
-        bodyElements.push(tableTexts.join('\n\n'));
-      }
+      const slideBody = slideElements.join('\n\n').trim();
+      const effectiveText = slideTitle
+        ? (slideBody ? `${slideTitle}\n\n${slideBody}` : slideTitle)
+        : (slideBody || '');
 
-      const slideBody = bodyElements.join('\n\n');
       slides.push({
         slideNumber: slideNum,
         title: slideTitle,
-        text: slideBody,
+        text: effectiveText,
         notes: notesText,
-        charCount: slideBody.length
+        charCount: effectiveText.length
       });
 
       const titleHeader = slideTitle ? `: ${slideTitle}` : '';
-      let slideFormatted = `--- Slide ${slideNum}${titleHeader} ---\n${slideBody || '[Empty slide]'}`;
+      let slideFormatted = `--- Slide ${slideNum}${titleHeader} ---\n${effectiveText || '[Empty slide]'}`;
       if (notesText) {
         slideFormatted += `\n[Speaker Notes]: ${notesText}`;
       }
@@ -1108,6 +1424,8 @@ export async function extractBrowserDocument(file, metadata = {}) {
     slides: partialResult.slides,
     sectionCount: partialResult.sectionCount,
     sections: partialResult.sections,
+    rowCount: partialResult.rowCount,
+    columnCount: partialResult.columnCount,
     table: partialResult.table,
     isScanned: Boolean(partialResult.isScanned),
     isTruncated: Boolean(isTruncated || partialResult.isTruncated),
