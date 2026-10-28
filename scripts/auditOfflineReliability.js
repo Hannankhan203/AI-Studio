@@ -22,6 +22,12 @@ import {
 import {
   DEFAULT_WEBLLM_MODEL_ID,
   FALLBACK_F32_WEBLLM_MODEL_ID,
+  SMOLLM2_360M_WEBLLM_MODEL_ID,
+  SMOLLM2_360M_F32_WEBLLM_MODEL_ID,
+  SMOLLM2_135M_WEBLLM_MODEL_ID,
+  SMOLLM2_135M_F32_WEBLLM_MODEL_ID,
+  QWEN3_06B_WEBLLM_MODEL_ID,
+  QWEN3_06B_F32_WEBLLM_MODEL_ID,
   LIGHTWEIGHT_WEBLLM_MODEL_ID,
   LIGHTWEIGHT_F32_WEBLLM_MODEL_ID,
   WEBLLM_MODEL_CATALOG,
@@ -165,9 +171,15 @@ test('parseDelimitedText accurately parses quoted CSV and formats Markdown table
 // ----------------------------------------------------------------------------
 // 3. WebLLM Model Catalog & Resolution Logic
 // ----------------------------------------------------------------------------
-test('WEBLLM_MODEL_CATALOG contains verified 1.5B and 0.5B models with valid configurations', () => {
+test('WEBLLM_MODEL_CATALOG contains verified 1.5B, SmolLM2 360M, SmolLM2 135M, and 0.5B models with valid configurations', () => {
   assert.ok(WEBLLM_MODEL_CATALOG[DEFAULT_WEBLLM_MODEL_ID], 'Default 1.5B model must exist');
   assert.ok(WEBLLM_MODEL_CATALOG[FALLBACK_F32_WEBLLM_MODEL_ID], 'Fallback 1.5B FP32 model must exist');
+  assert.ok(WEBLLM_MODEL_CATALOG[SMOLLM2_360M_WEBLLM_MODEL_ID], 'SmolLM2 360M model must exist');
+  assert.ok(WEBLLM_MODEL_CATALOG[SMOLLM2_360M_F32_WEBLLM_MODEL_ID], 'SmolLM2 360M FP32 model must exist');
+  assert.ok(WEBLLM_MODEL_CATALOG[SMOLLM2_135M_WEBLLM_MODEL_ID], 'SmolLM2 135M model must exist');
+  assert.ok(WEBLLM_MODEL_CATALOG[SMOLLM2_135M_F32_WEBLLM_MODEL_ID], 'SmolLM2 135M FP32 model must exist');
+  assert.ok(WEBLLM_MODEL_CATALOG[QWEN3_06B_WEBLLM_MODEL_ID], 'Qwen3 0.6B model must exist');
+  assert.ok(WEBLLM_MODEL_CATALOG[QWEN3_06B_F32_WEBLLM_MODEL_ID], 'Qwen3 0.6B FP32 model must exist');
   assert.ok(WEBLLM_MODEL_CATALOG[LIGHTWEIGHT_WEBLLM_MODEL_ID], 'Lightweight 0.5B model must exist');
   assert.ok(WEBLLM_MODEL_CATALOG[LIGHTWEIGHT_F32_WEBLLM_MODEL_ID], 'Lightweight 0.5B FP32 model must exist');
 
@@ -176,6 +188,30 @@ test('WEBLLM_MODEL_CATALOG contains verified 1.5B and 0.5B models with valid con
   assert.strictEqual(defaultModel.f32FallbackModelId, FALLBACK_F32_WEBLLM_MODEL_ID);
   assert.ok(defaultModel.estimatedDownloadMB > 0);
   assert.ok(defaultModel.minStorageBytes > defaultModel.estimatedDownloadMB * 1024 * 1024);
+
+  const smollm360 = WEBLLM_MODEL_CATALOG[SMOLLM2_360M_WEBLLM_MODEL_ID];
+  assert.strictEqual(smollm360.shortLabel, 'SmolLM2 360M');
+  assert.strictEqual(smollm360.tier, 'compact');
+  assert.strictEqual(smollm360.quantization, 'q4f16_1');
+  assert.strictEqual(smollm360.estimatedDownloadMB, 210);
+  assert.strictEqual(smollm360.vramRequiredMB, 376.06);
+  assert.strictEqual(smollm360.f32FallbackModelId, SMOLLM2_360M_F32_WEBLLM_MODEL_ID);
+  assert.strictEqual(smollm360.isDefault, false);
+
+  const smollm = WEBLLM_MODEL_CATALOG[SMOLLM2_135M_WEBLLM_MODEL_ID];
+  assert.strictEqual(smollm.shortLabel, 'SmolLM2 135M');
+  assert.strictEqual(smollm.tier, 'ultra-lightweight');
+  assert.strictEqual(smollm.estimatedDownloadMB, 270);
+  assert.strictEqual(smollm.f32FallbackModelId, SMOLLM2_135M_F32_WEBLLM_MODEL_ID);
+
+  const qwen3 = WEBLLM_MODEL_CATALOG[QWEN3_06B_WEBLLM_MODEL_ID];
+  assert.strictEqual(qwen3.shortLabel, 'Qwen3 0.6B');
+  assert.strictEqual(qwen3.tier, 'lightweight');
+  assert.strictEqual(qwen3.quantization, 'q4f16_1');
+  assert.strictEqual(qwen3.estimatedDownloadMB, 335);
+  assert.strictEqual(qwen3.vramRequiredMB, 1403.34);
+  assert.strictEqual(qwen3.f32FallbackModelId, QWEN3_06B_F32_WEBLLM_MODEL_ID);
+  assert.strictEqual(qwen3.isDefault, false);
 });
 
 test('resolveWebLLMModelId correctly resolves shader-f16 vs fp32 fallback', () => {
@@ -186,6 +222,22 @@ test('resolveWebLLMModelId correctly resolves shader-f16 vs fp32 fallback', () =
   // Without shader-f16: fallback to FP32 variant
   const withoutF16 = resolveWebLLMModelId(DEFAULT_WEBLLM_MODEL_ID, { hasShaderF16: false, allowF32Fallback: true });
   assert.strictEqual(withoutF16, FALLBACK_F32_WEBLLM_MODEL_ID);
+
+  // SmolLM2 360M fallback
+  const smollm360WithF16 = resolveWebLLMModelId(SMOLLM2_360M_WEBLLM_MODEL_ID, { hasShaderF16: true });
+  assert.strictEqual(smollm360WithF16, SMOLLM2_360M_WEBLLM_MODEL_ID);
+  const smollm360WithoutF16 = resolveWebLLMModelId(SMOLLM2_360M_WEBLLM_MODEL_ID, { hasShaderF16: false, allowF32Fallback: true });
+  assert.strictEqual(smollm360WithoutF16, SMOLLM2_360M_F32_WEBLLM_MODEL_ID);
+
+  // SmolLM2 135M fallback
+  const smollmWithoutF16 = resolveWebLLMModelId(SMOLLM2_135M_WEBLLM_MODEL_ID, { hasShaderF16: false, allowF32Fallback: true });
+  assert.strictEqual(smollmWithoutF16, SMOLLM2_135M_F32_WEBLLM_MODEL_ID);
+
+  // Qwen3 0.6B fallback
+  const qwen3WithF16 = resolveWebLLMModelId(QWEN3_06B_WEBLLM_MODEL_ID, { hasShaderF16: true });
+  assert.strictEqual(qwen3WithF16, QWEN3_06B_WEBLLM_MODEL_ID);
+  const qwen3WithoutF16 = resolveWebLLMModelId(QWEN3_06B_WEBLLM_MODEL_ID, { hasShaderF16: false, allowF32Fallback: true });
+  assert.strictEqual(qwen3WithoutF16, QWEN3_06B_F32_WEBLLM_MODEL_ID);
 
   // Lightweight model fallback
   const lightweightWithoutF16 = resolveWebLLMModelId(LIGHTWEIGHT_WEBLLM_MODEL_ID, { hasShaderF16: false, allowF32Fallback: true });
@@ -215,8 +267,12 @@ test('Generated production service worker contains required precached chunks and
   assert.ok(/\/health/.test(swContent) || swContent.includes('\\/health'), 'Navigation denylist must exclude /health');
   assert.ok(/\/upload/.test(swContent) || swContent.includes('\\/upload'), 'Navigation denylist must exclude /upload');
 
-  // Verify NetworkOnly routes for external weights & API
-  assert.ok(swContent.includes('NetworkOnly'), 'sw.js must register NetworkOnly for API and weights');
+  // Verify NetworkOnly routes for API & Firestore while bypassing cross-origin model weight CDNs
+  assert.ok(swContent.includes('NetworkOnly'), 'sw.js must register NetworkOnly for API and Firestore routes');
+  assert.ok(
+    !swContent.includes('huggingface\\.co') && !swContent.includes('huggingface.co'),
+    'sw.js must NOT intercept cross-origin huggingface.co model weight streams via Workbox runtimeCaching'
+  );
 
   // Verify essential lazy chunks in precache
   assert.ok(swContent.includes('webllmWorker-'), 'WebLLM dedicated worker must be in precache manifest');
@@ -225,7 +281,6 @@ test('Generated production service worker contains required precached chunks and
 
   // Verify model weights are NOT in precache
   assert.ok(!swContent.includes('resolve/main/params_shard'), 'Model weights must NOT be precached via Workbox');
-  assert.ok(!swContent.includes('huggingface.co/Qwen'), 'Model weights URLs must NOT be in Workbox precache');
 });
 
 // ----------------------------------------------------------------------------

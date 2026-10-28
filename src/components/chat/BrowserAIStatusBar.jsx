@@ -12,6 +12,9 @@ import {
 } from 'lucide-react';
 import {
   DEFAULT_WEBLLM_MODEL_ID,
+  SMOLLM2_360M_WEBLLM_MODEL_ID,
+  SMOLLM2_135M_WEBLLM_MODEL_ID,
+  QWEN3_06B_WEBLLM_MODEL_ID,
   WEBLLM_MODEL_CATALOG,
   getSupportedWebLLMModels
 } from '../../services/webllmService.js';
@@ -19,7 +22,7 @@ import {
 /**
  * Clean, non-blocking status and progress bar for Browser AI (WebLLM).
  * Surfaces real compatibility checks, shard download progress, WebGPU compilation,
- * ready state, model tier selection (1.5B Standard vs 0.5B Lightweight), and errors.
+ * ready state, model tier selection (Qwen 2.5 1.5B Standard, SmolLM2 360M Compact, SmolLM2 135M Ultra Lightweight), and errors.
  */
 export default function BrowserAIStatusBar({
   visible = false,
@@ -50,12 +53,27 @@ export default function BrowserAIStatusBar({
 
   const selectedCatalog =
     WEBLLM_MODEL_CATALOG[selectedModelId] || WEBLLM_MODEL_CATALOG[DEFAULT_WEBLLM_MODEL_ID];
-  const activeCatalog = WEBLLM_MODEL_CATALOG[stateModelId] || selectedCatalog;
+  const effectiveSpecCatalog =
+    webllmState?.hasShaderF16 === false && selectedCatalog?.f32FallbackModelId
+      ? WEBLLM_MODEL_CATALOG[selectedCatalog.f32FallbackModelId] || selectedCatalog
+      : selectedCatalog;
+  const vramEstimateLabel =
+    typeof effectiveSpecCatalog?.vramRequiredMB === 'number' && effectiveSpecCatalog.vramRequiredMB > 0
+      ? effectiveSpecCatalog.vramRequiredMB >= 1024
+        ? `~${(effectiveSpecCatalog.vramRequiredMB / 1024).toFixed(1)} GB VRAM`
+        : `~${Math.ceil(effectiveSpecCatalog.vramRequiredMB / 10) * 10} MB VRAM`
+      : null;
+  const loadedModelId = webllmState?.loadedModelId || null;
+  const isLoadedInGpu = Boolean(loadedModelId && (status === 'ready' || status === 'generating'));
+  const activeCatalog =
+    (loadedModelId && WEBLLM_MODEL_CATALOG[loadedModelId]) ||
+    WEBLLM_MODEL_CATALOG[stateModelId] ||
+    selectedCatalog;
 
   const loadedMatchesSelected =
-    (status === 'ready' || status === 'generating') &&
-    (stateModelId === selectedModelId ||
-      selectedCatalog?.f32FallbackModelId === stateModelId);
+    isLoadedInGpu &&
+    (loadedModelId === selectedModelId ||
+      selectedCatalog?.f32FallbackModelId === loadedModelId);
 
   const isChecking = status === 'checking' || Boolean(gpuCheck?.checking && status === 'idle');
   const isDownloading = status === 'downloading';
@@ -98,10 +116,14 @@ export default function BrowserAIStatusBar({
   } else if (status === 'error') {
     tone = 'error';
     statusBadge = { label: 'Error', variant: 'error' };
-    headline = 'Browser AI failed to initialize';
+    headline = `${activeCatalog.shortLabel} failed to load`;
     detail =
       errorMessage ||
-      'Model download or WebGPU initialization failed. Check storage/GPU memory or try the 0.5B lightweight model.';
+      (selectedCatalog.id === SMOLLM2_135M_WEBLLM_MODEL_ID ||
+      selectedCatalog.id === SMOLLM2_360M_WEBLLM_MODEL_ID ||
+      selectedCatalog.id === QWEN3_06B_WEBLLM_MODEL_ID
+        ? 'Model download or WebGPU initialization failed. Check your internet connection and browser storage, then click Retry.'
+        : 'Model download or WebGPU initialization failed. Check storage/GPU memory or try a smaller model (SmolLM2 360M/135M or Qwen3 0.6B).');
   } else if (loadedMatchesSelected) {
     tone = 'ready';
     statusBadge = {
@@ -112,7 +134,7 @@ export default function BrowserAIStatusBar({
     detail = isGenerating
       ? 'Generating response locally via WebGPU (no server or API calls).'
       : 'Running locally in your browser via WebGPU. Cached for repeat use.';
-  } else if (status === 'ready' && !loadedMatchesSelected) {
+  } else if (isLoadedInGpu && !loadedMatchesSelected) {
     tone = isUncachedOffline ? 'warning' : 'neutral';
     statusBadge = isCached
       ? { label: 'Cached', variant: 'ready' }
@@ -120,12 +142,12 @@ export default function BrowserAIStatusBar({
       ? { label: 'Offline • Not Cached', variant: 'warning' }
       : { label: 'Switch Model', variant: 'neutral' };
     headline = `${selectedCatalog.shortLabel} selected`;
-    detail = `${activeCatalog.shortLabel} is currently loaded in GPU memory. Load now or send a message to switch.`;
+    detail = `${activeCatalog.shortLabel} is currently loaded in GPU memory. Click "${isCached ? 'Load Model' : 'Download & Load'}" or send a message to switch.`;
   } else if (isUncachedOffline) {
     tone = 'warning';
     statusBadge = { label: 'Offline • Not Cached', variant: 'warning' };
     headline = `${selectedCatalog.shortLabel} — Browser AI`;
-    detail = `Offline — Initial download (~${selectedCatalog.estimatedDownloadMB} MB) requires an internet connection before offline use.`;
+    detail = `Offline — Initial download (~${effectiveSpecCatalog.estimatedDownloadMB} MB) requires an internet connection before offline use.`;
   } else {
     tone = isCached ? 'ready' : 'neutral';
     statusBadge = isCached
@@ -136,7 +158,7 @@ export default function BrowserAIStatusBar({
       ? 'Offline — Model is cached locally. Click Load Model or send a message to run on your device via WebGPU.'
       : isCached
       ? 'Model weights are cached in your browser. Click Load Model or send a message to initialize WebGPU.'
-      : `Runs locally via WebGPU (no API key). First use downloads and caches ~${selectedCatalog.estimatedDownloadMB} MB on your device.`;
+      : `Runs locally via WebGPU (no API key${vramEstimateLabel ? `, ${vramEstimateLabel}` : ''}). First use downloads and caches ~${effectiveSpecCatalog.estimatedDownloadMB} MB on your device.`;
   }
 
   const showProgressBar = isDownloading || isInitializingGpu;
@@ -212,7 +234,7 @@ export default function BrowserAIStatusBar({
             <button
               type="button"
               className="browser-ai-action-btn secondary"
-              onClick={onCancelLoad}
+              onClick={() => onCancelLoad()}
               title="Cancel model download or initialization"
             >
               <X size={12} />
@@ -224,12 +246,12 @@ export default function BrowserAIStatusBar({
             <button
               type="button"
               className="browser-ai-action-btn primary"
-              onClick={onLoadModel}
+              onClick={() => onLoadModel()}
               disabled={isUncachedOffline}
               title={
                 isUncachedOffline
                   ? 'Connect to the internet to download model weights'
-                  : 'Retry Browser AI initialization'
+                  : 'Retry Browser AI download and initialization'
               }
             >
               <RotateCcw size={12} />
@@ -241,7 +263,7 @@ export default function BrowserAIStatusBar({
             <button
               type="button"
               className="browser-ai-action-btn primary"
-              onClick={onLoadModel}
+              onClick={() => onLoadModel()}
               disabled={isUncachedOffline}
               title={
                 isUncachedOffline
@@ -260,7 +282,7 @@ export default function BrowserAIStatusBar({
             <button
               type="button"
               className="browser-ai-action-btn ghost"
-              onClick={onUnloadModel}
+              onClick={() => onUnloadModel()}
               title="Unload model from GPU memory (keeps browser cache intact)"
             >
               <Trash2 size={12} />
