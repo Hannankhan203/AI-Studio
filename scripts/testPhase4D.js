@@ -198,20 +198,23 @@ function startMockGroqUpstream() {
  * Starts an ephemeral server.ts process on an available local port wired to mockGroqBaseUrl.
  */
 async function startTestServer(port, mockGroqBaseUrl) {
+  const childEnv = {
+    ...process.env,
+    PORT: String(port),
+    NODE_ENV: 'production',
+    ORVIX_GROQ_BASE_URL: mockGroqBaseUrl,
+    GROQ_API_KEY: 'gsk_test_phase4d_valid_key',
+    VITE_GROQ_API_KEY: '',
+    GEMINI_API_KEY: '',
+    VITE_GEMINI_API_KEY: '',
+    OPENROUTER_API_KEY: 'sk-or-v1-test-fallback-key',
+    CLOUDFLARE_API_TOKEN: '',
+    CLOUDFLARE_ACCOUNT_ID: ''
+  };
+  delete childEnv.TESTING;
+
   const child = spawn('npx', ['tsx', 'server.ts'], {
-    env: {
-      ...process.env,
-      PORT: String(port),
-      NODE_ENV: 'production',
-      ORVIX_GROQ_BASE_URL: mockGroqBaseUrl,
-      GROQ_API_KEY: 'gsk_test_phase4d_valid_key',
-      VITE_GROQ_API_KEY: '',
-      GEMINI_API_KEY: '',
-      VITE_GEMINI_API_KEY: '',
-      OPENROUTER_API_KEY: 'sk-or-v1-test-fallback-key',
-      CLOUDFLARE_API_TOKEN: '',
-      CLOUDFLARE_ACCOUNT_ID: ''
-    },
+    env: childEnv,
     stdio: ['ignore', 'pipe', 'pipe']
   });
 
@@ -1004,7 +1007,7 @@ async function main() {
     console.log('\n--- 8. Provider Isolation & Error-Contract Invariants ---');
 
     await runTest('8.1 Non-Groq provider default models, compatibility rules, and Phase 4B error contracts remain intact', () => {
-      assert.equal(PROVIDER_DEFAULT_MODELS.gemini, 'gemini-2.5-flash');
+      assert.equal(PROVIDER_DEFAULT_MODELS.gemini, 'gemini-3.8-flash');
       assert.equal(PROVIDER_DEFAULT_MODELS.openrouter, 'openrouter/free');
       assert.equal(PROVIDER_DEFAULT_MODELS.cloudflare, '@cf/meta/llama-3.1-8b-instruct');
       assert.equal(PROVIDER_DEFAULT_MODELS.ollama, 'qwen2.5:1.5b');

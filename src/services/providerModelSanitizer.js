@@ -131,7 +131,7 @@ export function validateGroqTranscriptionModel(rawModel) {
 }
 
 export const PROVIDER_DEFAULT_MODELS = Object.freeze({
-  gemini: 'gemini-2.5-flash',
+  gemini: 'gemini-3.8-flash',
   groq: 'openai/gpt-oss-120b',
   openrouter: 'openrouter/free',
   cloudflare: '@cf/meta/llama-3.1-8b-instruct',
@@ -808,3 +808,98 @@ export function evaluateOfflineProviderGuard({ provider, isOnline }) {
     message: `You are currently offline. ${providerLabel} requires an internet connection — switch to Browser AI (WebLLM) or Local AI (Ollama) to continue offline, or reconnect and try again.`
   };
 }
+
+/**
+ * Resolves a model identifier when explicitly or automatically switching providers.
+ *
+ * Prevents Provider A + Model A from accidentally becoming Provider B + Model A.
+ * If the current model is compatible with the target provider, normalizes and preserves it.
+ * Otherwise, falls back to the target provider's default model.
+ *
+ * @param {string} toProvider Target provider ID
+ * @param {string|null|undefined} currentModel Current model identifier
+ * @param {string|null|undefined} [fromProvider=null] Source provider ID
+ * @returns {string|null} Resolved model identifier for the target provider
+ */
+export function resolveModelForProviderSwitch(toProvider, currentModel, fromProvider = null) {
+  const normTo = normalizeProviderId(toProvider);
+  if (!normTo) return null;
+
+  const defaultModel = PROVIDER_DEFAULT_MODELS[normTo] || null;
+  if (!currentModel || typeof currentModel !== 'string' || !currentModel.trim()) {
+    return defaultModel;
+  }
+
+  const sanitized = sanitizeModelForProvider(normTo, currentModel);
+  return sanitized || defaultModel;
+}
+
+/**
+ * Evaluates whether an AI provider is capable of processing the requested task parameters.
+ * E.g., vision/image tasks require Gemini; text-only cloud/local providers cannot handle raw image payloads.
+ *
+ * @param {string} provider
+ * @param {Object} [task={}]
+ * @param {boolean} [task.requiresVision=false]
+ * @param {boolean} [task.hasImageAttachments=false]
+ * @param {string|null} [task.model=null]
+ * @returns {boolean}
+ */
+export function isProviderCapableOfTask(provider, { requiresVision = false, hasImageAttachments = false, model = null } = {}) {
+  const norm = normalizeProviderId(provider);
+  if (!norm) return false;
+
+  if (requiresVision || hasImageAttachments) {
+    // Only Gemini supports multimodal image analysis / vision in this application
+    return norm === 'gemini';
+  }
+
+  return true;
+}
+
+/**
+ * Computes a deterministic fallback chain starting from a failed provider.
+ *
+ * Invariants:
+ * 1. Strict Local Privacy: Ollama and WebLLM local providers NEVER fallback to cloud.
+ * 2. Vision Guard: If vision is required, no text-only provider can serve as fallback.
+ * 3. Visited Protection: Providers already attempted in the request are excluded (no cycles).
+ * 4. Availability: Unconfigured providers are excluded according to providerConfig availability.
+ *
+ * @param {string} currentProvider
+ * @param {Object} [options={}]
+ * @param {Object|null} [options.providerConfig=null]
+ * @param {boolean} [options.requiresVision=false]
+ * @param {Array<string>|Set<string>} [options.visited=[]]
+ * @returns {Array<string>} Ordered list of candidate fallback provider IDs
+ */
+export function getDeterministicFallbackChain(currentProvider, { providerConfig = null, requiresVision = false, visited = [] } = {}) {
+  const normCurrent = normalizeProviderId(currentProvider);
+
+  // STRICT LOCAL PRIVACY INVARIANT: Ollama and WebLLM local providers MUST NEVER fallback to cloud
+  if (normCurrent === 'ollama' || normCurrent === 'webllm') {
+    return [];
+  }
+
+  // Vision requirement invariant: Only Gemini supports vision in this application
+  if (requiresVision) {
+    return [];
+  }
+
+  const visitedSet = new Set(
+    (Array.isArray(visited) ? visited : Array.from(visited || [])).map(normalizeProviderId).filter(Boolean)
+  );
+  if (normCurrent) {
+    visitedSet.add(normCurrent);
+  }
+
+  // Deterministic cloud fallback sequence
+  const defaultOrder = ['gemini', 'groq', 'openrouter', 'cloudflare'];
+
+  // Start with candidates that haven't been visited yet
+  const candidates = defaultOrder.filter((p) => !visitedSet.has(p));
+
+  // Filter against providerConfig if available (excludes confirmed unconfigured providers)
+  return filterAvailableFallbackProviders(candidates, normCurrent, providerConfig);
+}
+

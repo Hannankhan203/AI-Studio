@@ -16,15 +16,26 @@ import {
   sanitizeAttachmentForNetwork,
   hydrateAttachmentsWithImageBytes
 } from './attachmentStorageService.js';
-import { isVisionCapableProvider } from './documentContextService.js';
+import { isVisionCapableProvider, isImageAttachment } from './documentContextService.js';
 import {
   normalizeProviderId,
   sanitizeModelForProvider,
   normalizeProviderConfigPayload,
   getProviderConfigAvailability,
-  checkModelCompatibilityForProvider
+  checkModelCompatibilityForProvider,
+  resolveModelForProviderSwitch,
+  getDeterministicFallbackChain,
+  isProviderCapableOfTask,
+  PROVIDER_DEFAULT_MODELS
 } from './providerModelSanitizer.js';
-import { sanitizeErrorMessage } from './errorNormalizationService.js';
+import {
+  sanitizeErrorMessage,
+  normalizeAIError,
+  isCanonicalAIError,
+  CanonicalAIError,
+  isAbortLike,
+  STANDARD_ERROR_CODES
+} from './errorNormalizationService.js';
 
 export const AI_PROVIDERS = {
   GEMINI: 'gemini',
@@ -39,8 +50,8 @@ export const PROVIDER_OPTIONS = [
   {
     id: AI_PROVIDERS.GEMINI,
     name: 'Gemini',
-    modelTag: 'Gemini 2.5 Flash',
-    defaultModel: 'gemini-2.5-flash',
+    modelTag: 'Gemini 3.8 Flash',
+    defaultModel: 'gemini-3.8-flash',
     description: 'Google Gemini'
   },
   {
@@ -526,6 +537,13 @@ export function parseRouterError(rawError, statusCode = 500, providerHint = null
       err.canFallback = false;
     }
   }
+  // Enforce strict invariants: partial output, cancellation, and local providers can never fallback
+  if (err.partial || err.cancelled || isOllamaContext || isWebLLMContext) {
+    err.canFallback = false;
+    if (err.partial || err.cancelled) {
+      err.retryable = false;
+    }
+  }
   if (isObjectInput && Array.isArray(rawError.suggestedProviders)) {
     err.suggestedProviders = rawError.suggestedProviders;
   }
@@ -593,27 +611,33 @@ async function prepareAttachmentsForContinuation(attachments, targetProvider, ta
  * @param {number} [params.retryBaseDelayMs=600]
  * @returns {Promise<{ text: string, modelUsed: string, provider: string, isDemo?: boolean }>}
  */
-export async function streamAIMessage({
-  provider = DEFAULT_PROVIDER,
-  model = null,
-  mode = 'general',
-  prompt,
-  history = [],
-  username = null,
-  preferences = null,
-  onChunk,
-  onStart,
-  signal,
-  isRequestActive = null,
-  conversationId = null,
-  attachments = [],
-  isContinuation = false,
-  partNumber = 1,
-  originalPrompt = null,
-  previousContentSummary = null,
-  chatEndpoint = '/api/chat',
-  retryBaseDelayMs = 600
-}) {
+export async function streamAIMessage(params = {}) {
+  if (params?.autoFallback === true) {
+    return streamAIMessageWithFallback(params);
+  }
+
+  const {
+    provider = DEFAULT_PROVIDER,
+    model = null,
+    mode = 'general',
+    prompt,
+    history = [],
+    username = null,
+    preferences = null,
+    onChunk,
+    onStart,
+    signal,
+    isRequestActive = null,
+    conversationId = null,
+    attachments = [],
+    isContinuation = false,
+    partNumber = 1,
+    originalPrompt = null,
+    previousContentSummary = null,
+    chatEndpoint = '/api/chat',
+    retryBaseDelayMs = 600
+  } = params || {};
+
   const normalizedProvider = normalizeProviderId(provider);
   const normalizedMode = (mode || 'general').toLowerCase();
   const sanitizedModel = sanitizeModelForProvider(normalizedProvider, model);
@@ -1117,5 +1141,349 @@ export async function streamAIMessage({
  * @returns {Promise<{ text: string, modelUsed: string, provider: string, isDemo?: boolean }>}
  */
 export async function sendAIMessage(params) {
+  if (params?.autoFallback === true) {
+    return streamAIMessageWithFallback(params);
+  }
   return streamAIMessage(params);
 }
+
+/**
+ * Re-exports model switching and fallback chain helpers for consumers.
+ */
+export { resolveModelForProviderSwitch, getDeterministicFallbackChain };
+
+/**
+ * Evaluates whether an error is eligible to trigger automated provider fallback.
+ *
+ * Strict policy:
+ * - CANNOT fallback if cancelled, aborted, or superseded.
+ * - CANNOT fallback if partial output has already been emitted (prevents duplicate text).
+ * - CANNOT fallback if provider is local (Ollama or WebLLM) — strict local privacy boundary.
+ * - CANNOT fallback if error is non-fallback (400, 401, 403, 413, invalid model, safety, quota, context length).
+ * - CANNOT fallback if canFallback !== true.
+ * - MAY fallback on transient 500, 502, 503, 504, timeout, network failure, or retry-exhausted provider outages.
+ *
+ * @param {any} error
+ * @param {Object} [options={}]
+ * @param {AbortSignal} [options.signal=null]
+ * @param {() => boolean} [options.isRequestActive=null]
+ * @param {boolean} [options.hasPartialOutput=false]
+ * @returns {boolean}
+ */
+export function isFallbackEligible(error, { signal = null, isRequestActive = null, hasPartialOutput = false } = {}) {
+  if (!error) return false;
+
+  // 1. User cancellation / abort
+  if (error.cancelled === true || isAbortLike(error, signal)) {
+    return false;
+  }
+  if (signal?.aborted) {
+    return false;
+  }
+  if (typeof isRequestActive === 'function' && !isRequestActive()) {
+    return false;
+  }
+
+  // 2. Partial streamed output (must never replay after partial tokens shown)
+  if (error.partial === true || hasPartialOutput) {
+    return false;
+  }
+  if (typeof error.partialText === 'string' && error.partialText.trim().length > 0) {
+    return false;
+  }
+
+  // 3. Local provider privacy boundary
+  const normProvider = normalizeProviderId(error.provider);
+  if (normProvider === 'ollama' || normProvider === 'webllm') {
+    return false;
+  }
+
+  // 4. canFallback MUST strictly be true
+  if (error.canFallback !== true) {
+    return false;
+  }
+
+  // 5. Incompatible or non-recoverable error codes
+  const code = String(error.code || error.status || error.errorCode || '').toUpperCase();
+  const nonFallbackCodes = new Set([
+    'REQUEST_CANCELLED',
+    'REQUEST_ABORTED',
+    'REQUEST_SUPERSEDED',
+    'INVALID_MODEL',
+    'UNSUPPORTED_MODEL',
+    'AUTH_FAILED',
+    'UNAUTHENTICATED',
+    'PERMISSION_DENIED',
+    'MISSING_CREDENTIALS',
+    'INVALID_REQUEST_PARAMETERS',
+    'INVALID_ARGUMENT',
+    'SAFETY_BLOCKED',
+    'CONTEXT_LENGTH_EXCEEDED',
+    'PAYLOAD_TOO_LARGE',
+    'LOCAL_PROVIDER_ONLY',
+    'WEBGPU_UNSUPPORTED',
+    'WEBGPU_ADAPTER_UNAVAILABLE',
+    'SHADER_F16_UNSUPPORTED',
+    'INSUFFICIENT_STORAGE'
+  ]);
+  if (nonFallbackCodes.has(code)) {
+    return false;
+  }
+
+  // 6. Explicit HTTP status: 400, 401, 403, 413, 499 never fallback
+  const httpStatus = Number(error.httpStatus || error.statusCode || error.code);
+  if (httpStatus === 400 || httpStatus === 401 || httpStatus === 403 || httpStatus === 413 || httpStatus === 499) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Creates a sanitized, structured fallback diagnostic record without exposing
+ * API keys, authorization tokens, raw prompts, or sensitive attachment contents.
+ *
+ * @param {Object} data
+ * @returns {Object}
+ */
+export function createFallbackDiagnostic({
+  requestId,
+  originalProvider,
+  failedProvider,
+  failureCode,
+  fallbackEligibility,
+  selectedFallbackProvider,
+  attemptNumber
+}) {
+  return {
+    requestId: String(requestId || `req-${Date.now()}`),
+    originalProvider: normalizeProviderId(originalProvider),
+    failedProvider: normalizeProviderId(failedProvider),
+    failureCode: String(failureCode || 'UNKNOWN_ERROR'),
+    fallbackEligibility: Boolean(fallbackEligibility),
+    selectedFallbackProvider: selectedFallbackProvider ? normalizeProviderId(selectedFallbackProvider) : null,
+    attemptNumber: Number(attemptNumber) || 1,
+    timestamp: Date.now()
+  };
+}
+
+/**
+ * Logs a concise internal diagnostic for provider fallback operations.
+ * Never logs secrets, tokens, or raw prompts.
+ *
+ * @param {Object} diag
+ */
+export function logFallbackDiagnostic(diag) {
+  if (!diag) return;
+  console.warn(
+    `[AI Fallback] Request: ${diag.requestId} | Initial: ${diag.originalProvider} | Failed: ${diag.failedProvider} (${diag.failureCode}) | Eligible: ${diag.fallbackEligibility} | Target: ${diag.selectedFallbackProvider || 'None'} | Step: ${diag.attemptNumber}`
+  );
+}
+
+/**
+ * Streams chat responses with deterministic bounded retry and automatic fallback coordination
+ * across configured, available AI providers.
+ *
+ * Flow:
+ * 1. Attempt primary provider (up to maxClientAttempts per provider on transient failures).
+ * 2. If primary succeeds -> returns { text, modelUsed, provider, attemptedProviders, fallbackHistory, ... }.
+ * 3. If primary fails:
+ *    - Cancellation? Stop immediately (no retry, no fallback).
+ *    - Partial output emitted? Stop immediately (no fallback to prevent duplicate/corrupted output).
+ *    - Non-fallback error (auth, 400, invalid model, local privacy boundary, canFallback: false)? Stop immediately.
+ *    - Fallback eligible (500, 502, 503, 504, timeout, network failure, canFallback: true)?
+ *      - Select next provider from deterministic fallback chain that has not yet been visited.
+ *      - If none available -> formulate and throw single canonical final error.
+ *      - Otherwise -> record diagnostic, switch model cleanly via resolveModelForProviderSwitch,
+ *        and attempt fallback provider.
+ *
+ * @param {Object} params
+ * @param {string} [params.provider='gemini']
+ * @param {string|null} [params.model=null]
+ * @param {string} [params.mode='general']
+ * @param {string} params.prompt
+ * @param {Array} [params.history=[]]
+ * @param {Array} [params.attachments=[]]
+ * @param {AbortSignal} [params.signal]
+ * @param {() => boolean} [params.isRequestActive]
+ * @param {(chunkText: string, accumulatedText: string) => void} [params.onChunk]
+ * @param {({ modelUsed: string, provider: string, isDemo?: boolean }) => void} [params.onStart]
+ * @param {(diagnostic: Object) => void} [params.onFallback]
+ * @param {Array<string>} [params.fallbackChain]
+ * @param {number} [params.maxFallbackProviders=3]
+ * @param {string} [params.requestId]
+ * @returns {Promise<{ text: string, modelUsed: string, provider: string, isDemo?: boolean, attemptedProviders: string[], fallbackHistory: Array<Object> }>}
+ */
+export async function streamAIMessageWithFallback(params = {}) {
+  const requestId = params.requestId || `req-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const initialProvider = normalizeProviderId(params.provider || DEFAULT_PROVIDER);
+  let currentProvider = initialProvider;
+  let currentModel = params.model || null;
+
+  // Track visited providers to prevent loops (e.g. A -> B -> A)
+  const visitedProviders = new Set([initialProvider]);
+  const attemptedProviders = [initialProvider];
+  const fallbackHistory = [];
+
+  // Determine if vision is required (e.g. raw image attachments)
+  const hasImageAttachments = Array.isArray(params.attachments) && params.attachments.some(isImageAttachment);
+  const requiresVision = hasImageAttachments;
+
+  // Maximum fallback depth across providers (default 3 providers max)
+  const maxFallbackDepth = Number.isInteger(params.maxFallbackProviders) && params.maxFallbackProviders > 0
+    ? params.maxFallbackProviders
+    : 3;
+
+  let lastError = null;
+
+  while (attemptedProviders.length <= maxFallbackDepth) {
+    if (params.signal?.aborted || (typeof params.isRequestActive === 'function' && !params.isRequestActive())) {
+      throw createRouterAbortError();
+    }
+
+    // Resolve model safely for current provider
+    const effectiveModel = resolveModelForProviderSwitch(currentProvider, currentModel, initialProvider);
+
+    // Track stream state for current provider
+    let providerEmittedChunks = false;
+    let accumulatedText = '';
+
+    try {
+      // Execute stream attempt on current provider (autoFallback: false so retries stay on this provider)
+      const result = await streamAIMessage({
+        ...params,
+        provider: currentProvider,
+        model: effectiveModel,
+        autoFallback: false,
+        onStart: (info) => {
+          params.onStart?.({
+            ...info,
+            provider: currentProvider,
+            modelUsed: info?.modelUsed || effectiveModel || PROVIDER_DEFAULT_MODELS[currentProvider]
+          });
+        },
+        onChunk: (chunkText, currentAcc) => {
+          providerEmittedChunks = true;
+          accumulatedText = currentAcc;
+          params.onChunk?.(chunkText, currentAcc);
+        }
+      });
+
+      // Successful completion!
+      return {
+        ...result,
+        attemptedProviders: [...attemptedProviders],
+        fallbackHistory: [...fallbackHistory]
+      };
+    } catch (rawErr) {
+      if (
+        params.signal?.aborted ||
+        (typeof params.isRequestActive === 'function' && !params.isRequestActive()) ||
+        rawErr?.name === 'AbortError' ||
+        rawErr?.cancelled ||
+        isAbortLike(rawErr)
+      ) {
+        const abortErr = createRouterAbortError(rawErr);
+        abortErr.cancelled = true;
+        abortErr.retryable = false;
+        abortErr.canFallback = false;
+        abortErr.attemptedProviders = [...attemptedProviders];
+        abortErr.fallbackHistory = [...fallbackHistory];
+        throw abortErr;
+      }
+
+      const canonicalErr = normalizeAIError(rawErr, {
+        provider: currentProvider,
+        model: effectiveModel,
+        requestId,
+        partialText: accumulatedText,
+        partial: providerEmittedChunks || Boolean(rawErr?.partial),
+        promptText: params.prompt,
+        attemptedProviders: [...attemptedProviders],
+        fallbackHistory: [...fallbackHistory]
+      });
+
+      lastError = canonicalErr;
+
+      // CRITICAL STREAMING INVARIANT:
+      // If partial text was already emitted to the user, NEVER attempt fallback to another provider.
+      if (providerEmittedChunks || canonicalErr.partial || (canonicalErr.partialText && canonicalErr.partialText.trim().length > 0)) {
+        canonicalErr.partial = true;
+        canonicalErr.canFallback = false;
+        canonicalErr.retryable = false;
+        throw canonicalErr;
+      }
+
+      // Check fallback eligibility
+      const eligible = isFallbackEligible(canonicalErr, {
+        signal: params.signal,
+        isRequestActive: params.isRequestActive,
+        hasPartialOutput: providerEmittedChunks
+      });
+
+      if (!eligible) {
+        throw canonicalErr;
+      }
+
+      // Determine candidate fallback providers
+      let candidates;
+      if (Array.isArray(params.fallbackChain) && params.fallbackChain.length > 0) {
+        candidates = params.fallbackChain
+          .map(normalizeProviderId)
+          .filter((p) => p && !visitedProviders.has(p) && isProviderCapableOfTask(p, { requiresVision, hasImageAttachments }));
+      } else {
+        candidates = getDeterministicFallbackChain(currentProvider, {
+          providerConfig: params.providerConfig || getCachedProviderConfig(),
+          requiresVision,
+          visited: Array.from(visitedProviders)
+        });
+      }
+
+      const nextProvider = candidates.find((p) => !visitedProviders.has(p));
+
+      // No eligible fallback provider remaining or depth reached
+      if (!nextProvider || attemptedProviders.length >= maxFallbackDepth) {
+        const finalExhaustedErr = normalizeAIError(canonicalErr, {
+          provider: currentProvider,
+          model: effectiveModel,
+          requestId,
+          canFallback: false,
+          attemptedProviders: [...attemptedProviders],
+          fallbackHistory: [...fallbackHistory]
+        });
+        finalExhaustedErr.canFallback = false;
+        throw finalExhaustedErr;
+      }
+
+      // Record diagnostic & advance to next provider
+      const diag = createFallbackDiagnostic({
+        requestId,
+        originalProvider: initialProvider,
+        failedProvider: currentProvider,
+        failureCode: canonicalErr.code,
+        fallbackEligibility: true,
+        selectedFallbackProvider: nextProvider,
+        attemptNumber: fallbackHistory.length + 1
+      });
+      fallbackHistory.push(diag);
+      logFallbackDiagnostic(diag);
+      params.onFallback?.(diag);
+
+      visitedProviders.add(nextProvider);
+      attemptedProviders.push(nextProvider);
+      currentProvider = nextProvider;
+      currentModel = null;
+    }
+  }
+
+  throw (
+    lastError ||
+    normalizeAIError('All AI provider fallback attempts failed.', {
+      provider: currentProvider,
+      requestId,
+      attemptedProviders: [...attemptedProviders],
+      fallbackHistory: [...fallbackHistory]
+    })
+  );
+}
+

@@ -103,7 +103,7 @@ export function sanitizeErrorMessage(raw, options = {}) {
   sanitized = sanitized.replace(/Bearer\s+[A-Za-z0-9_\-\.]+/gi, 'Bearer [REDACTED]');
 
   // Redact Google AI Studio / Gemini API keys (AIza...)
-  sanitized = sanitized.replace(/AIza[0-9A-Za-z-_]{35}/g, '[REDACTED_API_KEY]');
+  sanitized = sanitized.replace(/AIza[0-9A-Za-z-_]{20,}/g, '[REDACTED_API_KEY]');
 
   // Redact Groq API keys (gsk_...)
   sanitized = sanitized.replace(/gsk_[A-Za-z0-9_\-]{20,}/g, '[REDACTED_API_KEY]');
@@ -169,17 +169,36 @@ export class CanonicalAIError extends Error {
     this.cancelled = Boolean(options.cancelled);
     this.timeout = Boolean(options.timeout);
     this.retryable = Boolean(options.retryable);
+    this.partial = Boolean(options.partial);
+    this.partialText = typeof options.partialText === 'string' ? options.partialText : '';
 
-    // CRITICAL PRIVACY INVARIANT: Ollama and WebLLM local providers MUST NEVER have canFallback: true
-    if (this.provider === 'ollama' || this.provider === 'webllm') {
+    // CRITICAL PRIVACY, CANCELLATION & PARTIAL INVARIANTS:
+    // 1. Ollama and WebLLM local providers MUST NEVER have canFallback: true
+    // 2. Cancelled or aborted requests MUST strictly have canFallback: false and retryable: false
+    // 3. Partial streamed output MUST strictly have canFallback: false and retryable: false
+    if (
+      this.provider === 'ollama' ||
+      this.provider === 'webllm' ||
+      this.cancelled ||
+      this.partial ||
+      (this.partialText && this.partialText.trim().length > 0)
+    ) {
       this.canFallback = false;
+      if (this.cancelled || this.partial || (this.partialText && this.partialText.trim().length > 0)) {
+        this.retryable = false;
+      }
     } else {
       this.canFallback = Boolean(options.canFallback);
     }
 
-    this.partial = Boolean(options.partial);
-    this.partialText = typeof options.partialText === 'string' ? options.partialText : '';
     this.requestId = options.requestId !== undefined && options.requestId !== null ? options.requestId : null;
+
+    this.attemptedProviders = Array.isArray(options.attemptedProviders)
+      ? [...options.attemptedProviders]
+      : [this.provider];
+    this.fallbackHistory = Array.isArray(options.fallbackHistory)
+      ? [...options.fallbackHistory]
+      : [];
 
     if (Array.isArray(options.suggestedProviders)) {
       this.suggestedProviders = [...options.suggestedProviders];
@@ -216,6 +235,8 @@ export class CanonicalAIError extends Error {
       partial: this.partial,
       partialText: this.partialText,
       requestId: this.requestId,
+      attemptedProviders: this.attemptedProviders,
+      fallbackHistory: this.fallbackHistory,
       suggestedProviders: this.suggestedProviders,
       finishReason: this.finishReason,
       retryAfterSeconds: this.retryAfterSeconds
@@ -334,6 +355,8 @@ export function normalizeAIError(rawError, context = {}) {
       requestId: context.requestId !== undefined ? context.requestId : rawError.requestId,
       partial: typeof context.partial === 'boolean' ? context.partial : rawError.partial,
       partialText: typeof context.partialText === 'string' ? context.partialText : rawError.partialText,
+      attemptedProviders: context.attemptedProviders || rawError.attemptedProviders,
+      fallbackHistory: context.fallbackHistory || rawError.fallbackHistory,
       cause: rawError.cause
     });
   }
@@ -957,6 +980,8 @@ export function normalizeAIError(rawError, context = {}) {
     partial,
     partialText,
     requestId,
+    attemptedProviders: context.attemptedProviders || rawError?.attemptedProviders || [provider],
+    fallbackHistory: context.fallbackHistory || rawError?.fallbackHistory || [],
     suggestedProviders,
     finishReason,
     retryAfterSeconds,
