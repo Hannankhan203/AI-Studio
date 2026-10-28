@@ -1,6 +1,6 @@
 # Orvix
 
-**Version: v0.2.2**
+**Version: v0.2.4**
 
 <p align="center">
   <strong>An Intelligent, Multi-Model Conversational AI Workspace featuring On-Device Browser AI (WebLLM & WebGPU), Offline PWA App-Shell Caching, Client-Side Document Extraction, Dual-Format Table & Clipboard Formatting, Expanded Mobile Swipe Navigation, Mobile PWA Live Dictation with Whisper Refinement, Specialized Chat Modes, Multi-Model Response Alternatives, Global Chat-Input Focus, Pixel-Perfect Code Blocks, Live Latency Tracking, Controlled Continuation, and Deep Document Understanding</strong>
@@ -1123,7 +1123,13 @@ When troubleshooting streaming completions or intermittent upstream latency on s
 
 Orvix adheres to Semantic Versioning (`MAJOR.MINOR.PATCH`). Below is the concise, scannable history of all releases and development milestones.
 
-### v0.2.2 — Gemini Reliability, Fallback Hardening & Production Verification *(Current)*
+### v0.2.4 — Complete Ollama Provider Removal & Legacy Fallback Hardening *(Current)*
+- **Complete Ollama Removal**: Fully removed the Ollama AI provider from the active Orvix Web application and server infrastructure, eliminating local daemon dependencies unsuited for live cloud and Vercel deployments.
+- **Strict Browser AI (WebLLM) Preservation**: Protected the on-device Browser AI (WebLLM) provider with zero modifications to its WebGPU pipeline, Qwen 2.5 models (`0.5B` and `1.5B`), dedicated worker execution, and local caching.
+- **Graceful Legacy Selection Fallback**: Implemented robust normalization (`normalizeProviderId`) ensuring any legacy stored `localStorage` selection, active session, or API request targeting Ollama gracefully resolves to Google Gemini (`gemini-3.8-flash`) without errors or disruption.
+- **5-Provider Architecture**: Formally locked the active multi-provider registry to Google Gemini, Groq, OpenRouter, Cloudflare Workers AI, and Browser AI (WebLLM).
+
+### v0.2.2 — Gemini Reliability, Fallback Hardening & Production Verification
 - **Gemini Model Configuration & Automated Failover**: Established `gemini-3.8-flash` as the primary default model and `gemini-3.1-flash-lite` as the verified fallback candidate (`fallbackCandidates = ['gemini-3.8-flash', 'gemini-3.1-flash-lite']`). Automatically reroutes requests upon encountering upstream rate limits (`429`), temporary server unavailability (`503 UNAVAILABLE`), or deadline timeouts (`504 DEADLINE_EXCEEDED`) without repeating the failing model.
 - **SSE Streaming Architecture & Latency Safeguards**: Introduced immediate SSE header priming (`: prime\n\n` within 50ms), reverse proxy buffering bypass (`X-Accel-Buffering: no`), and active 8-second keepalive heartbeats (`: keepalive\n\n`) to eliminate idle socket drops on Vercel and edge proxies during upstream model initialization.
 - **Strict Fallback Boundaries**: Implemented strict pre-stream vs. mid-stream error boundaries. Pre-chunk timeouts allow clean retries or automated failover (`partial: false, canFallback: true`), while mid-stream errors strictly forbid failover (`partial: true, canFallback: false`) to prevent duplicate text replay.

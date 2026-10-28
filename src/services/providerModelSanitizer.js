@@ -65,6 +65,8 @@ export const CLOUDFLARE_DEFAULT_MODEL = '@cf/meta/llama-3.1-8b-instruct';
 export const WEBLLM_SUPPORTED_MODELS = Object.freeze([
   'Qwen2.5-1.5B-Instruct-q4f16_1-MLC',
   'Qwen2.5-1.5B-Instruct-q4f32_1-MLC',
+  'SmolLM2-135M-Instruct-q0f16-MLC',
+  'SmolLM2-135M-Instruct-q0f32-MLC',
   'Qwen2.5-0.5B-Instruct-q4f16_1-MLC',
   'Qwen2.5-0.5B-Instruct-q4f32_1-MLC'
 ]);
@@ -174,8 +176,11 @@ const KNOWN_UI_DISPLAY_LABELS = new Set([
   'browser ai (webllm)',
   'browser ai (webllm) — qwen 2.5 1.5b',
   'browser ai (webllm) - qwen 2.5 1.5b',
+  'browser ai (webllm) — smollm2 135m',
+  'browser ai (webllm) - smollm2 135m',
   'qwen 2.5 1.5b',
   'qwen 2.5 coder 1.5b',
+  'smollm2 135m',
   'llama 3.2 1b',
   'smollm2 360m'
 ]);
@@ -199,7 +204,8 @@ export function normalizeProviderId(provider) {
  * @returns {boolean}
  */
 export function isCloudProvider(provider) {
-  return CLOUD_PROVIDER_SET.has(normalizeProviderId(provider));
+  if (!provider || typeof provider !== 'string') return false;
+  return CLOUD_PROVIDER_SET.has(provider.trim().toLowerCase());
 }
 
 /**
@@ -208,16 +214,18 @@ export function isCloudProvider(provider) {
  * @returns {boolean}
  */
 export function isLocalProvider(provider) {
-  return LOCAL_PROVIDER_SET.has(normalizeProviderId(provider));
+  if (!provider || typeof provider !== 'string') return false;
+  return LOCAL_PROVIDER_SET.has(provider.trim().toLowerCase());
 }
 
 /**
- * Returns true if the provider identifier is one of the 6 supported Orvix providers.
+ * Returns true if the provider identifier is one of the 5 supported Orvix providers.
  * @param {string|null|undefined} provider
  * @returns {boolean}
  */
 export function isSupportedProvider(provider) {
-  return SUPPORTED_PROVIDER_SET.has(normalizeProviderId(provider));
+  if (!provider || typeof provider !== 'string') return false;
+  return SUPPORTED_PROVIDER_SET.has(provider.trim().toLowerCase());
 }
 
 /**

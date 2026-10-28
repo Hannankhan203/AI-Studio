@@ -477,7 +477,7 @@ async function main() {
     // =========================================================================
     // 3. Cross-provider model IDs are rejected
     // =========================================================================
-    await runTest('3. Cross-provider model IDs (Gemini, Cloudflare, Ollama, WebLLM, Whisper audio) are rejected for OpenRouter', async () => {
+    await runTest('3. Cross-provider model IDs (Gemini, Cloudflare, WebLLM, Whisper audio) are rejected for OpenRouter', async () => {
       const foreignModels = [
         'gemini-2.5-flash',
         'models/gemini-2.5-flash',
@@ -2170,9 +2170,9 @@ async function main() {
     });
 
     // =========================================================================
-    // CF-30. Switching from Gemini/Groq/OpenRouter/Ollama/WebLLM to Cloudflare uses a valid Cloudflare model
+    // CF-30. Switching from Gemini/Groq/OpenRouter/WebLLM to Cloudflare uses a valid Cloudflare model
     // =========================================================================
-    await runTest('CF-30. Switching from Gemini/Groq/OpenRouter/Ollama/WebLLM to Cloudflare sanitizes foreign models and uses default @cf/meta/llama-3.1-8b-instruct', async () => {
+    await runTest('CF-30. Switching from Gemini/Groq/OpenRouter/WebLLM to Cloudflare sanitizes foreign models and uses default @cf/meta/llama-3.1-8b-instruct', async () => {
       const foreignModels = [
         'gemini-2.5-flash',
         'llama-3.3-70b-versatile',

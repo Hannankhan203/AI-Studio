@@ -1090,7 +1090,7 @@ await test('Phase 2B.3 — Groq, OpenRouter, Cloudflare, and WebLLM skip Indexed
     assert.strictEqual(prepared[2].extraction.status, 'NO_TEXT_DETECTED');
   }
 
-  // Verify streamAIMessage outgoing /api/chat network payloads for Groq, OpenRouter, Cloudflare, and Ollama
+  // Verify streamAIMessage outgoing /api/chat network payloads for Groq, OpenRouter, and Cloudflare
   // strip base64/dataUrl even if caller passed pre-encoded image strings, while preserving OCR text
   const originalFetch = globalThis.fetch;
   const capturedByProvider = new Map();

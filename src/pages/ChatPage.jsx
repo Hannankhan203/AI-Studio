@@ -11,7 +11,8 @@ import {
 } from '../services/aiRouter.js';
 import {
   sanitizeModelForProvider,
-  evaluateOfflineProviderGuard
+  evaluateOfflineProviderGuard,
+  normalizeProviderId
 } from '../services/providerModelSanitizer.js';
 import {
   createChatDocument,
@@ -130,11 +131,15 @@ export default function ChatPage() {
 
   const [selectedProvider, setSelectedProvider] = useState(() => {
     if (typeof window !== 'undefined') {
-      return (
+      const saved =
         localStorage.getItem('orvix_selected_provider') ||
         localStorage.getItem('chatora_selected_provider') ||
-        DEFAULT_PROVIDER
-      );
+        DEFAULT_PROVIDER;
+      const normalized = normalizeProviderId(saved);
+      if (saved && saved !== normalized) {
+        localStorage.setItem('orvix_selected_provider', normalized);
+      }
+      return normalized;
     }
     return DEFAULT_PROVIDER;
   });
@@ -218,19 +223,20 @@ export default function ChatPage() {
   };
 
   const handleSelectProvider = (provider) => {
+    const normalized = normalizeProviderId(provider);
     if (
-      provider &&
-      provider !== selectedProvider &&
+      normalized &&
+      normalized !== selectedProvider &&
       requestControllerRef.current.hasActiveRequest()
     ) {
       cancelCurrentGeneration('provider_switched');
     }
 
-    setSelectedProvider(provider);
+    setSelectedProvider(normalized);
 
     if (typeof window !== 'undefined') {
-      localStorage.setItem('orvix_selected_provider', provider);
-      localStorage.setItem('chatora_selected_provider', provider);
+      localStorage.setItem('orvix_selected_provider', normalized);
+      localStorage.setItem('chatora_selected_provider', normalized);
     }
   };
 
