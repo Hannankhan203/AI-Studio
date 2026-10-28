@@ -17,4 +17,5 @@ export * from './alternativeResponseService.js';
 export * from './providerModelSanitizer.js';
 export * from './transcriptionService.js';
 export * from './browserDocumentExtractor.js';
+export * from './errorNormalizationService.js';
 

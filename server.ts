@@ -243,12 +243,18 @@ function getBackoffWithJitter(attempt: number, retryAfterSec?: number): number {
 }
 
 // Sanitizes error messages to ensure no API keys, tokens, or headers are ever logged
-function sanitizeErrorLog(msg: string): string {
+// Sanitizes error messages to ensure no API keys, tokens, or headers are ever logged or sent to users
+export function sanitizeErrorLog(msg: string): string {
   if (!msg) return '';
   return String(msg)
+    .replace(/Bearer\s+[A-Za-z0-9_\-\.]+/gi, 'Bearer [REDACTED]')
     .replace(/AIza[0-9A-Za-z-_]{35}/g, '[REDACTED_API_KEY]')
-    .replace(/Bearer\s+[A-Za-z0-9-_.]+/gi, 'Bearer [REDACTED]')
-    .replace(/key=[^&\s]+/gi, 'key=[REDACTED]');
+    .replace(/gsk_[A-Za-z0-9]{20,}/g, '[REDACTED_API_KEY]')
+    .replace(/sk-or-[A-Za-z0-9]{20,}/g, '[REDACTED_API_KEY]')
+    .replace(/sk-[A-Za-z0-9]{20,}/g, '[REDACTED_API_KEY]')
+    .replace(/([?&]key=)[A-Za-z0-9_\-]+/gi, '$1[REDACTED]')
+    .replace(/\b(GEMINI_API_KEY|GROQ_API_KEY|OPENROUTER_API_KEY|CLOUDFLARE_API_TOKEN|CLOUDFLARE_ACCOUNT_ID)\s*=\s*[^\s,;]+/gi, '$1=[REDACTED]')
+    .replace(/(authorization:\s*)([^\r\n,;]+)/gi, '$1[REDACTED]');
 }
 
 export type AIDiagnosticCategory =
@@ -349,7 +355,7 @@ export function getServerProviderConfigStatus(serverlessRuntime = false) {
   };
 }
 
-function getConfiguredFallbackProviders(excludeProvider: string, serverlessRuntime = false): string[] {
+export function getConfiguredFallbackProviders(excludeProvider: string, serverlessRuntime = false): string[] {
   const status = getServerProviderConfigStatus(serverlessRuntime);
   const candidates: string[] = [];
   if (status.geminiConfigured) candidates.push('gemini');
@@ -2917,7 +2923,7 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
       return res.status(400).json({
         error: errMessage,
         code: 400,
-        status: 'INVALID_ARGUMENT',
+        status: normalizedProvider === 'webllm' ? 'LOCAL_PROVIDER_ONLY' : 'INVALID_ARGUMENT',
         provider: normalizedProvider,
         retryable: false,
         canFallback: false
@@ -6695,6 +6701,27 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
           return;
         }
       }
+    }
+
+    if (provider.toLowerCase() === 'webllm') {
+      logAIDiagnostic({
+        category: 'request validation error',
+        provider: 'webllm',
+        phase: 'validation',
+        upstreamStatus: 400,
+        upstreamErrorCode: 'LOCAL_PROVIDER_ONLY',
+        sanitizedMessage: 'Browser AI (WebLLM) runs on-device in the browser via WebGPU and cannot be dispatched to the server-side /api/chat endpoint.',
+        willRetry: false
+      });
+      return res.status(400).json({
+        error: 'Browser AI (WebLLM) runs on-device in the browser via WebGPU and cannot be dispatched to the server-side /api/chat endpoint.',
+        code: 400,
+        status: 'LOCAL_PROVIDER_ONLY',
+        errorCode: 'LOCAL_PROVIDER_ONLY',
+        provider: 'webllm',
+        retryable: false,
+        canFallback: false
+      });
     }
 
     return res.status(400).json({ error: `Unknown provider: ${provider}` });

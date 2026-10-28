@@ -940,15 +940,22 @@ export async function runIsolatedPromptStream({
     const { friendlyMsg, effectiveProvider, canSwitchProvider } = classified;
     const resolvedErrorCode =
       classified?.errorCode ||
+      classified?.canonicalError?.code ||
       error?.errorCode ||
       (typeof error?.status === 'string' ? error.status : undefined);
+    const resolvedHttpStatus =
+      classified?.httpStatus ||
+      classified?.canonicalError?.httpStatus ||
+      error?.httpStatus ||
+      error?.code;
     const resolvedSuggestedProviders = Array.isArray(classified?.suggestedProviders)
       ? classified.suggestedProviders
       : Array.isArray(error?.suggestedProviders)
       ? error.suggestedProviders
       : undefined;
     const extraErrorFields = {
-      ...(resolvedErrorCode ? { errorCode: resolvedErrorCode } : {}),
+      ...(resolvedErrorCode ? { errorCode: resolvedErrorCode, status: resolvedErrorCode } : {}),
+      ...(resolvedHttpStatus ? { httpStatus: resolvedHttpStatus } : {}),
       ...(resolvedSuggestedProviders ? { suggestedProviders: resolvedSuggestedProviders } : {})
     };
 
@@ -1022,6 +1029,6 @@ export async function runIsolatedPromptStream({
       await onPersistMessage(targetChatId, finalizedErrorMessage, true);
     }
 
-    return { status: 'error', requestId, error };
+    return { status: 'error', requestId, error, classifiedErr: classified, canonicalError: classified?.canonicalError };
   }
 }

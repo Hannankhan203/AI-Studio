@@ -84,6 +84,7 @@ import {
   cancelActiveChatRequest,
   runIsolatedPromptStream
 } from '../services/requestIsolationService.js';
+import { normalizeAIError } from '../services/errorNormalizationService.js';
 import { AlertCircle, X, Check, WifiOff } from 'lucide-react';
 
 export default function ChatPage() {
@@ -1002,153 +1003,28 @@ export default function ChatPage() {
   /**
    * Formats raw provider/router errors into actionable user-facing messages.
    */
-  const classifyPromptError = (error, { finalProvider, providerToUse }) => {
+  const classifyPromptError = (error, { finalProvider, providerToUse, activeModel, targetText, promptText } = {}) => {
     console.error('Streaming prompt execution error:', error);
 
-    let rawMsg = String(error?.message || '');
-    if (rawMsg.includes('{') && rawMsg.includes('}')) {
-      try {
-        const match = rawMsg.match(/\{[\s\S]*\}/);
-        if (match) {
-          const parsed = JSON.parse(match[0]);
-          if (parsed.error?.message) {
-            rawMsg = parsed.error.message;
-          }
-        }
-      } catch (_) {}
-    }
+    const normalized = normalizeAIError(error, {
+      provider: error?.provider || finalProvider || providerToUse,
+      model: error?.model || activeModel,
+      partialText: targetText,
+      promptText
+    });
 
-    const effectiveProvider = error?.provider || finalProvider || providerToUse;
-    const currentProviderConfig = Array.isArray(PROVIDER_OPTIONS)
-      ? PROVIDER_OPTIONS.find((p) => p.id === effectiveProvider)
-      : null;
-    const providerDisplayName =
-      currentProviderConfig?.name ||
-      (effectiveProvider
-        ? effectiveProvider.charAt(0).toUpperCase() + effectiveProvider.slice(1)
-        : 'AI Provider');
-
-    const isOllama = effectiveProvider === 'ollama';
-    const isWebLLM = effectiveProvider === 'webllm';
-    const isLocalProvider = isOllama || isWebLLM;
-    const isGemini = effectiveProvider === 'gemini';
-
-    const isNotConfigured = Boolean(
-      error?.errorCode === 'PROVIDER_NOT_CONFIGURED' ||
-      error?.status === 'PROVIDER_NOT_CONFIGURED' ||
-      rawMsg.toLowerCase().includes('not configured on this server')
-    );
-    const isInvalidModel = Boolean(
-      error?.errorCode === 'INVALID_MODEL' || error?.status === 'INVALID_MODEL'
-    );
-    const isTimeout = Boolean(
-      error?.code === 504 || error?.status === 'DEADLINE_EXCEEDED'
-    );
-
-    const is503 =
-      !isNotConfigured &&
-      (error?.code === 503 ||
-        error?.status === 'UNAVAILABLE' ||
-        rawMsg.toLowerCase().includes('high demand') ||
-        rawMsg.toLowerCase().includes('spikes in demand') ||
-        rawMsg.toLowerCase().includes('overloaded')) &&
-      error?.code !== 500;
-
-    const is500 = error?.code === 500 || error?.status === 'INTERNAL';
-    const isAuthError =
-      error?.code === 401 ||
-      error?.code === 403 ||
-      error?.status === 'UNAUTHENTICATED' ||
-      error?.status === 'PERMISSION_DENIED';
-    const isRateLimit =
-      error?.code === 429 || error?.status === 'RESOURCE_EXHAUSTED';
-    const isPayloadError = Boolean(
-      error?.isPayloadError ||
-      error?.code === 413 ||
-      error?.status === 'PAYLOAD_TOO_LARGE'
-    );
-    const isNotFound =
-      !isPayloadError &&
-      !isInvalidModel &&
-      (error?.code === 404 ||
-        error?.status === 'NOT_FOUND' ||
-        rawMsg.toLowerCase().includes('not found') ||
-        rawMsg.toLowerCase().includes('does not exist') ||
-        rawMsg.toLowerCase().includes('access to it') ||
-        rawMsg.toLowerCase().includes('decommissioned') ||
-        rawMsg.toLowerCase().includes('retired'));
-
-    let friendlyMsg = rawMsg;
-    if (isNotConfigured) {
-      friendlyMsg =
-        rawMsg ||
-        `${providerDisplayName} is not configured on this server. Configure its server API key in the server environment or switch to an available provider below.`;
-    } else if (isInvalidModel) {
-      friendlyMsg =
-        rawMsg ||
-        `The requested model identifier is not valid for ${providerDisplayName}. Please retry or select another provider below.`;
-    } else if (isPayloadError) {
-      friendlyMsg =
-        rawMsg ||
-        'The attached image payload exceeds the supported request budget (3.0 MB max per image, 4.2 MB max total request). Please resize or compress the image and try again.';
-    } else if (isOllama) {
-      if (rawMsg) {
-        friendlyMsg = rawMsg;
-      } else if (isNotFound) {
-        friendlyMsg = `Local AI (Ollama) model 'qwen2.5:1.5b' was not found. Please pull the model locally using 'ollama pull qwen2.5:1.5b'.`;
-      } else if (is503) {
-        friendlyMsg = `Local AI (Ollama) is unavailable: could not connect to Ollama at http://127.0.0.1:11434. Make sure Ollama is running locally ('ollama serve').`;
-      } else {
-        friendlyMsg = `An error occurred with Local AI (Ollama). Please make sure Ollama is running locally and model 'qwen2.5:1.5b' is installed.`;
-      }
-    } else if (isWebLLM) {
-      friendlyMsg =
-        rawMsg ||
-        'Browser AI (WebLLM) encountered a local initialization or generation error on this device.';
-    } else if (isTimeout) {
-      friendlyMsg =
-        rawMsg ||
-        `${providerDisplayName} timed out before sending response headers. Please retry in a moment or switch to another provider below.`;
-    } else if (is503) {
-      if (isGemini) {
-        friendlyMsg =
-          'Google Gemini is currently experiencing high demand. Spikes in demand are usually temporary. Please try again in a few moments, or switch to Groq, OpenRouter, or Local AI below.';
-      } else {
-        friendlyMsg = `${providerDisplayName} is currently experiencing high demand. Spikes in demand are usually temporary. Please try again in a few moments, or switch to another provider below.`;
-      }
-    } else if (isNotFound) {
-      friendlyMsg =
-        rawMsg ||
-        `The requested model for ${providerDisplayName} is unavailable or retired. Please choose another model or provider below.`;
-    } else if (is500) {
-      friendlyMsg =
-        rawMsg && !rawMsg.includes('Server request failed') && !rawMsg.includes('Internal Server Error')
-          ? `${providerDisplayName} encountered an internal error: ${rawMsg}. You can retry or switch to another provider below.`
-          : `${providerDisplayName} encountered an internal error (HTTP 500). Please try again in a moment, or switch to another provider below.`;
-    } else if (isAuthError) {
-      friendlyMsg = `Authentication or permission error with ${providerDisplayName}. Please check your API key configuration or switch providers below.`;
-    } else if (isRateLimit) {
-      friendlyMsg = `${providerDisplayName} rate limit or quota exceeded. Please wait a moment before trying again, or switch providers below.`;
-    } else if (!friendlyMsg) {
-      friendlyMsg = `An unexpected error occurred while communicating with ${providerDisplayName}.`;
-    }
+    const isLocalProvider = normalized.provider === 'ollama' || normalized.provider === 'webllm';
+    const canSwitchProvider = normalized.canFallback && !isLocalProvider;
 
     return {
-      friendlyMsg,
-      effectiveProvider,
-      canSwitchProvider: error?.canFallback === false ? false : !isLocalProvider,
-      errorCode:
-        error?.errorCode ||
-        (isNotConfigured
-          ? 'PROVIDER_NOT_CONFIGURED'
-          : isInvalidModel
-          ? 'INVALID_MODEL'
-          : isTimeout
-          ? 'DEADLINE_EXCEEDED'
-          : undefined),
-      suggestedProviders: Array.isArray(error?.suggestedProviders)
-        ? error.suggestedProviders
-        : undefined
+      friendlyMsg: normalized.message,
+      effectiveProvider: normalized.provider,
+      canSwitchProvider,
+      errorCode: normalized.code,
+      status: normalized.status,
+      httpStatus: normalized.httpStatus,
+      canonicalError: normalized,
+      suggestedProviders: normalized.suggestedProviders
     };
   };
 

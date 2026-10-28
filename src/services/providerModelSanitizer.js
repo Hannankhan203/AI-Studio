@@ -465,6 +465,11 @@ export function checkModelCompatibilityForProvider(provider, candidateModel) {
         lower.startsWith('gemini-') ||
         lower.startsWith('models/') ||
         lower.startsWith('openrouter/') ||
+        lower.startsWith('openai/') ||
+        lower.startsWith('anthropic/') ||
+        lower.startsWith('gpt-') ||
+        lower.startsWith('claude-') ||
+        lower.startsWith('llama-') ||
         lower.includes(':') ||
         GROQ_TRANSCRIPTION_MODEL_SET.has(lower) ||
         lower.startsWith('whisper-') ||

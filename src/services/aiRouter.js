@@ -5,7 +5,12 @@
  * Normalizes parameters, model identifiers, retry semantics, stream continuation, and error formats.
  */
 
-import { streamWebLLMMessage, DEFAULT_WEBLLM_MODEL_ID } from './webllmService.js';
+import {
+  streamWebLLMMessage,
+  DEFAULT_WEBLLM_MODEL_ID,
+  WebLLMError,
+  WEBLLM_ERROR_CODES
+} from './webllmService.js';
 import {
   prepareChatRequestBody,
   sanitizeAttachmentForNetwork,
@@ -16,8 +21,10 @@ import {
   normalizeProviderId,
   sanitizeModelForProvider,
   normalizeProviderConfigPayload,
-  getProviderConfigAvailability
+  getProviderConfigAvailability,
+  checkModelCompatibilityForProvider
 } from './providerModelSanitizer.js';
+import { sanitizeErrorMessage } from './errorNormalizationService.js';
 
 export const AI_PROVIDERS = {
   GEMINI: 'gemini',
@@ -472,12 +479,18 @@ export function parseRouterError(rawError, statusCode = 500, providerHint = null
     }
   }
 
-  const err = new Error(
+  const sanitizedMsg = sanitizeErrorMessage(
     cleanMsg || 'An unexpected error occurred while communicating with the AI service.'
   );
+  const err = new Error(sanitizedMsg);
   err.code = code;
+  err.httpStatus = Number.isFinite(code) && code >= 400 && code <= 599 ? code : 500;
   err.status = status;
   err.errorCode = isObjectInput && rawError.errorCode ? String(rawError.errorCode) : status;
+  err.timeout = code === 504 || status === 'DEADLINE_EXCEEDED';
+  err.cancelled = false;
+  err.partial = Boolean(rawError?.partial);
+  err.partialText = typeof rawError?.partialText === 'string' ? rawError.partialText : '';
   if (explicitRetryable === false || isOllamaContext) {
     err.retryable = false;
   } else if (typeof explicitRetryable === 'boolean') {
@@ -499,7 +512,10 @@ export function parseRouterError(rawError, statusCode = 500, providerHint = null
     err.provider = normalizedHint;
   }
   if (isObjectInput && typeof rawError.canFallback === 'boolean') {
-    err.canFallback = rawError.canFallback;
+    // Local privacy invariant: Ollama and WebLLM must NEVER have canFallback: true
+    if (!isOllamaContext && !isWebLLMContext) {
+      err.canFallback = rawError.canFallback;
+    }
   }
   if (isObjectInput && Array.isArray(rawError.suggestedProviders)) {
     err.suggestedProviders = rawError.suggestedProviders;
@@ -602,6 +618,20 @@ export async function streamAIMessage({
   // Strictly local browser inference: route Browser AI (WebLLM) directly to webllmService.js.
   // Never send Browser AI requests to /api/chat, Ollama, Firebase, or any cloud provider.
   if (normalizedProvider === AI_PROVIDERS.WEBLLM) {
+    if (model && typeof model === 'string' && model.trim()) {
+      const compat = checkModelCompatibilityForProvider('webllm', model.trim());
+      if (!compat.compatible) {
+        throw new WebLLMError(
+          compat.reason || `Model "${model.trim()}" is not valid for Browser AI (WebLLM).`,
+          {
+            code: WEBLLM_ERROR_CODES.UNSUPPORTED_MODEL,
+            httpCode: 400,
+            retryable: false
+          }
+        );
+      }
+    }
+
     let effectivePrompt = prompt;
     if (isContinuation) {
       const contHeader = originalPrompt
