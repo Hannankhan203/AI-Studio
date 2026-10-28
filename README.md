@@ -1,6 +1,6 @@
 # Orvix
 
-**Version: v0.2.1**
+**Version: v0.2.2**
 
 <p align="center">
   <strong>An Intelligent, Multi-Model Conversational AI Workspace featuring On-Device Browser AI (WebLLM & WebGPU), Offline PWA App-Shell Caching, Client-Side Document Extraction, Dual-Format Table & Clipboard Formatting, Expanded Mobile Swipe Navigation, Mobile PWA Live Dictation with Whisper Refinement, Specialized Chat Modes, Multi-Model Response Alternatives, Global Chat-Input Focus, Pixel-Perfect Code Blocks, Live Latency Tracking, Controlled Continuation, and Deep Document Understanding</strong>
@@ -21,7 +21,7 @@
    - [App Shell Precache vs. Model Weight Cache](#app-shell-precache-vs-model-weight-cache)
    - [Prerequisites for Reliable Offline Use](#prerequisites-for-reliable-offline-use)
    - [Model Weight Retention & Storage Lifecycle](#model-weight-retention--storage-lifecycle)
-   - [Behavior of Cloud Providers & Local Ollama When Offline](#behavior-of-cloud-providers--local-ollama-when-offline)
+   - [Behavior of Cloud Providers When Offline](#behavior-of-cloud-providers-when-offline)
    - [Mobile Device Hardware Realities](#mobile-device-hardware-realities)
 5. [Browser-Side Document Extraction (Offline & Local)](#browser-side-document-extraction-offline--local)
    - [Supported Offline Document Formats](#supported-offline-document-formats)
@@ -78,6 +78,7 @@
     - [Automatic Chat-Input Focus](#automatic-chat-input-focus)
     - [Live Response-Time Measurement](#live-response-time-measurement)
     - [Controlled Large-Response Continuation](#controlled-large-response-continuation)
+    - [Edit & Resend Flow with Clean Branch Truncation](#edit--resend-flow-with-clean-branch-truncation)
     - [Conversation Pinning & Client-Side Export](#conversation-pinning--client-side-export)
 15. [Architecture & Technology Stack](#architecture--technology-stack)
 16. [Authentication & Persistence Architecture](#authentication--persistence-architecture)
@@ -86,6 +87,7 @@
 19. [Installation & Running Locally](#installation--running-locally)
 20. [Build & Deployment Instructions](#build--deployment-instructions)
 21. [Troubleshooting & Common Issues](#troubleshooting--common-issues)
+    - [Troubleshooting Gemini Timeouts & Streaming (DevTools & Vercel)](#troubleshooting-gemini-timeouts--streaming-devtools--vercel)
 22. [Security Architecture](#security-architecture)
 23. [Current Limitations](#current-limitations)
 24. [Version History & Release Changelog](#version-history--release-changelog)
@@ -155,7 +157,7 @@ Unlike cloud-based providers (Gemini, Groq, OpenRouter, Cloudflare Workers AI) t
 - **No API Keys or Cloud Accounts Required**: Browser AI requires zero credentials, billing accounts, or proxy tokens.
 - **Complete Data Confidentiality**: Input prompts, system instructions, conversation context, and extracted file attachments remain on the user's physical machine. Prompts are never logged, routed through server endpoints, or used for model training.
 - **Zero Server Infrastructure Dependencies**: Token generation runs on the client's local graphics processor (GPU). Even if the Orvix backend server is unreachable or offline, on-device generation continues without interruption.
-- **Companion Provider Option**: Browser AI is integrated as a peer option alongside Orvix's cloud providers and Local AI (Ollama). Users can switch between cloud models and Browser AI at any time using the model selector dropdown in the navigation header.
+- **Companion Provider Option**: Browser AI is integrated as a peer option alongside Orvix's cloud providers. Users can switch between cloud models and Browser AI at any time using the model selector dropdown in the navigation header.
 
 ### Configured Qwen 2.5 Model Variants & Quantization Tiers
 
@@ -254,14 +256,13 @@ Once both conditions are fulfilled, the visitor can disconnect from the internet
   - Browser storage pressure eviction (if device free disk space drops critically low, browsers may evict non-persistent caches). Orvix proactively requests `navigator.storage.persist()` to minimize eviction risk.
   - Switching to an entirely different web browser or operating system profile (browser caches are isolated per browser).
 
-### Behavior of Cloud Providers & Local Ollama When Offline
+### Behavior of Cloud Providers When Offline
 
 When Orvix detects that the browser is offline (`!navigator.onLine`):
 - **Cloud AI Providers (Gemini, Groq, OpenRouter, Cloudflare Workers AI)**: Cloud providers rely on remote API datacenters. If a user submits a prompt with a cloud provider selected while offline, Orvix intercepts the submission immediately with a helpful notice:  
   `"[Provider] requires an internet connection. Switch to Browser AI (WebLLM) to chat offline on this device."`  
   The offline banner includes a one-click **"Switch to Browser AI"** button.
-- **Local AI (Ollama)**: Local Ollama runs on `http://127.0.0.1:11434` and does not require an external internet connection. However, it requires the Orvix local Node.js backend server (`server.ts`) to be running on the host machine to proxy Ollama requests.
-- **Browser AI (WebLLM)**: **Requires neither internet nor a running local backend server**. It runs purely client-side inside the browser sandbox.
+- **Browser AI (WebLLM)**: **Requires neither internet nor a running backend server**. It runs purely client-side inside the browser sandbox.
 
 ### Mobile Device Hardware Realities
 
@@ -731,7 +732,6 @@ Orvix connects to multiple distinct AI provider architectures: serverless cloud 
 | **Groq Cloud** | `llama-3.3-70b-versatile` | Ultra-low latency cloud inference via Groq LPUs | `openai/gpt-oss-120b` |
 | **OpenRouter** | `openrouter/free` | Decentralized routing across free community models | Dynamic routing |
 | **Cloudflare Workers AI** | `@cf/meta/llama-3.1-8b-instruct` | Low-latency edge inference | Edge fallback |
-| **Local AI (Ollama)** | `qwen2.5:1.5b` *(or configured local model)* | Local on-premise inference via local Ollama daemon (`127.0.0.1:11434`) | Requires local Orvix backend |
 
 ### Provider Context Budgets
 
@@ -742,15 +742,26 @@ Context budgets are calibrated in `src/services/documentContextService.js`:
 | **Browser AI (WebLLM)** | 4,096 tokens | ~8,000–10,000 characters | 100% offline document Q&A, complete privacy, zero API costs |
 | **Google Gemini** | 1,000,000 tokens | ~120,000 characters | Extensive multi-page PDFs, books, large codebases |
 | **Groq Cloud** | 128,000 tokens | ~24,000 characters | Rapid structured analysis, high-speed coding |
-| **Local AI (Ollama)** | 4,096 tokens | ~16,000 characters | Local privacy, offline server inference without cloud dependencies |
 | **OpenRouter** | Variable by model | ~16,000 characters | Broad open-source experimentation |
 | **Cloudflare Workers AI** | 8,192 tokens | ~16,000 characters | Edge summaries, quick queries |
 
 ### Streaming & Fallback System
 
 - **Dedicated Web Worker Streaming (Browser AI)**: Browser AI completions execute entirely client-side inside `src/workers/webllmWorker.js`. Generated tokens stream directly from WebGPU command queues into the UI state without making network requests.
-- **Server-Sent Events (SSE)**: Cloud completions (Gemini, Groq, OpenRouter, Cloudflare) stream tokens incrementally in real time via `POST /api/chat`.
-- **Automatic Model Failover**: If `gemini-3.8-flash` encounters a rate limit (429) or temporary server error (503), Orvix automatically retries with `gemini-3.1-flash-lite`.
+- **Server-Sent Events (SSE) Streaming Architecture**:
+  - **Immediate Header Priming**: The server immediately transmits initial SSE headers (`Content-Type: text/event-stream; charset=utf-8`, `Connection: keep-alive`) and flushes an initial comment (`: prime\n\n`) within 50ms of receiving the request. This provides an immediate Time-to-First-Byte (TTFB) to satisfy reverse proxy and Vercel edge idle timeout thresholds before the upstream model returns its initial chunk.
+  - **Reverse Proxy Buffering Disabled**: Sets `X-Accel-Buffering: no` on all streaming responses to prevent intermediate reverse proxies (Vercel, Nginx, Cloudflare) from buffering chunks.
+  - **Active Keepalive Heartbeat**: Periodic SSE comment frames (`: keepalive\n\n`) are emitted every 8 seconds while awaiting upstream model generation, preventing idle socket teardown during complex reasoning or large context ingestion.
+  - **Strict Pre-Stream vs. Mid-Stream Error Boundary**: If an error or timeout occurs *before* any generated chunk is received, the system flags `canFallback: true` and `partial: false`, permitting retry or automated failover. Once any generated chunk has been emitted to the client, the error is marked with `partial: true` and `canFallback: false`, strictly prohibiting retries or provider switching to prevent duplicate text or contradictory partial replays.
+  - **Client Disconnect Cancellation**: Outbound upstream requests are wired to `AbortController` signals that trigger immediately when the client disconnects or clicks **Stop**, aborting upstream calls and freeing server resources.
+- **Gemini Model Configuration & Fallback Candidate Strategy**:
+  - `gemini-3.8-flash` is configured as the primary default model and `gemini-3.1-flash-lite` is the fallback candidate model (`const fallbackCandidates = ['gemini-3.8-flash', 'gemini-3.1-flash-lite']`).
+  - If `gemini-3.8-flash` encounters a rate limit (`429`), temporary upstream server error (`503 UNAVAILABLE`), or upstream deadline timeout (`504 DEADLINE_EXCEEDED`) before any tokens are streamed, Orvix automatically advances to `gemini-3.1-flash-lite` without re-invoking the failing model.
+  - *Availability Notice*: The automated fallback strategy helps maintain availability during temporary load spikes, but does not guarantee that every Gemini timeout is eliminated or that every model is continuously available under all network, regional, or quota conditions.
+- **Production Verification**:
+  - In production testing, live streaming was successfully verified using `gemini-3.1-flash-lite`.
+  - Streaming completed cleanly with a normal `STOP` finish reason.
+  - The Edit & Resend flow was subsequently tested and verified in production, demonstrating proper branch truncation and isolated re-generation.
 - **Cross-Provider Recovery**: If an active cloud provider fails or goes offline, Orvix provides a **"Switch Provider & Retry"** button that redirects the exact prompt to an alternate provider without retyping. When offline, Orvix offers a one-click **"Switch to Browser AI"** button.
 
 ### Zero-Key Simulation Mode
@@ -841,6 +852,13 @@ Clicking an image card opens `DocumentPreviewModal.jsx` with two inspection tabs
 - For exhaustive prompts, `detectLargeResponseIntent()` divides massive responses into coherent sections.
 - When Part 1 finishes, the assistant signs off with a clear continuation notice, and an interactive **`[ → Continue response ]`** chip appears above the composer.
 - Clicking the chip or typing phrases like `"Continue"` triggers the next section while preserving the original prompt and attached documents.
+
+### Edit & Resend Flow with Clean Branch Truncation
+
+- **In-Place Prompt Revision**: Users can edit any previously sent user message directly within the conversation thread by clicking the **Edit** (`Pencil`) action button on the message card.
+- **Clean Branch Truncation**: Editing a prior message automatically truncates subsequent downstream messages from that point forward in the active conversation thread. This ensures that the AI model receives a clean, non-contradictory context window reflecting the edited intent without being confused by obsolete future turns.
+- **Request Isolation & Stale Stream Safety**: Coordinated through `src/services/requestIsolationService.js`, initiating an edit immediately supersedes any active generation in that chat, aborts in-flight network connections, and blocks late-arriving chunks from corrupting the newly generated response.
+- **Production Verification**: The Edit & Resend flow was verified in live production testing, confirming responsive branch truncation, clean SSE streaming, and zero cross-request state leakage.
 
 ### Conversation Pinning & Client-Side Export
 
@@ -1039,6 +1057,40 @@ Orvix is pre-configured with `vercel.json` and dedicated entry points in `api/`:
 | **`EROFS: read-only file system`** | Serverless deployment write restriction | Orvix stages uploads in memory via `multer.memoryStorage()`, preventing local disk write errors. |
 | **Scanned PDF shows no text** | PDF contains image scans without a text layer | Use the Image upload option to extract text via the server-side OCR engine. |
 | **HEIC image preview blank** | Browsers cannot render raw HEIC in `<img>` | Orvix displays an informational fallback card with full text inspection in the modal dialog. |
+| **Gemini timeout (504 DEADLINE_EXCEEDED) / 503 UNAVAILABLE** | Upstream Gemini model experiencing temporary demand spikes or response header deadline exceeded | Orvix automatically advances to `gemini-3.1-flash-lite` on pre-stream timeouts. If all cloud attempts fail, click **"Switch Provider & Retry"** to query Groq or OpenRouter, or click **"Switch to Browser AI"** to run local inference. Inspect Vercel runtime logs and DevTools Network EventStream for diagnostics. |
+
+### Troubleshooting Gemini Timeouts & Streaming (DevTools & Vercel)
+
+When troubleshooting streaming completions or intermittent upstream latency on serverless deployments:
+
+#### 1. Inspecting Vercel Runtime Logs
+1. Navigate to the **Vercel Dashboard** and open your Orvix project.
+2. Select the **Deployments** tab and click on the active production deployment.
+3. Open the **Logs** (or **Runtime Logs**) tab.
+4. Filter log entries by searching for `/api/chat` or filtering by HTTP status codes `504` or `503`.
+5. Review the structured diagnostic log entries generated by Orvix's diagnostic logger:
+   ```text
+   [AI Diagnostic][provider timeout] Provider: gemini | Model: gemini-3.8-flash | Phase: pre-stream | Status: HTTP 504 [DEADLINE_EXCEEDED] | Action: Will retry (attempt 2/2) | Sanitized: The request to Google Gemini timed out...
+   ```
+6. **Log Retention Notice**: Log retention windows and real-time log search capabilities depend on your active Vercel plan (e.g., Vercel Hobby accounts provide 1-hour log retention, whereas Pro and Enterprise tiers offer extended retention and external log drain integrations).
+7. **Security Guarantee**: All server-side error logging runs through `sanitizeErrorLog`, ensuring API keys, authorization tokens, and personal credentials are never exposed in log outputs.
+
+#### 2. Verifying `/api/chat` Streaming Responses in Browser DevTools
+1. Open your browser's Developer Tools (`F12`, or `Ctrl + Shift + I` / `Cmd + Option + I`).
+2. Switch to the **Network** tab and click the **Fetch/XHR** filter.
+3. Submit a prompt using Google Gemini in the Orvix conversation area.
+4. Click on the active `/api/chat` POST request in the network list.
+5. Select the **Response** (or **EventStream**) sub-tab to inspect raw SSE events as they arrive:
+   - Initial Header Priming: `: prime` (confirms sub-50ms TTFB connection establishment)
+   - Periodic Heartbeat: `: keepalive` (emitted every 8s to prevent proxy idle disconnection)
+   - Stream Initialization: `data: {"type":"start","modelUsed":"gemini-3.8-flash","provider":"gemini"}` (or fallback model `gemini-3.1-flash-lite`)
+   - Text Chunks: `data: {"type":"chunk","text":"..."}`
+   - Stream Finalization: `data: {"type":"done","text":"...","modelUsed":"...","finishReason":"STOP"}`
+6. If a pre-stream timeout occurs before token generation starts, you will observe a structured error frame:
+   ```json
+   data: {"type":"error","code":504,"status":"DEADLINE_EXCEEDED","provider":"gemini","retryable":false,"canFallback":true}
+   ```
+   This confirms that the server properly flagged the error as fallback-eligible without emitting broken partial text.
 
 ---
 
@@ -1071,7 +1123,15 @@ Orvix is pre-configured with `vercel.json` and dedicated entry points in `api/`:
 
 Orvix adheres to Semantic Versioning (`MAJOR.MINOR.PATCH`). Below is the concise, scannable history of all releases and development milestones.
 
-### v0.2.1 — Empty New Chat Hero & Responsive CSS Refinement *(Current)*
+### v0.2.2 — Gemini Reliability, Fallback Hardening & Production Verification *(Current)*
+- **Gemini Model Configuration & Automated Failover**: Established `gemini-3.8-flash` as the primary default model and `gemini-3.1-flash-lite` as the verified fallback candidate (`fallbackCandidates = ['gemini-3.8-flash', 'gemini-3.1-flash-lite']`). Automatically reroutes requests upon encountering upstream rate limits (`429`), temporary server unavailability (`503 UNAVAILABLE`), or deadline timeouts (`504 DEADLINE_EXCEEDED`) without repeating the failing model.
+- **SSE Streaming Architecture & Latency Safeguards**: Introduced immediate SSE header priming (`: prime\n\n` within 50ms), reverse proxy buffering bypass (`X-Accel-Buffering: no`), and active 8-second keepalive heartbeats (`: keepalive\n\n`) to eliminate idle socket drops on Vercel and edge proxies during upstream model initialization.
+- **Strict Fallback Boundaries**: Implemented strict pre-stream vs. mid-stream error boundaries. Pre-chunk timeouts allow clean retries or automated failover (`partial: false, canFallback: true`), while mid-stream errors strictly forbid failover (`partial: true, canFallback: false`) to prevent duplicate text replay.
+- **Successful Production Verification**: Validated live streaming response generation using `gemini-3.1-flash-lite`, confirming clean token streaming and normal `STOP` completion. Verified the Edit & Resend message revision flow in production with clean branch truncation and isolated execution.
+- **Audio Pipeline Verification**: Verified `/api/transcribe` dual pipeline combining Groq Whisper (`whisper-large-v3-turbo`) with Gemini audio fallback (`gemini-3.5-transcribe` / `gemini-3.8-flash`).
+- **Comprehensive Troubleshooting Guide**: Added step-by-step diagnostic procedures for inspecting Vercel runtime logs (with plan retention notices) and verifying live `/api/chat` SSE EventStream events in browser DevTools.
+
+### v0.2.1 — Empty New Chat Hero & Responsive CSS Refinement
 - **Hero Centerpiece Sizing**: Rebalanced the empty-state Orvix logo and personalized greeting (`"What can I help you with, [username]?"`) to serve as a bold, intentional visual anchor on large laptop and desktop viewports.
 - **7-Tier Fluid CSS Clamp Sizing**: Implemented fluid responsive typography and logo dimensions (`clamp(4rem, 8vw, 7.5rem)` for the icon, `clamp(1.5rem, 3vw, 2.5rem)` for the greeting) across 7 screen widths (320px mobile to 2560px+ ultra-wide).
 - **Distraction-Free Layout**: Maintained removal of obsolete chat-mode selection chips, four duplicate mode buttons, and starter prompts, keeping focus on the clean hero and input dock.

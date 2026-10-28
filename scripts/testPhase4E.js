@@ -2202,9 +2202,9 @@ async function main() {
     // =========================================================================
     // CF-31. Switching away from Cloudflare does not leak @cf/... model IDs into other providers
     // =========================================================================
-    await runTest('CF-31. Switching away from Cloudflare strips @cf/... model IDs for Gemini, Groq, OpenRouter, Ollama, and WebLLM', async () => {
+    await runTest('CF-31. Switching away from Cloudflare strips @cf/... model IDs for Gemini, Groq, OpenRouter, and WebLLM', async () => {
       const cfModel = '@cf/meta/llama-3.1-8b-instruct';
-      for (const targetProvider of ['gemini', 'groq', 'openrouter', 'ollama', 'webllm']) {
+      for (const targetProvider of ['gemini', 'groq', 'openrouter', 'webllm']) {
         const compat = checkModelCompatibilityForProvider(targetProvider, cfModel);
         assert.equal(compat.compatible, false, `Expected ${cfModel} to be incompatible with ${targetProvider}`);
         const sanitized = sanitizeModelForProvider(targetProvider, cfModel);

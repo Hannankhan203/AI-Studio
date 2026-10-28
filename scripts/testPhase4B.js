@@ -335,7 +335,6 @@ try {
           assert.strictEqual(payload.retryable, false);
           assert.strictEqual(payload.canFallback, true);
           assert.ok(Array.isArray(payload.suggestedProviders));
-          assert.ok(payload.suggestedProviders.includes('ollama'));
           assert.ok(payload.suggestedProviders.includes('webllm'));
           assert.ok(
             !payload.suggestedProviders.includes('groq'),
@@ -423,7 +422,6 @@ try {
         assert.strictEqual(cfg.groqConfigured, false);
         assert.strictEqual(cfg.openrouterConfigured, false, 'Placeholder key must report false');
         assert.strictEqual(cfg.cloudflareConfigured, true);
-        assert.strictEqual(cfg.ollamaSupported, true);
         assert.strictEqual(cfg.webllmSupported, true);
         assert.strictEqual(cfg.demoModeEnabled, false);
 
@@ -452,7 +450,6 @@ try {
           ).map((p) => p.id);
           assert.ok(fallbacksFromGroq.includes('gemini'));
           assert.ok(fallbacksFromGroq.includes('cloudflare'));
-          assert.ok(fallbacksFromGroq.includes('ollama'));
           assert.ok(fallbacksFromGroq.includes('webllm'));
           assert.ok(
             !fallbacksFromGroq.includes('openrouter'),
@@ -519,10 +516,6 @@ try {
       assert.strictEqual(sanitizeModelForProvider('openrouter', 'gemini-2.5-flash'), null);
       assert.strictEqual(sanitizeModelForProvider('openrouter', '@cf/meta/llama-3.1-8b-instruct'), null);
       assert.strictEqual(sanitizeModelForProvider('cloudflare', 'openai/gpt-oss-120b'), null);
-      assert.strictEqual(
-        sanitizeModelForProvider('ollama', 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC'),
-        null
-      );
       assert.strictEqual(sanitizeModelForProvider('webllm', 'qwen2.5:1.5b'), null);
 
       // Valid provider models preserved (and retired Llama 3.3 migrated on Groq)
@@ -539,7 +532,6 @@ try {
         sanitizeModelForProvider('cloudflare', '@cf/meta/llama-3.1-8b-instruct'),
         '@cf/meta/llama-3.1-8b-instruct'
       );
-      assert.strictEqual(sanitizeModelForProvider('ollama', 'qwen2.5:1.5b'), 'qwen2.5:1.5b');
       assert.strictEqual(
         sanitizeModelForProvider('webllm', 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC'),
         'Qwen2.5-1.5B-Instruct-q4f16_1-MLC'
@@ -596,7 +588,6 @@ try {
         { provider: 'groq', model: 'gemini-2.5-flash' },
         { provider: 'openrouter', model: '@cf/meta/llama-3.1-8b-instruct' },
         { provider: 'cloudflare', model: 'openrouter/free' },
-        { provider: 'ollama', model: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC' },
         { provider: 'gemini', model: 'bad model with spaces' }
       ];
 
@@ -645,14 +636,14 @@ await runTest(
   async () => {
     const mockServer = await startLocalMockServer();
     try {
-      // 5A: Stopped local Ollama 503 with retryable: false
+      // 5A: Stopped cloud 503 with retryable: false
       mockServer.setHandler((_req, res) => {
         res.writeHead(503, { 'Content-Type': 'application/json' });
         res.end(
           JSON.stringify({
-            error: 'Local AI (Ollama) is unavailable at http://127.0.0.1:11434.',
+            error: 'Groq service is unavailable.',
             status: 'UNAVAILABLE',
-            provider: 'ollama',
+            provider: 'groq',
             retryable: false,
             canFallback: false
           })
@@ -661,7 +652,7 @@ await runTest(
 
       await withRelativeFetchBase(mockServer.baseUrl, async () => {
         await assert.rejects(
-          () => streamAIMessage({ provider: 'ollama', prompt: 'Hello local' }),
+          () => streamAIMessage({ provider: 'groq', prompt: 'Hello cloud' }),
           (err) => {
             assert.strictEqual(err.code, 503);
             assert.strictEqual(err.retryable, false);
@@ -672,7 +663,7 @@ await runTest(
       assert.strictEqual(
         mockServer.requests.length,
         1,
-        'Stopped Ollama 503 with retryable: false must execute exactly 1 request'
+        'Stopped provider 503 with retryable: false must execute exactly 1 request'
       );
 
       // 5B: Gemini 503 where server already exhausted its internal retry loop
@@ -1033,7 +1024,7 @@ await runTest(
       assert.strictEqual(onlineRes.allowed, true);
     }
 
-    for (const localProv of ['webllm', 'ollama']) {
+    for (const localProv of ['webllm']) {
       const offlineLocal = evaluateOfflineProviderGuard({ provider: localProv, isOnline: false });
       assert.strictEqual(offlineLocal.allowed, true);
     }

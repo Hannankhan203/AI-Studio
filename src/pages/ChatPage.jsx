@@ -495,7 +495,7 @@ export default function ChatPage() {
 
   /**
    * Shared offline guard enforced before every user-initiated cloud AI action.
-   * Permits local providers ('webllm', 'ollama') offline while blocking cloud
+   * Permits local provider ('webllm') offline while blocking cloud
    * providers ('gemini', 'groq', 'openrouter', 'cloudflare') before mutating state.
    */
   const guardOfflineProviderAction = (targetProvider) => {
@@ -1013,7 +1013,7 @@ export default function ChatPage() {
       promptText
     });
 
-    const isLocalProvider = normalized.provider === 'ollama' || normalized.provider === 'webllm';
+    const isLocalProvider = normalized.provider === 'webllm';
     const canSwitchProvider = normalized.canFallback && !isLocalProvider;
 
     return {
@@ -1306,7 +1306,7 @@ export default function ChatPage() {
 
           processedAttachments = localExtractedAttachments;
         } else {
-          // Online upload path (or cloud / Ollama provider)
+          // Online upload path (or cloud provider)
           const uploadController = new AbortController();
           const UPLOAD_TIMEOUT_MS = 300000;
           let isTimeout = false;
@@ -1562,9 +1562,7 @@ export default function ChatPage() {
                   userMsg = 'Attachment upload was cancelled or timed out. Please try again.';
                 }
               } else if (userMsg.toLowerCase().includes('failed to fetch') || userMsg.toLowerCase().includes('networkerror')) {
-                userMsg = !isBrowserOnline() || submitProvider === 'ollama'
-                  ? 'Could not reach the local Orvix backend server (/api/upload). Please verify the local server is running.'
-                  : 'Network error while connecting to upload server. Please verify the server is running and check your connection.';
+                userMsg = 'Network error while connecting to upload server. Please verify the server is running and check your connection.';
               }
 
               return failPreflightIfActive(`Failed to upload attachments: ${userMsg}`);
@@ -2139,9 +2137,7 @@ export default function ChatPage() {
 
     const rawChosenModel = typeof targetProvider === 'object' && targetProvider?.model
       ? targetProvider.model
-      : (chosenProvider === 'ollama'
-          ? 'qwen2.5:1.5b'
-          : chosenProvider === 'webllm'
+      : (chosenProvider === 'webllm'
           ? webllmModelId
           : chosenProvider === 'groq'
           ? 'openai/gpt-oss-120b'
@@ -2583,11 +2579,7 @@ export default function ChatPage() {
           />
 
           <span className="persistence-alert-text">
-            {selectedProvider === 'ollama'
-              ? isCloudEnabled
-                ? 'Offline mode — Local AI (Ollama) is ready. Messages are saved locally and will sync to Cloud Firestore when internet reconnects.'
-                : 'Offline mode — Local AI (Ollama) and local conversation history are active.'
-              : selectedProvider === 'webllm'
+            {selectedProvider === 'webllm'
               ? (webllmState.status === 'ready' || webllmState.isCached)
                 ? (appShellState.isAppShellCached
                     ? `Offline mode — App shell & ${webllmState.modelId ? (WEBLLM_MODEL_CATALOG[webllmState.modelId]?.shortLabel || 'Browser AI') : 'Browser AI'} are cached on this device. Supported documents (PDF, DOCX, PPTX, TXT, MD, CSV, JSON, XML) can be extracted locally.`
@@ -2600,7 +2592,7 @@ export default function ChatPage() {
               : 'You are offline — Cloud AI providers and Firebase require internet. Switch to Browser AI (WebLLM) to chat locally.'}
           </span>
 
-          {selectedProvider !== 'ollama' && selectedProvider !== 'webllm' && (
+          {selectedProvider !== 'webllm' && (
             <div className="offline-switch-actions">
               <button
                 type="button"
@@ -2608,13 +2600,6 @@ export default function ChatPage() {
                 onClick={() => handleSelectProvider('webllm')}
               >
                 Switch to Browser AI
-              </button>
-              <button
-                type="button"
-                className="offline-switch-btn"
-                onClick={() => handleSelectProvider('ollama')}
-              >
-                Switch to Ollama
               </button>
             </div>
           )}
