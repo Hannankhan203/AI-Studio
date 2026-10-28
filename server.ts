@@ -248,10 +248,10 @@ export function sanitizeErrorLog(msg: string): string {
   if (!msg) return '';
   return String(msg)
     .replace(/Bearer\s+[A-Za-z0-9_\-\.]+/gi, 'Bearer [REDACTED]')
-    .replace(/AIza[0-9A-Za-z-_]{35}/g, '[REDACTED_API_KEY]')
-    .replace(/gsk_[A-Za-z0-9]{20,}/g, '[REDACTED_API_KEY]')
-    .replace(/sk-or-[A-Za-z0-9]{20,}/g, '[REDACTED_API_KEY]')
-    .replace(/sk-[A-Za-z0-9]{20,}/g, '[REDACTED_API_KEY]')
+    .replace(/AIza[0-9A-Za-z_\-]{35}/g, '[REDACTED_API_KEY]')
+    .replace(/gsk_[A-Za-z0-9_\-]{20,}/g, '[REDACTED_API_KEY]')
+    .replace(/sk-or-[A-Za-z0-9_\-\.]{15,}/g, '[REDACTED_API_KEY]')
+    .replace(/\bsk-[A-Za-z0-9_\-]{20,}/g, '[REDACTED_API_KEY]')
     .replace(/([?&]key=)[A-Za-z0-9_\-]+/gi, '$1[REDACTED]')
     .replace(/\b(GEMINI_API_KEY|GROQ_API_KEY|OPENROUTER_API_KEY|CLOUDFLARE_API_TOKEN|CLOUDFLARE_ACCOUNT_ID)\s*=\s*[^\s,;]+/gi, '$1=[REDACTED]')
     .replace(/(authorization:\s*)([^\r\n,;]+)/gi, '$1[REDACTED]');

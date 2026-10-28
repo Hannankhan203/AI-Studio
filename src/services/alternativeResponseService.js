@@ -87,17 +87,19 @@ export function createAlternativeRecord({
  * @returns {Object} Normalized message with alternatives structure
  */
 export function normalizeAssistantMessage(message, precedingUserMessage = null) {
-  if (!message || message.sender !== 'assistant') {
+  if (!message || message.sender === 'user') {
     return message;
   }
 
+  const baseMessage = message.sender === 'assistant' ? message : { ...message, sender: 'assistant' };
+
   const parentMessageId =
-    message.parentMessageId ||
+    baseMessage.parentMessageId ||
     (precedingUserMessage?.id ? precedingUserMessage.id : null);
 
   let alternatives = [];
 
-  if (Array.isArray(message.alternatives) && message.alternatives.length > 0) {
+  if (Array.isArray(baseMessage.alternatives) && baseMessage.alternatives.length > 0) {
     // Message already has alternatives array; ensure each alternative is well-formed
     alternatives = message.alternatives.map((alt) =>
       createAlternativeRecord({
@@ -241,6 +243,15 @@ export function updateActiveAlternativeInMessage(assistantMessage, updates = {})
   if (!assistantMessage) return assistantMessage;
 
   const normalized = normalizeAssistantMessage(assistantMessage);
+  if (!normalized || !Array.isArray(normalized.alternatives) || normalized.alternatives.length === 0) {
+    return {
+      ...(normalized || assistantMessage),
+      ...updates,
+      sender: 'assistant',
+      content: typeof updates.content === 'string' ? updates.content : (normalized?.content || assistantMessage?.content || '')
+    };
+  }
+
   const activeId = normalized.activeAlternativeId;
 
   const updatedAlternatives = normalized.alternatives.map((alt) => {

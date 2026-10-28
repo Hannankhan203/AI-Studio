@@ -775,6 +775,7 @@ export function normalizeWebLLMError(rawErr, { modelId = DEFAULT_WEBLLM_MODEL_ID
     lower.includes('modelnotfounderror') ||
     lower.includes('cannot find model record') ||
     lower.includes('unsupported model') ||
+    lower.includes('not supported') ||
     lower.includes('unsupported browser ai model') ||
     lower.includes('not in the supported browser ai')
   ) {

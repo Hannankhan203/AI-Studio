@@ -106,13 +106,13 @@ export function sanitizeErrorMessage(raw, options = {}) {
   sanitized = sanitized.replace(/AIza[0-9A-Za-z-_]{35}/g, '[REDACTED_API_KEY]');
 
   // Redact Groq API keys (gsk_...)
-  sanitized = sanitized.replace(/gsk_[A-Za-z0-9]{20,}/g, '[REDACTED_API_KEY]');
+  sanitized = sanitized.replace(/gsk_[A-Za-z0-9_\-]{20,}/g, '[REDACTED_API_KEY]');
 
   // Redact OpenRouter API keys (sk-or-...)
-  sanitized = sanitized.replace(/sk-or-[A-Za-z0-9]{20,}/g, '[REDACTED_API_KEY]');
+  sanitized = sanitized.replace(/sk-or-[A-Za-z0-9_\-\.]{15,}/g, '[REDACTED_API_KEY]');
 
   // Redact generic OpenAI / Cloudflare format keys (sk-...)
-  sanitized = sanitized.replace(/sk-[A-Za-z0-9]{20,}/g, '[REDACTED_API_KEY]');
+  sanitized = sanitized.replace(/\bsk-[A-Za-z0-9_\-]{20,}/g, '[REDACTED_API_KEY]');
 
   // Redact URL query parameter keys (e.g., ?key=... or &key=...)
   sanitized = sanitized.replace(/([?&]key=)[A-Za-z0-9_\-]+/gi, '$1[REDACTED]');
@@ -576,6 +576,8 @@ export function normalizeAIError(rawError, context = {}) {
       upperStatus === 'UNSUPPORTED_MODEL' ||
       upperStatus === 'WEBLLM_UNSUPPORTED_MODEL' ||
       lowerMsg.includes('unsupported browser ai model') ||
+      lowerMsg.includes('unsupported model') ||
+      lowerMsg.includes('not supported') ||
       lowerMsg.includes('modelnotfounderror')
     ) {
       code = STANDARD_ERROR_CODES.UNSUPPORTED_MODEL;
@@ -706,7 +708,8 @@ export function normalizeAIError(rawError, context = {}) {
     upperStatus === 'CONTEXT_LENGTH_EXCEEDED' ||
     lowerMsg.includes('context length') ||
     lowerMsg.includes('maximum context length') ||
-    lowerMsg.includes('tokens exceed')
+    lowerMsg.includes('tokens exceed') ||
+    (lowerMsg.includes('token') && (lowerMsg.includes('at most') || lowerMsg.includes('maximum') || lowerMsg.includes('exceed') || lowerMsg.includes('limit') || lowerMsg.includes('requested')))
   ) {
     code = STANDARD_ERROR_CODES.CONTEXT_LENGTH_EXCEEDED;
     category = ERROR_CATEGORIES.UPSTREAM_API_AND_MODEL;
@@ -799,15 +802,23 @@ export function normalizeAIError(rawError, context = {}) {
   else if (
     upperStatus === 'STREAM_INTERRUPTED' ||
     upperStatus === 'MALFORMED_STREAM_FRAME' ||
+    upperStatus === 'STREAM_FAILED' ||
     lowerMsg.includes('stream connection was closed') ||
     lowerMsg.includes('stream interrupted') ||
+    lowerMsg.includes('terminated mid-stream') ||
+    lowerMsg.includes('mid-stream') ||
+    lowerMsg.includes('stream failed') ||
     lowerMsg.includes('malformed') ||
     lowerMsg.includes('unexpected end of json') ||
     lowerMsg.includes('unterminated string')
   ) {
-    code = lowerMsg.includes('malformed')
-      ? STANDARD_ERROR_CODES.MALFORMED_STREAM_FRAME
-      : STANDARD_ERROR_CODES.STREAM_INTERRUPTED;
+    code =
+      upperStatus === 'MALFORMED_STREAM_FRAME' ||
+      lowerMsg.includes('malformed') ||
+      lowerMsg.includes('unexpected end of json') ||
+      lowerMsg.includes('unterminated string')
+        ? STANDARD_ERROR_CODES.MALFORMED_STREAM_FRAME
+        : STANDARD_ERROR_CODES.STREAM_INTERRUPTED;
     category = ERROR_CATEGORIES.STREAMING_AND_GENERATION;
     httpStatus = 500;
     retryable = !partial;
@@ -816,6 +827,22 @@ export function normalizeAIError(rawError, context = {}) {
       partial
         ? 'Response stream was interrupted before completion.'
         : 'The AI streaming connection was interrupted. Please try again.';
+  }
+  // 12b. EMPTY RESPONSE OR STREAM COMPLETION WITHOUT OUTPUT
+  else if (
+    upperStatus === 'EMPTY_RESPONSE' ||
+    upperStatus === 'EMPTY_STREAM_RESPONSE' ||
+    upperStatus === 'UPSTREAM_SERVICE_ERROR' ||
+    lowerMsg.includes('empty response') ||
+    lowerMsg.includes('empty completed response') ||
+    lowerMsg.includes('stream completed without returning any response')
+  ) {
+    code = STANDARD_ERROR_CODES.UPSTREAM_SERVICE_ERROR;
+    category = ERROR_CATEGORIES.STREAMING_AND_GENERATION;
+    httpStatus = 502;
+    retryable = !partial;
+    canFallback = !isLocalProvider;
+    userMessage = 'The AI service returned an empty response. Please try again or switch providers.';
   }
   // 13. UPSTREAM SERVICE TEMPORARY OUTAGES (502 / 503)
   else if (
@@ -826,7 +853,7 @@ export function normalizeAIError(rawError, context = {}) {
     code = STANDARD_ERROR_CODES.BAD_GATEWAY;
     category = ERROR_CATEGORIES.UPSTREAM_API_AND_MODEL;
     httpStatus = 502;
-    retryable = true;
+    retryable = !partial;
     canFallback = !isLocalProvider;
     userMessage =
       'The AI gateway returned a temporary upstream error (502). Please try again in a few moments.';
@@ -841,7 +868,7 @@ export function normalizeAIError(rawError, context = {}) {
     code = STANDARD_ERROR_CODES.SERVICE_UNAVAILABLE;
     category = ERROR_CATEGORIES.UPSTREAM_API_AND_MODEL;
     httpStatus = 503;
-    retryable = true;
+    retryable = !partial;
     canFallback = !isLocalProvider;
     userMessage =
       'The AI service is currently experiencing high demand. Spikes in demand are usually temporary. Please try again in a few moments.';
@@ -875,18 +902,33 @@ export function normalizeAIError(rawError, context = {}) {
     retryable = rawError.retryable;
   }
 
+  if (typeof context.canFallback === 'boolean') {
+    canFallback = context.canFallback;
+  } else if (isObject && typeof rawError.canFallback === 'boolean') {
+    canFallback = rawError.canFallback;
+  }
+
   // If server retries were already exhausted, never retry again automatically
   if (rawError?.serverRetriesExhausted === true) {
     retryable = false;
   }
 
+  // CRITICAL RETRY & PARTIAL INVARIANT:
+  // If partial output was emitted, retryable must strictly be false to avoid duplicating user-visible text
+  if (partial) {
+    retryable = false;
+  }
+
+  // CRITICAL CANCELLATION INVARIANT:
+  // Cancellation is never retryable and never fallback-eligible, regardless of caller hints
+  if (cancelled || code === STANDARD_ERROR_CODES.REQUEST_CANCELLED || code === STANDARD_ERROR_CODES.REQUEST_ABORTED) {
+    retryable = false;
+    canFallback = false;
+  }
+
   // ENFORCE PRIVACY INVARIANT: Ollama and WebLLM must strictly have canFallback: false
   if (isLocalProvider) {
     canFallback = false;
-  } else if (typeof context.canFallback === 'boolean') {
-    canFallback = context.canFallback;
-  } else if (isObject && typeof rawError.canFallback === 'boolean') {
-    canFallback = rawError.canFallback;
   }
 
   const suggestedProviders =

@@ -491,7 +491,9 @@ export function parseRouterError(rawError, statusCode = 500, providerHint = null
   err.cancelled = false;
   err.partial = Boolean(rawError?.partial);
   err.partialText = typeof rawError?.partialText === 'string' ? rawError.partialText : '';
-  if (explicitRetryable === false || isOllamaContext) {
+  if (err.partial || (typeof err.partialText === 'string' && err.partialText.trim().length > 0)) {
+    err.retryable = false;
+  } else if (explicitRetryable === false || isOllamaContext) {
     err.retryable = false;
   } else if (typeof explicitRetryable === 'boolean') {
     err.retryable = explicitRetryable;
@@ -508,13 +510,20 @@ export function parseRouterError(rawError, statusCode = 500, providerHint = null
   } else if (code === 413 || status === 'PAYLOAD_TOO_LARGE') {
     if (normalizedHint) err.provider = normalizedHint;
     err.canFallback = false;
-  } else if (normalizedHint) {
-    err.provider = normalizedHint;
+  } else {
+    if (normalizedHint) err.provider = normalizedHint;
+    const defaultCanFallback = !isOllamaContext && !isWebLLMContext && code !== 400 && code !== 413;
+    err.canFallback =
+      isObjectInput && typeof rawError.canFallback === 'boolean'
+        ? rawError.canFallback
+        : defaultCanFallback;
   }
   if (isObjectInput && typeof rawError.canFallback === 'boolean') {
     // Local privacy invariant: Ollama and WebLLM must NEVER have canFallback: true
     if (!isOllamaContext && !isWebLLMContext) {
       err.canFallback = rawError.canFallback;
+    } else {
+      err.canFallback = false;
     }
   }
   if (isObjectInput && Array.isArray(rawError.suggestedProviders)) {
