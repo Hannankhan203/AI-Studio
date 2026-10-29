@@ -53,7 +53,8 @@ export function classifySimpleGreetingIntent(prompt, options = {}) {
   if (
     options?.hasAttachments === true ||
     options?.isContinuation === true ||
-    (Array.isArray(options?.attachments) && options.attachments.length > 0)
+    (Array.isArray(options?.attachments) && options.attachments.length > 0) ||
+    (Array.isArray(options?.availableDocs) && options.availableDocs.length > 0)
   ) {
     return defaultResult;
   }
@@ -91,7 +92,8 @@ export function classifySimpleGreetingIntent(prompt, options = {}) {
     isSimpleGreeting: true,
     normalizedGreeting: normalized,
     maxContextMessages: 2,
-    maxOutputTokens: 256
+    maxOutputTokens: 256,
+    maxTokens: 256
   };
 }
 

@@ -1193,6 +1193,8 @@ export default function ChatPage() {
       return false;
     }
 
+    isSubmittingRef.current = true;
+
     const initialChatId = activeChatIdRef.current;
     const submitProvider = selectedProvider;
     const preflightEntry = requestControllerRef.current.beginRequest({

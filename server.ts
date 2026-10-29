@@ -25,7 +25,8 @@ import {
   adaptDocumentContextForProvider,
   formatOpenAIMessages,
   isVisionCapableProvider,
-  isImageAttachment
+  isImageAttachment,
+  classifySimpleGreetingIntent
 } from './src/services/documentContextService.js';
 // @ts-ignore - Multi-part large response handling service
 import {
@@ -3605,252 +3606,274 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
     }
     const validatedClientModel: string | null = modelValidation.model;
 
-    // Associate attachments sent in this turn with the conversation
-    if (conversationId && Array.isArray(attachments)) {
-      let docSet = conversationDocuments.get(conversationId);
-      if (!docSet) {
-        docSet = new Set<string>();
-        conversationDocuments.set(conversationId, docSet);
-      }
-      for (const att of attachments) {
-        if (att?.id) {
-          docSet.add(att.id);
-          const existing = fileRegistry.get(att.id);
-          if (existing) {
-            existing.conversationId = conversationId;
-          } else if (att.extraction) {
-            fileRegistry.set(att.id, {
-              id: att.id,
-              originalName: att.originalName || att.name || 'document',
-              diskFilename: att.id,
-              mimeType: att.type || att.mimeType || 'application/octet-stream',
-              extension: att.extension || '',
-              size: att.size || 0,
-              formattedSize: att.formattedSize || '',
-              status: att.status || 'ready',
-              uploadedAt: att.uploadedAt || new Date().toISOString(),
-              expiresAt: Date.now() + TEMP_FILE_TTL_MS,
-              conversationId,
-              extraction: att.extraction
-            });
+    // Classify if prompt is a standalone greeting with zero attachments
+    // @ts-ignore
+    const greetingCheck = classifySimpleGreetingIntent(prompt, {
+      attachments: Array.isArray(attachments) ? attachments : [],
+      isContinuation
+    });
+    const isGreeting = Boolean(greetingCheck.isSimpleGreeting);
+
+    const availableDocs: DocumentData[] = [];
+    let prepDoc: PreparedDocumentContext;
+    let isLikelyLarge = false;
+    let multiPartAugmentation = '';
+
+    if (!isGreeting) {
+      // Associate attachments sent in this turn with the conversation
+      if (conversationId && Array.isArray(attachments)) {
+        let docSet = conversationDocuments.get(conversationId);
+        if (!docSet) {
+          docSet = new Set<string>();
+          conversationDocuments.set(conversationId, docSet);
+        }
+        for (const att of attachments) {
+          if (att?.id) {
+            docSet.add(att.id);
+            const existing = fileRegistry.get(att.id);
+            if (existing) {
+              existing.conversationId = conversationId;
+            } else if (att.extraction) {
+              fileRegistry.set(att.id, {
+                id: att.id,
+                originalName: att.originalName || att.name || 'document',
+                diskFilename: att.id,
+                mimeType: att.type || att.mimeType || 'application/octet-stream',
+                extension: att.extension || '',
+                size: att.size || 0,
+                formattedSize: att.formattedSize || '',
+                status: att.status || 'ready',
+                uploadedAt: att.uploadedAt || new Date().toISOString(),
+                expiresAt: Date.now() + TEMP_FILE_TTL_MS,
+                conversationId,
+                extraction: att.extraction
+              });
+            }
           }
         }
       }
-    }
 
-    // Collect available documents for this specific conversation (Requirement 3: strict conversation isolation)
-    // Collect available documents for this specific conversation (Requirement 3: strict conversation isolation)
-    const availableDocs: DocumentData[] = [];
-    const seenDocIds = new Set<string>();
+      // Collect available documents for this specific conversation (Requirement 3: strict conversation isolation)
+      const seenDocIds = new Set<string>();
 
-    const addDocIfValid = (docData: DocumentData, fromConvId?: string) => {
-      // Never use a document associated with a different conversation!
-      if (fromConvId && conversationId && fromConvId !== conversationId) {
-        return;
+      const addDocIfValid = (docData: DocumentData, fromConvId?: string) => {
+        // Never use a document associated with a different conversation!
+        if (fromConvId && conversationId && fromConvId !== conversationId) {
+          return;
+        }
+        const docKey = docData.fileId || docData.id || (docData.originalName ? `${docData.originalName}_${docData.sizeBytes || 0}` : docData.filename);
+        if (docKey && !seenDocIds.has(docKey)) {
+          seenDocIds.add(docKey);
+          availableDocs.push(docData);
+        }
+      };
+
+      // 1. Current turn attachments (Highest priority: explicitly attached to this request)
+      const currentTurnAttachmentId = Array.isArray(attachments) && attachments[0]?.id ? String(attachments[0].id) : undefined;
+      if (Array.isArray(attachments)) {
+        for (const att of attachments) {
+          if (!att?.id) continue;
+          const record = fileRegistry.get(att.id);
+          if (record && !record.extraction) {
+            try {
+              const ext = path.extname(record.diskFilename).toLowerCase();
+              const isImg =
+                ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif'].includes(ext) ||
+                record.mimeType.startsWith('image/');
+              const fullDiskPath = path.join(UPLOAD_DIR, record.diskFilename);
+              const inputSource = record.buffer || (fs.existsSync(fullDiskPath) ? fullDiskPath : null);
+              if (inputSource) {
+                const isOfflineChat = Boolean(req.body?.offline);
+                const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || null;
+
+                if (isImg) {
+                  record.extraction = (await extractImageText(
+                    inputSource,
+                    record.originalName,
+                    ext,
+                    record.mimeType,
+                    record.id,
+                    record.dimensions,
+                    geminiKey,
+                    { offline: isOfflineChat }
+                  )) as any;
+                  record.status = record.extraction?.status === 'error' ? 'error' : 'ready';
+                } else {
+                  record.extraction = (await extractDocumentContent(
+                    inputSource,
+                    record.originalName,
+                    ext,
+                    record.mimeType,
+                    record.id,
+                    { offline: isOfflineChat, apiKey: geminiKey }
+                  )) as any;
+                }
+              }
+            } catch (lazyErr) {
+              console.warn('[Extraction] On-demand extraction error:', lazyErr);
+              logAIDiagnostic({
+                category: 'attachment/context processing failure',
+                provider: String(req.body?.provider || 'unknown'),
+                model: String(req.body?.model || 'unknown'),
+                phase: 'attachment',
+                sanitizedMessage: `Extraction failed for attachment: ${(lazyErr as Error)?.message || lazyErr}`
+              });
+            }
+          }
+
+          const rawExtraction = record?.extraction || att.extraction;
+          if (rawExtraction) {
+            const originalName = record?.originalName || att.originalName || att.name || (rawExtraction as any).originalName || 'document';
+            const extName = path.extname(originalName).toLowerCase();
+            const detectedFormat =
+              (rawExtraction as any).format ||
+              record?.extension ||
+              att.format ||
+              att.extension ||
+              (extName === '.pdf' ? 'PDF' : extName === '.docx' ? 'DOCX' : extName === '.pptx' ? 'PPTX' : extName === '.txt' ? 'TXT' : undefined);
+
+            const docData: DocumentData = {
+              ...(rawExtraction as DocumentData),
+              id: att.id,
+              fileId: att.id,
+              originalName,
+              filename: record?.diskFilename || att.name || att.originalName || (rawExtraction as any).filename || originalName,
+              format: detectedFormat || (rawExtraction as any).format,
+              mimeType: record?.mimeType || att.mimeType || att.type || (rawExtraction as any).mimeType,
+              type: record?.mimeType || att.type || att.mimeType || (rawExtraction as any).mimeType,
+              sizeBytes: Number(record?.size || att.size || (rawExtraction as any).sizeBytes || 0),
+              pages: (rawExtraction as any).pages || record?.extraction?.pages,
+              isImage: Boolean((rawExtraction as any).isImage || record?.isImage || att.isImage)
+            };
+            addDocIfValid(docData, record?.conversationId || conversationId || undefined);
+          }
+        }
       }
-      const docKey = docData.fileId || docData.id || (docData.originalName ? `${docData.originalName}_${docData.sizeBytes || 0}` : docData.filename);
-      if (docKey && !seenDocIds.has(docKey)) {
-        seenDocIds.add(docKey);
-        availableDocs.push(docData);
-      }
-    };
 
-    // 1. Current turn attachments (Highest priority: explicitly attached to this request)
-    const currentTurnAttachmentId = Array.isArray(attachments) && attachments[0]?.id ? String(attachments[0].id) : undefined;
-    if (Array.isArray(attachments)) {
-      for (const att of attachments) {
-        if (!att?.id) continue;
-        const record = fileRegistry.get(att.id);
-        if (record && !record.extraction) {
-          try {
-            const ext = path.extname(record.diskFilename).toLowerCase();
-            const isImg =
-              ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.heic', '.heif'].includes(ext) ||
-              record.mimeType.startsWith('image/');
-            const fullDiskPath = path.join(UPLOAD_DIR, record.diskFilename);
-            const inputSource = record.buffer || (fs.existsSync(fullDiskPath) ? fullDiskPath : null);
-            if (inputSource) {
-              const isOfflineChat = Boolean(req.body?.offline);
-              const geminiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || null;
-
-              if (isImg) {
-                record.extraction = (await extractImageText(
-                  inputSource,
-                  record.originalName,
-                  ext,
-                  record.mimeType,
-                  record.id,
-                  record.dimensions,
-                  geminiKey,
-                  { offline: isOfflineChat }
-                )) as any;
-                record.status = record.extraction?.status === 'error' ? 'error' : 'ready';
-              } else {
-                record.extraction = (await extractDocumentContent(
-                  inputSource,
-                  record.originalName,
-                  ext,
-                  record.mimeType,
-                  record.id,
-                  { offline: isOfflineChat, apiKey: geminiKey }
-                )) as any;
+      // 2. Attachments in history of this conversation (traverse from MOST RECENT to oldest)
+      if (Array.isArray(history)) {
+        for (let i = history.length - 1; i >= 0; i--) {
+          const hMsg = history[i];
+          if (Array.isArray(hMsg?.attachments)) {
+            for (const hAtt of hMsg.attachments) {
+              if (!hAtt?.id) continue;
+              const record = fileRegistry.get(hAtt.id);
+              if (record?.extraction) {
+                addDocIfValid(record.extraction as DocumentData, record.conversationId || conversationId || undefined);
+              } else if (hAtt.extraction) {
+                const docData: any = {
+                  ...(hAtt.extraction as DocumentData),
+                  id: hAtt.id,
+                  fileId: hAtt.id,
+                  originalName: hAtt.originalName || hAtt.name,
+                  filename: hAtt.filename || hAtt.name || hAtt.originalName,
+                  mimeType: hAtt.mimeType || hAtt.type || (hAtt.extraction as any)?.mimeType,
+                  type: hAtt.type || hAtt.mimeType || (hAtt.extraction as any)?.mimeType,
+                  extension: hAtt.extension,
+                  sizeBytes: Number(hAtt.size || (hAtt.extraction as any)?.sizeBytes || 0),
+                  isImage: Boolean(hAtt.isImage || (hAtt.extraction as any)?.isImage),
+                  base64: hAtt.base64 || hAtt.dataUrl
+                };
+                addDocIfValid(docData, conversationId || undefined);
               }
             }
-          } catch (lazyErr) {
-            console.warn('[Extraction] On-demand extraction error:', lazyErr);
-            logAIDiagnostic({
-              category: 'attachment/context processing failure',
-              provider: String(req.body?.provider || 'unknown'),
-              model: String(req.body?.model || 'unknown'),
-              phase: 'attachment',
-              sanitizedMessage: `Extraction failed for attachment: ${(lazyErr as Error)?.message || lazyErr}`
-            });
-          }
-        }
-
-        const rawExtraction = record?.extraction || att.extraction;
-        if (rawExtraction) {
-          const originalName = record?.originalName || att.originalName || att.name || (rawExtraction as any).originalName || 'document';
-          const extName = path.extname(originalName).toLowerCase();
-          const detectedFormat =
-            (rawExtraction as any).format ||
-            record?.extension ||
-            att.format ||
-            att.extension ||
-            (extName === '.pdf' ? 'PDF' : extName === '.docx' ? 'DOCX' : extName === '.pptx' ? 'PPTX' : extName === '.txt' ? 'TXT' : undefined);
-
-          const docData: DocumentData = {
-            ...(rawExtraction as DocumentData),
-            id: att.id,
-            fileId: att.id,
-            originalName,
-            filename: record?.diskFilename || att.name || att.originalName || (rawExtraction as any).filename || originalName,
-            format: detectedFormat || (rawExtraction as any).format,
-            mimeType: record?.mimeType || att.mimeType || att.type || (rawExtraction as any).mimeType,
-            type: record?.mimeType || att.type || att.mimeType || (rawExtraction as any).mimeType,
-            sizeBytes: Number(record?.size || att.size || (rawExtraction as any).sizeBytes || 0),
-            pages: (rawExtraction as any).pages || record?.extraction?.pages,
-            isImage: Boolean((rawExtraction as any).isImage || record?.isImage || att.isImage)
-          };
-          addDocIfValid(docData, record?.conversationId || conversationId || undefined);
-        }
-      }
-    }
-
-    // 2. Attachments in history of this conversation (traverse from MOST RECENT to oldest)
-    if (Array.isArray(history)) {
-      for (let i = history.length - 1; i >= 0; i--) {
-        const hMsg = history[i];
-        if (Array.isArray(hMsg?.attachments)) {
-          for (const hAtt of hMsg.attachments) {
-            if (!hAtt?.id) continue;
-            const record = fileRegistry.get(hAtt.id);
-            if (record?.extraction) {
-              addDocIfValid(record.extraction as DocumentData, record.conversationId || conversationId || undefined);
-            } else if (hAtt.extraction) {
-              const docData: any = {
-                ...(hAtt.extraction as DocumentData),
-                id: hAtt.id,
-                fileId: hAtt.id,
-                originalName: hAtt.originalName || hAtt.name,
-                filename: hAtt.filename || hAtt.name || hAtt.originalName,
-                mimeType: hAtt.mimeType || hAtt.type || (hAtt.extraction as any)?.mimeType,
-                type: hAtt.type || hAtt.mimeType || (hAtt.extraction as any)?.mimeType,
-                extension: hAtt.extension,
-                sizeBytes: Number(hAtt.size || (hAtt.extraction as any)?.sizeBytes || 0),
-                isImage: Boolean(hAtt.isImage || (hAtt.extraction as any)?.isImage),
-                base64: hAtt.base64 || hAtt.dataUrl
-              };
-              addDocIfValid(docData, conversationId || undefined);
-            }
           }
         }
       }
-    }
 
-    // 3. Conversation-registered files for this conversation (traverse in reverse insertion order)
-    if (conversationId && conversationDocuments.has(conversationId)) {
-      const convSet = Array.from(conversationDocuments.get(conversationId)!).reverse();
-      for (const fileId of convSet) {
-        const record = fileRegistry.get(fileId);
-        if (record?.extraction) {
-          addDocIfValid(record.extraction as DocumentData, record.conversationId || conversationId);
+      // 3. Conversation-registered files for this conversation (traverse in reverse insertion order)
+      if (conversationId && conversationDocuments.has(conversationId)) {
+        const convSet = Array.from(conversationDocuments.get(conversationId)!).reverse();
+        for (const fileId of convSet) {
+          const record = fileRegistry.get(fileId);
+          if (record?.extraction) {
+            addDocIfValid(record.extraction as DocumentData, record.conversationId || conversationId);
+          }
         }
       }
-    }
 
-    // 4. Attachments referenced in the multi-part sequence (preserves attachment across Part 1 -> Continue -> Part 2)
-    if (isContinuation && Array.isArray(multiPartCtx.referencedAttachments)) {
-      for (const rAtt of multiPartCtx.referencedAttachments) {
-        if (!rAtt?.id) continue;
-        const record = fileRegistry.get(rAtt.id);
-        if (record?.extraction) {
-          addDocIfValid(record.extraction as DocumentData, record.conversationId || conversationId || undefined);
-        } else if (rAtt.extraction) {
-          addDocIfValid(rAtt.extraction as DocumentData, conversationId || undefined);
+      // 4. Attachments referenced in the multi-part sequence (preserves attachment across Part 1 -> Continue -> Part 2)
+      if (isContinuation && Array.isArray(multiPartCtx.referencedAttachments)) {
+        for (const rAtt of multiPartCtx.referencedAttachments) {
+          if (!rAtt?.id) continue;
+          const record = fileRegistry.get(rAtt.id);
+          if (record?.extraction) {
+            addDocIfValid(record.extraction as DocumentData, record.conversationId || conversationId || undefined);
+          } else if (rAtt.extraction) {
+            addDocIfValid(rAtt.extraction as DocumentData, conversationId || undefined);
+          }
         }
       }
+
+      // Prepare document context for the prompt (using originalPrompt when continuing)
+      const effectiveDocPrompt = isContinuation && originalPrompt ? originalPrompt : prompt;
+      const isVision = isVisionCapableProvider(
+        normalizedProvider,
+        validatedClientModel ?? undefined
+      );
+      prepDoc = prepareDocumentContext(effectiveDocPrompt, availableDocs, {
+        provider: normalizedProvider,
+        model: validatedClientModel ?? undefined,
+        isVisionCapable: isVision,
+        activeAttachmentId: currentTurnAttachmentId
+      }) as PreparedDocumentContext;
+
+      // Detect if this inquiry is likely to exceed safe response output size
+      const largeDetection = detectLargeResponseIntent({
+        prompt: effectiveDocPrompt,
+        docs: availableDocs,
+        preferences,
+        mode,
+        history
+      });
+      isLikelyLarge = largeDetection.isLikelyLarge || isContinuation;
+
+      // Multi-part prompt augmentation
+      multiPartAugmentation = buildMultiPartPromptAugmentation({
+        isLikelyLarge,
+        isContinuation,
+        partNumber,
+        originalPrompt: originalPrompt || prompt,
+        previousContentSummary,
+        provider: normalizedProvider
+      });
+
+      // If an immediate direct answer is determined (e.g. unreadable scanned file, empty doc, page out of bounds)
+      const isImageNoTextRejection =
+        prepDoc.directAnswer === 'No readable text detected in this image.' ||
+        (typeof prepDoc.directAnswer === 'string' &&
+          prepDoc.directAnswer.toLowerCase().includes('no readable text detected') &&
+          availableDocs.length > 0 &&
+          availableDocs.every((d: any) => isImageAttachment(d)));
+
+      if (prepDoc.directAnswer && !(isVision && isImageNoTextRejection)) {
+        const shouldStreamEarly = stream !== false;
+        if (!shouldStreamEarly) {
+          return res.json({
+            text: prepDoc.directAnswer,
+            modelUsed: 'Document Analyzer',
+            provider: normalizedProvider
+          });
+        }
+        initSSE(res);
+        sendSSE(res, { type: 'start', modelUsed: 'Document Analyzer', provider: normalizedProvider });
+        sendSSE(res, { type: 'chunk', text: prepDoc.directAnswer });
+        sendSSE(res, { type: 'done', text: prepDoc.directAnswer, modelUsed: 'Document Analyzer', provider: normalizedProvider });
+        res.end();
+        return;
+      }
+    } else {
+      prepDoc = {
+        formattedContext: '',
+        hasErrorsOrWarnings: false,
+        unreadableDocNotes: [],
+        targetedDocs: [],
+        scope: 'greeting',
+        isBoundedOrChunked: false
+      };
     }
 
-    // Prepare document context for the prompt (using originalPrompt when continuing)
-    const effectiveDocPrompt = isContinuation && originalPrompt ? originalPrompt : prompt;
-    const isVision = isVisionCapableProvider(
-      normalizedProvider,
-      validatedClientModel ?? undefined
-    );
-    const prepDoc: PreparedDocumentContext = prepareDocumentContext(effectiveDocPrompt, availableDocs, {
-      provider: normalizedProvider,
-      model: validatedClientModel ?? undefined,
-      isVisionCapable: isVision,
-      activeAttachmentId: currentTurnAttachmentId
-    }) as PreparedDocumentContext;
     const shouldStream = stream !== false;
-
-    // Detect if this inquiry is likely to exceed safe response output size
-    const largeDetection = detectLargeResponseIntent({
-      prompt: effectiveDocPrompt,
-      docs: availableDocs,
-      preferences,
-      mode,
-      history
-    });
-    const isLikelyLarge = largeDetection.isLikelyLarge || isContinuation;
-
-    // Multi-part prompt augmentation
-    const multiPartAugmentation = buildMultiPartPromptAugmentation({
-      isLikelyLarge,
-      isContinuation,
-      partNumber,
-      originalPrompt: originalPrompt || prompt,
-      previousContentSummary,
-      provider: normalizedProvider
-    });
-
-    // If an immediate direct answer is determined (e.g. unreadable scanned file, empty doc, page out of bounds)
-    // Note: If the model is vision-capable (Gemini) and the document is an image without OCR text or with failed OCR,
-    // do not prematurely abort with "No readable text detected" — let the image bytes reach Gemini.
-    const isImageNoTextRejection =
-      prepDoc.directAnswer === 'No readable text detected in this image.' ||
-      (typeof prepDoc.directAnswer === 'string' &&
-        prepDoc.directAnswer.toLowerCase().includes('no readable text detected') &&
-        availableDocs.length > 0 &&
-        availableDocs.every((d: any) => isImageAttachment(d)));
-
-    if (prepDoc.directAnswer && !(isVision && isImageNoTextRejection)) {
-      if (!shouldStream) {
-        return res.json({
-          text: prepDoc.directAnswer,
-          modelUsed: 'Document Analyzer',
-          provider: normalizedProvider
-        });
-      }
-      initSSE(res);
-      sendSSE(res, { type: 'start', modelUsed: 'Document Analyzer', provider: normalizedProvider });
-      sendSSE(res, { type: 'chunk', text: prepDoc.directAnswer });
-      sendSSE(res, { type: 'done', text: prepDoc.directAnswer, modelUsed: 'Document Analyzer', provider: normalizedProvider });
-      res.end();
-      return;
-    }
 
     const cleanUsername =
       typeof username === 'string' && username.trim()
@@ -3862,20 +3885,24 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
       ? `${baseSystemInstruction}\n\n${multiPartAugmentation}`
       : baseSystemInstruction;
 
-    // Shared Provider-Independent Document Context Adaptation (Requirements 2, 3, 5, 7, 8)
-    const adapted: any = adaptDocumentContextForProvider({
-      provider: normalizedProvider,
-      prompt,
-      baseSystemInstruction: fullSystemInstruction,
-      preparedContext: prepDoc
-    });
+    let effectiveSystemInstruction = fullSystemInstruction;
+    let effectivePrompt = prompt;
 
-    const effectiveSystemInstruction = adapted.effectiveSystemInstruction;
-    const effectivePrompt = adapted.effectivePrompt;
+    if (!isGreeting && prepDoc.formattedContext) {
+      // Shared Provider-Independent Document Context Adaptation (Requirements 2, 3, 5, 7, 8)
+      const adapted: any = adaptDocumentContextForProvider({
+        provider: normalizedProvider,
+        prompt,
+        baseSystemInstruction: fullSystemInstruction,
+        preparedContext: prepDoc
+      });
+      effectiveSystemInstruction = adapted.effectiveSystemInstruction;
+      effectivePrompt = adapted.effectivePrompt;
+    }
 
     // Validate image payloads for vision providers before demo/live dispatch, and enforce the deployed /api/chat request budget
     let validatedGeminiImageParts: Array<{ mimeType: string; data: string }> = [];
-    if (normalizedProvider === 'gemini') {
+    if (normalizedProvider === 'gemini' && !isGreeting && (Array.isArray(attachments) && attachments.length > 0 || availableDocs.length > 0)) {
       try {
         validatedGeminiImageParts = buildGeminiImageParts({
           attachments: Array.isArray(attachments) ? attachments : [],
@@ -3985,7 +4012,8 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
       });
 
       const imageParts: Array<{ mimeType: string; data: string }> = validatedGeminiImageParts;
-      const contents = formatGeminiHistory(history, effectivePrompt, 12, imageParts);
+      const maxGeminiHistory = isGreeting ? (greetingCheck?.maxContextMessages || 2) : 12;
+      const contents = formatGeminiHistory(history, effectivePrompt, maxGeminiHistory, imageParts);
       // Attempt sequence: max 3 attempts total (initial attempt + valid fallbacks)
       // Uses the validated Gemini model if specified, falling back to gemini-3.1-flash-lite
       const requestedGeminiModel = validatedClientModel || 'gemini-3.8-flash';
@@ -4002,11 +4030,13 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
       }));
       const maxAttempts = attemptPlan.length;
 
-      let targetGeminiTokens = 4096;
-      if (preferences?.responseLength === 'detailed' || isLikelyLarge || isContinuation) {
-        targetGeminiTokens = 8192;
-      } else if (preferences?.responseLength === 'concise') {
-        targetGeminiTokens = 1024;
+      let targetGeminiTokens = isGreeting ? 256 : 4096;
+      if (!isGreeting) {
+        if (preferences?.responseLength === 'detailed' || isLikelyLarge || isContinuation) {
+          targetGeminiTokens = 8192;
+        } else if (preferences?.responseLength === 'concise') {
+          targetGeminiTokens = 1024;
+        }
       }
 
       const geminiRequestStartTime = Date.now();
@@ -4604,10 +4634,12 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         return;
       }
 
+      const maxGroqHistory = isGreeting ? (greetingCheck?.maxContextMessages || 2) : 12;
       const messages = formatOpenAIMessages({
         systemInstruction: effectiveSystemInstruction,
         history,
-        prompt: effectivePrompt
+        prompt: effectivePrompt,
+        maxContextMessages: maxGroqHistory
       });
 
       const GROQ_ACTIVE_MODEL = 'openai/gpt-oss-120b';
@@ -4627,11 +4659,13 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
       }));
       const groqChatEndpoint = `${getGroqApiBaseUrl()}/chat/completions`;
 
-      let groqMaxTokens = 2560;
-      if (preferences?.responseLength === 'detailed' || isLikelyLarge || isContinuation) {
-        groqMaxTokens = 4096;
-      } else if (preferences?.responseLength === 'concise') {
-        groqMaxTokens = 1024;
+      let groqMaxTokens = isGreeting ? 256 : 2560;
+      if (!isGreeting) {
+        if (preferences?.responseLength === 'detailed' || isLikelyLarge || isContinuation) {
+          groqMaxTokens = 4096;
+        } else if (preferences?.responseLength === 'concise') {
+          groqMaxTokens = 1024;
+        }
       }
 
       if (!shouldStream) {
@@ -4943,6 +4977,8 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         if (upstreamGuard.isClientClosed()) return;
         initSSE(res);
         const stopHeartbeat = startSSEHeartbeat(res);
+        res.write(': prime\n\n');
+        res.flushHeaders?.();
         sendSSE(res, { type: 'start', modelUsed: selectedModel, provider: 'groq' });
 
         let fullText = '';
@@ -5324,10 +5360,12 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         return;
       }
 
+      const maxOpenRouterHistory = isGreeting ? (greetingCheck?.maxContextMessages || 2) : 12;
       const messages = formatOpenAIMessages({
         systemInstruction: effectiveSystemInstruction,
         history,
-        prompt: effectivePrompt
+        prompt: effectivePrompt,
+        maxContextMessages: maxOpenRouterHistory
       });
 
       const selectedModel = validatedClientModel || 'openrouter/free';
@@ -5381,11 +5419,13 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         };
       };
 
-      let openRouterMaxTokens = 2560;
-      if (preferences?.responseLength === 'detailed' || isLikelyLarge || isContinuation) {
-        openRouterMaxTokens = 4096;
-      } else if (preferences?.responseLength === 'concise') {
-        openRouterMaxTokens = 1024;
+      let openRouterMaxTokens = isGreeting ? 256 : 2560;
+      if (!isGreeting) {
+        if (preferences?.responseLength === 'detailed' || isLikelyLarge || isContinuation) {
+          openRouterMaxTokens = 4096;
+        } else if (preferences?.responseLength === 'concise') {
+          openRouterMaxTokens = 1024;
+        }
       }
 
       if (!shouldStream) {
@@ -5600,6 +5640,8 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         if (upstreamGuard.isClientClosed()) return;
         initSSE(res);
         const stopHeartbeat = startSSEHeartbeat(res);
+        res.write(': prime\n\n');
+        res.flushHeaders?.();
         sendSSE(res, { type: 'start', modelUsed: selectedModel, provider: 'openrouter' });
 
         let fullText = '';
@@ -6078,10 +6120,12 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
         return;
       }
 
+      const maxCloudflareHistory = isGreeting ? (greetingCheck?.maxContextMessages || 2) : 12;
       const messages = formatOpenAIMessages({
         systemInstruction: effectiveSystemInstruction,
         history,
-        prompt: effectivePrompt
+        prompt: effectivePrompt,
+        maxContextMessages: maxCloudflareHistory
       });
 
       const estimatedPromptTokens = Math.ceil(JSON.stringify(messages).length / 3.8);
@@ -6112,13 +6156,15 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
       const availableTokenHeadroom = Math.max(256, maxContextTokens - estimatedPromptTokens - 256);
 
-      let targetOutputTokens = 3072;
-      if (preferences?.responseLength === 'detailed' || isLikelyLarge || isContinuation) {
-        targetOutputTokens = 4096;
-      } else if (preferences?.responseLength === 'concise') {
-        targetOutputTokens = 1024;
-      } else if (preferences?.responseLength === 'balanced') {
-        targetOutputTokens = 2560;
+      let targetOutputTokens = isGreeting ? 256 : 3072;
+      if (!isGreeting) {
+        if (preferences?.responseLength === 'detailed' || isLikelyLarge || isContinuation) {
+          targetOutputTokens = 4096;
+        } else if (preferences?.responseLength === 'concise') {
+          targetOutputTokens = 1024;
+        } else if (preferences?.responseLength === 'balanced') {
+          targetOutputTokens = 2560;
+        }
       }
 
       const cfMaxTokens = Math.min(targetOutputTokens, availableTokenHeadroom);
@@ -6541,6 +6587,8 @@ app.post(['/api/chat', '/chat', '/'], async (req, res) => {
 
         initSSE(res);
         const stopHeartbeat = startSSEHeartbeat(res);
+        res.write(': prime\n\n');
+        res.flushHeaders?.();
         sendSSE(res, { type: 'start', modelUsed: modelId, provider: 'cloudflare' });
 
         let fullText = '';

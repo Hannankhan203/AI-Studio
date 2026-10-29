@@ -896,8 +896,8 @@ function ChatMessage({
               {formattedResponseTime && (
                 <span
                   className="response-time-badge"
-                  title={`Response time: ${formattedResponseTime}`}
-                  aria-label={`Response time: ${formattedResponseTime}`}
+                  title={`Response time: ${formattedResponseTime}${typeof message?.firstVisibleTextMs === 'number' ? ` (First text: ${formatResponseTime(message.firstVisibleTextMs)})` : ''}`}
+                  aria-label={`Response time: ${formattedResponseTime}${typeof message?.firstVisibleTextMs === 'number' ? ` (First text: ${formatResponseTime(message.firstVisibleTextMs)})` : ''}`}
                 >
                   <Timer size={11} className="response-time-icon" aria-hidden="true" />
                   <span>Response time: {formattedResponseTime}</span>

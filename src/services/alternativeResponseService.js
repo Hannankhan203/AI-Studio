@@ -53,6 +53,7 @@ export function createAlternativeRecord({
   provider = 'gemini',
   modelUsed = null,
   responseTimeMs = null,
+  firstVisibleTextMs = null,
   timestamp = '',
   createdAt = null,
   referencedAttachments = [],
@@ -69,6 +70,7 @@ export function createAlternativeRecord({
     provider: chosenProvider,
     modelUsed: cleanModel || null,
     responseTimeMs: typeof responseTimeMs === 'number' && !isNaN(responseTimeMs) ? responseTimeMs : null,
+    firstVisibleTextMs: typeof firstVisibleTextMs === 'number' && !isNaN(firstVisibleTextMs) ? firstVisibleTextMs : null,
     timestamp: timestamp || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     createdAt: typeof createdAt === 'number' && !isNaN(createdAt) ? createdAt : Date.now(),
     referencedAttachments: Array.isArray(referencedAttachments) ? [...referencedAttachments] : [],
@@ -109,6 +111,7 @@ export function normalizeAssistantMessage(message, precedingUserMessage = null) 
         provider: alt.provider || message.provider || 'gemini',
         modelUsed: alt.modelUsed || message.modelUsed || null,
         responseTimeMs: alt.responseTimeMs,
+        firstVisibleTextMs: alt.firstVisibleTextMs,
         timestamp: alt.timestamp || message.timestamp,
         createdAt: alt.createdAt,
         referencedAttachments: alt.referencedAttachments || message.referencedAttachments || [],
@@ -127,6 +130,7 @@ export function normalizeAssistantMessage(message, precedingUserMessage = null) 
         provider: message.provider || 'gemini',
         modelUsed: message.modelUsed || null,
         responseTimeMs: message.responseTimeMs,
+        firstVisibleTextMs: message.firstVisibleTextMs,
         timestamp: message.timestamp || '',
         createdAt: message.createdAt || Date.now(),
         referencedAttachments: message.referencedAttachments || [],
@@ -155,6 +159,7 @@ export function normalizeAssistantMessage(message, precedingUserMessage = null) 
     provider: activeAlt.provider,
     modelUsed: activeAlt.modelUsed,
     responseTimeMs: activeAlt.responseTimeMs,
+    firstVisibleTextMs: activeAlt.firstVisibleTextMs,
     timestamp: activeAlt.timestamp || message.timestamp,
     referencedAttachments:
       activeAlt.referencedAttachments && activeAlt.referencedAttachments.length > 0
@@ -223,6 +228,7 @@ export function switchActiveAlternativeInMessage(assistantMessage, targetAlterna
     provider: targetAlt.provider,
     modelUsed: targetAlt.modelUsed,
     responseTimeMs: targetAlt.responseTimeMs,
+    firstVisibleTextMs: targetAlt.firstVisibleTextMs,
     timestamp: targetAlt.timestamp || assistantMessage.timestamp,
     referencedAttachments:
       targetAlt.referencedAttachments && targetAlt.referencedAttachments.length > 0
@@ -274,7 +280,9 @@ export function updateActiveAlternativeInMessage(assistantMessage, updates = {})
     provider: updates.provider || activeAlt.provider,
     modelUsed: updates.modelUsed !== undefined ? updates.modelUsed : activeAlt.modelUsed,
     responseTimeMs:
-      updates.responseTimeMs !== undefined ? updates.responseTimeMs : activeAlt.responseTimeMs
+      updates.responseTimeMs !== undefined ? updates.responseTimeMs : activeAlt.responseTimeMs,
+    firstVisibleTextMs:
+      updates.firstVisibleTextMs !== undefined ? updates.firstVisibleTextMs : activeAlt.firstVisibleTextMs
   };
 }
 

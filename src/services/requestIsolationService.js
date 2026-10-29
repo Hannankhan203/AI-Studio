@@ -580,6 +580,7 @@ export async function runIsolatedPromptStream({
     }
 
     const finalResponseTime = !isStopped ? (responseTime ?? measuredResponseTimeMs) : null;
+    const finalFirstVisibleText = !isStopped ? measuredFirstVisibleTextMs : null;
     const baseExisting = findExistingAssistantMessage
       ? findExistingAssistantMessage(targetChatId, assistantMessageId)
       : null;
@@ -598,7 +599,8 @@ export async function runIsolatedPromptStream({
           content: contentToSave,
           isStreaming: false,
           isStopped: Boolean(isStopped),
-          responseTimeMs: typeof finalResponseTime === 'number' ? finalResponseTime : undefined
+          responseTimeMs: typeof finalResponseTime === 'number' ? finalResponseTime : undefined,
+          firstVisibleTextMs: typeof finalFirstVisibleText === 'number' ? finalFirstVisibleText : undefined
         }
       ),
       {
@@ -607,6 +609,8 @@ export async function runIsolatedPromptStream({
         provider: providerToFinalize || finalProvider || providerToUse || baseExisting?.provider,
         responseTimeMs:
           typeof finalResponseTime === 'number' ? finalResponseTime : baseExisting?.responseTimeMs,
+        firstVisibleTextMs:
+          typeof finalFirstVisibleText === 'number' ? finalFirstVisibleText : baseExisting?.firstVisibleTextMs,
         isStreaming: false,
         isStopped: Boolean(isStopped),
         referencedAttachments: undefined
@@ -626,6 +630,10 @@ export async function runIsolatedPromptStream({
               typeof finalResponseTime === 'number'
                 ? finalResponseTime
                 : normalized.responseTimeMs,
+            firstVisibleTextMs:
+              typeof finalFirstVisibleText === 'number'
+                ? finalFirstVisibleText
+                : normalized.firstVisibleTextMs,
             isStreaming: false,
             isStopped: Boolean(isStopped),
             referencedAttachments: undefined
@@ -946,6 +954,7 @@ export async function runIsolatedPromptStream({
         provider: finalProvider || providerToUse,
         isStreaming: false,
         responseTimeMs: measuredResponseTimeMs,
+        firstVisibleTextMs: typeof measuredFirstVisibleTextMs === 'number' ? measuredFirstVisibleTextMs : undefined,
         referencedAttachments: undefined
       });
 
