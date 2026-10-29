@@ -645,8 +645,7 @@ export async function streamAIMessage(params = {}) {
         if (!isActive()) return;
         onChunk?.(chunkText, acc);
       },
-      signal,
-      isRequestActive: isActive
+      signal
     });
   }
 

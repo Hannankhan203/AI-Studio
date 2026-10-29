@@ -323,14 +323,6 @@ let activeInitPromise = null;
 let activeInitModelId = null;
 let activeInitAbortReject = null;
 let activeInitAbortController = null;
-let activeInitSession = null;
-let activeUnloadPromise = null;
-let cachedGpuSupportResult = null;
-let cachedGpuNavigatorRef = null;
-let cachedSecureContextVal = null;
-let activeGpuCheckPromise = null;
-const inFlightCacheChecks = new Map();
-const activeDownloadSessions = new Map();
 let generationQueuePromise = Promise.resolve();
 let isGeneratingNow = false;
 let manualStopRequested = false;
@@ -338,37 +330,6 @@ let customWorkerFactory = null;
 let customEngineFactory = null;
 let customFetchFactory = null;
 let customDownloadConfig = null;
-
-let generationSequence = 0;
-let activeGenerationId = 0;
-let activeGenerationAbortCheck = null;
-
-let runtimeStats = {
-  activeWorkerCount: 0,
-  totalWorkersSpawned: 0,
-  totalWorkersTerminated: 0,
-  totalEngineInits: 0,
-  fastPathHits: 0,
-  totalGenerations: 0,
-  totalAbortedGenerations: 0,
-  rawTokenChunksReceived: 0,
-  uiChunkEmissions: 0,
-  lastTtftMs: null,
-  lastGenerationDurationMs: null,
-  activeGenerationId: 0
-};
-
-export function getWebLLMRuntimeStats() {
-  return {
-    ...runtimeStats,
-    activeGenerationId,
-    loadedModelId,
-    activeInitModelId,
-    isGeneratingNow,
-    hasEngineInstance: Boolean(engineInstance),
-    hasWorkerInstance: Boolean(workerInstance)
-  };
-}
 
 const MAX_DIAGNOSTIC_EVENTS = 80;
 const recentDiagnosticEvents = [];
@@ -579,24 +540,6 @@ export function resetWebLLMRuntimeForTesting() {
   customDownloadConfig = null;
   recentDiagnosticEvents.length = 0;
   webllmModulePromise = null;
-  cachedGpuSupportResult = null;
-  cachedGpuNavigatorRef = null;
-  cachedSecureContextVal = null;
-  activeGpuCheckPromise = null;
-  inFlightCacheChecks.clear();
-  for (const dlSession of activeDownloadSessions.values()) {
-    try {
-      dlSession.controller?.abort();
-    } catch (_) {}
-  }
-  activeDownloadSessions.clear();
-  if (activeInitSession) {
-    activeInitSession.superseded = true;
-    try {
-      activeInitSession.abortAll?.('Runtime reset for testing.');
-    } catch (_) {}
-    activeInitSession = null;
-  }
   if (activeInitAbortController) {
     try {
       activeInitAbortController.abort();
@@ -606,34 +549,15 @@ export function resetWebLLMRuntimeForTesting() {
     activeInitAbortController = null;
   }
   terminateWorkerImmediate();
-  activeUnloadPromise = null;
   generationQueuePromise = Promise.resolve();
   isGeneratingNow = false;
   manualStopRequested = false;
-  generationSequence = 0;
-  activeGenerationId = 0;
-  activeGenerationAbortCheck = null;
   activeInitPromise = null;
   activeInitModelId = null;
   activeInitAbortReject = null;
   loadedModelId = null;
-  runtimeStats = {
-    activeWorkerCount: 0,
-    totalWorkersSpawned: 0,
-    totalWorkersTerminated: 0,
-    totalEngineInits: 0,
-    fastPathHits: 0,
-    totalGenerations: 0,
-    totalAbortedGenerations: 0,
-    rawTokenChunksReceived: 0,
-    uiChunkEmissions: 0,
-    lastTtftMs: null,
-    lastGenerationDurationMs: null,
-    activeGenerationId: 0
-  };
   updateEngineState({
     status: 'idle',
-    phase: 'idle',
     modelId: DEFAULT_WEBLLM_MODEL_ID,
     loadedModelId: null,
     progress: 0,
@@ -648,28 +572,8 @@ export function resetWebLLMRuntimeForTesting() {
 
 const stateListeners = new Set();
 
-function resolvePhaseFromStatus(status) {
-  switch (status) {
-    case 'checking':
-      return 'checking';
-    case 'downloading':
-      return 'downloading';
-    case 'loading':
-      return 'initializing';
-    case 'ready':
-      return 'ready';
-    case 'generating':
-      return 'generating';
-    case 'error':
-      return 'error';
-    default:
-      return 'idle';
-  }
-}
-
 let engineState = {
   status: 'idle', // 'idle' | 'checking' | 'downloading' | 'loading' | 'ready' | 'generating' | 'error'
-  phase: 'idle', // 'idle' | 'checking' | 'downloading' | 'initializing' | 'ready' | 'generating' | 'error'
   modelId: DEFAULT_WEBLLM_MODEL_ID,
   loadedModelId: null,
   progress: 0,
@@ -682,13 +586,9 @@ let engineState = {
 };
 
 function updateEngineState(patch) {
-  const nextStatus = patch?.status !== undefined ? patch.status : engineState.status;
-  const nextPhase =
-    patch?.phase !== undefined ? patch.phase : resolvePhaseFromStatus(nextStatus);
   engineState = {
     ...engineState,
-    ...patch,
-    phase: nextPhase
+    ...patch
   };
   const snapshot = getWebLLMState();
   for (const listener of stateListeners) {
@@ -878,7 +778,7 @@ function isAbortError(err) {
  *   adapterInfo: { vendor?: string, architecture?: string, description?: string } | null
  * }>}
  */
-export async function checkWebGPUSupport({ forceRefresh = false } = {}) {
+export async function checkWebGPUSupport() {
   if (typeof window === 'undefined' || typeof navigator === 'undefined') {
     return {
       supported: false,
@@ -917,124 +817,77 @@ export async function checkWebGPUSupport({ forceRefresh = false } = {}) {
     };
   }
 
-  // Return memoized positive result when navigator.gpu reference and secure context have not changed
-  if (
-    !forceRefresh &&
-    cachedGpuSupportResult &&
-    cachedGpuSupportResult.supported &&
-    cachedGpuNavigatorRef === navigator.gpu &&
-    cachedSecureContextVal === window.isSecureContext
-  ) {
-    return cachedGpuSupportResult;
-  }
-
-  if (!forceRefresh && activeGpuCheckPromise) {
-    return activeGpuCheckPromise;
-  }
-
   const gpuTimeoutMs = customDownloadConfig?.gpuCheckTimeoutMs ?? DEFAULT_GPU_CHECK_TIMEOUT_MS;
-  activeGpuCheckPromise = (async () => {
-    try {
-      let adapter = await raceWithStageDeadline(
-        () =>
-          navigator.gpu.requestAdapter({
-            powerPreference: 'high-performance'
-          }),
-        gpuTimeoutMs,
-        (ms) => {
-          const timeoutErr = new Error(`WebGPU requestAdapter timed out after ${formatDurationSeconds(ms)}`);
-          timeoutErr.code = 'WEBGPU_ADAPTER_TIMEOUT';
-          return timeoutErr;
-        }
-      );
-
-      // Mobile / low-power laptop compatibility: fall back to default adapter if 'high-performance' returns null
-      if (!adapter) {
-        adapter = await raceWithStageDeadline(
-          () => navigator.gpu.requestAdapter(),
-          gpuTimeoutMs,
-          (ms) => {
-            const timeoutErr = new Error(`WebGPU default requestAdapter timed out after ${formatDurationSeconds(ms)}`);
-            timeoutErr.code = 'WEBGPU_ADAPTER_TIMEOUT';
-            return timeoutErr;
-          }
-        );
+  try {
+    const adapter = await raceWithStageDeadline(
+      () =>
+        navigator.gpu.requestAdapter({
+          powerPreference: 'high-performance'
+        }),
+      gpuTimeoutMs,
+      (ms) => {
+        const timeoutErr = new Error(`WebGPU requestAdapter timed out after ${formatDurationSeconds(ms)}`);
+        timeoutErr.code = 'WEBGPU_ADAPTER_TIMEOUT';
+        return timeoutErr;
       }
+    );
 
-      if (!adapter) {
-        return {
-          supported: false,
-          reasonCode: WEBLLM_ERROR_CODES.WEBGPU_ADAPTER_UNAVAILABLE,
-          message:
-            'No compatible WebGPU graphics adapter was found. Please ensure hardware acceleration is enabled in your browser settings and your GPU drivers are up to date.',
-          hasShaderF16: false,
-          maxStorageBufferBindingSize: null,
-          maxBufferSize: null,
-          adapterInfo: null
-        };
-      }
-
-      const hasShaderF16 = Boolean(adapter.features && adapter.features.has('shader-f16'));
-      const maxStorageBufferBindingSize =
-        typeof adapter.limits?.maxStorageBufferBindingSize === 'number'
-          ? adapter.limits.maxStorageBufferBindingSize
-          : null;
-      const maxBufferSize =
-        typeof adapter.limits?.maxBufferSize === 'number' ? adapter.limits.maxBufferSize : null;
-
-      let adapterInfo = null;
-      if (adapter.info) {
-        adapterInfo = {
-          vendor: adapter.info.vendor || '',
-          architecture: adapter.info.architecture || '',
-          description: adapter.info.description || ''
-        };
-      }
-
-      const isLowPowerOrMobileAdapter = Boolean(
-        !hasShaderF16 ||
-          (typeof maxBufferSize === 'number' && maxBufferSize < 512 * 1024 * 1024) ||
-          /qualcomm|adreno|mali|powervr|apple a1[0-9]|intel\(r\) uhd|intel\(r\) hd/i.test(
-            `${adapterInfo?.vendor || ''} ${adapterInfo?.architecture || ''} ${adapterInfo?.description || ''}`
-          )
-      );
-
-      const result = {
-        supported: true,
-        reasonCode: null,
-        message: null,
-        hasShaderF16,
-        maxStorageBufferBindingSize,
-        maxBufferSize,
-        adapterInfo,
-        isLowPowerOrMobileAdapter
-      };
-      cachedGpuSupportResult = result;
-      cachedGpuNavigatorRef = navigator.gpu;
-      cachedSecureContextVal = window.isSecureContext;
-      return result;
-    } catch (err) {
-      const isTimeout = err?.code === 'WEBGPU_ADAPTER_TIMEOUT';
-      if (isTimeout) {
-        logWebLLMStage('init_timeout', { subStage: 'gpu_request_adapter', timeoutMs: gpuTimeoutMs }, { level: 'warn' });
-      }
+    if (!adapter) {
       return {
         supported: false,
         reasonCode: WEBLLM_ERROR_CODES.WEBGPU_ADAPTER_UNAVAILABLE,
-        message: isTimeout
-          ? `WebGPU graphics adapter detection timed out after ${formatDurationSeconds(gpuTimeoutMs)}. Restart Chrome or update your Windows GPU driver, then retry.`
-          : 'Failed to access the WebGPU graphics adapter. Please check that hardware acceleration is enabled in your browser.',
+        message:
+          'No compatible WebGPU graphics adapter was found. Please ensure hardware acceleration is enabled in your browser settings and your GPU drivers are up to date.',
         hasShaderF16: false,
         maxStorageBufferBindingSize: null,
         maxBufferSize: null,
         adapterInfo: null
       };
-    } finally {
-      activeGpuCheckPromise = null;
     }
-  })();
 
-  return activeGpuCheckPromise;
+    const hasShaderF16 = Boolean(adapter.features && adapter.features.has('shader-f16'));
+    const maxStorageBufferBindingSize =
+      typeof adapter.limits?.maxStorageBufferBindingSize === 'number'
+        ? adapter.limits.maxStorageBufferBindingSize
+        : null;
+    const maxBufferSize =
+      typeof adapter.limits?.maxBufferSize === 'number' ? adapter.limits.maxBufferSize : null;
+
+    let adapterInfo = null;
+    if (adapter.info) {
+      adapterInfo = {
+        vendor: adapter.info.vendor || '',
+        architecture: adapter.info.architecture || '',
+        description: adapter.info.description || ''
+      };
+    }
+
+    return {
+      supported: true,
+      reasonCode: null,
+      message: null,
+      hasShaderF16,
+      maxStorageBufferBindingSize,
+      maxBufferSize,
+      adapterInfo
+    };
+  } catch (err) {
+    const isTimeout = err?.code === 'WEBGPU_ADAPTER_TIMEOUT';
+    if (isTimeout) {
+      logWebLLMStage('init_timeout', { subStage: 'gpu_request_adapter', timeoutMs: gpuTimeoutMs }, { level: 'warn' });
+    }
+    return {
+      supported: false,
+      reasonCode: WEBLLM_ERROR_CODES.WEBGPU_ADAPTER_UNAVAILABLE,
+      message: isTimeout
+        ? `WebGPU graphics adapter detection timed out after ${formatDurationSeconds(gpuTimeoutMs)}. Restart Chrome or update your Windows GPU driver, then retry.`
+        : 'Failed to access the WebGPU graphics adapter. Please check that hardware acceleration is enabled in your browser.',
+      hasShaderF16: false,
+      maxStorageBufferBindingSize: null,
+      maxBufferSize: null,
+      adapterInfo: null
+    };
+  }
 }
 
 /**
@@ -1157,89 +1010,77 @@ export async function isWebLLMModelCached(modelId = DEFAULT_WEBLLM_MODEL_ID) {
     return false;
   }
 
-  const targetId = (modelId && String(modelId).trim()) || DEFAULT_WEBLLM_MODEL_ID;
-  const existingCheck = inFlightCacheChecks.get(targetId);
-  if (existingCheck) {
-    return existingCheck;
-  }
-
   const cacheCheckTimeoutMs = customDownloadConfig?.cacheCheckTimeoutMs ?? DEFAULT_CACHE_CHECK_TIMEOUT_MS;
-  const checkPromise = (async () => {
-    try {
-      return await raceWithStageDeadline(
-        async () => {
-          const webllm = await loadWebLLMModule();
-          const record = findPrebuiltModelRecord(webllm, targetId);
-          if (!record) {
+  try {
+    return await raceWithStageDeadline(
+      async () => {
+        const webllm = await loadWebLLMModule();
+        const targetId = (modelId && String(modelId).trim()) || DEFAULT_WEBLLM_MODEL_ID;
+        const record = findPrebuiltModelRecord(webllm, targetId);
+        if (!record) {
+          return false;
+        }
+
+        const tensorsCached = await webllm.hasModelInCache(targetId, webllm.prebuiltAppConfig);
+        if (!tensorsCached) {
+          return false;
+        }
+
+        // Also verify config & WASM caches used by MLCEngine.reloadInternal() during offline startup
+        const modelBaseUrl = normalizeModelBaseUrl(record.model);
+        const chatConfigUrl = new URL('mlc-chat-config.json', modelBaseUrl).href;
+
+        const configCache = await caches.open('webllm/config');
+        const cachedConfig = await configCache.match(new Request(chatConfigUrl));
+        if (!cachedConfig) {
+          return false;
+        }
+
+        if (record.model_lib && record.model_lib.startsWith('http') && !record.model_lib.includes('localhost')) {
+          const wasmCache = await caches.open('webllm/wasm');
+          const cachedWasm = await wasmCache.match(new Request(record.model_lib));
+          if (!cachedWasm) {
             return false;
           }
+        }
 
-          const tensorsCached = await webllm.hasModelInCache(targetId, webllm.prebuiltAppConfig);
-          if (!tensorsCached) {
-            return false;
-          }
-
-          // Also verify config & WASM caches used by MLCEngine.reloadInternal() during offline startup
-          const modelBaseUrl = normalizeModelBaseUrl(record.model);
-          const chatConfigUrl = new URL('mlc-chat-config.json', modelBaseUrl).href;
-
-          const configCache = await caches.open('webllm/config');
-          const cachedConfig = await configCache.match(new Request(chatConfigUrl));
-          if (!cachedConfig) {
-            return false;
-          }
-
-          if (record.model_lib && record.model_lib.startsWith('http') && !record.model_lib.includes('localhost')) {
-            const wasmCache = await caches.open('webllm/wasm');
-            const cachedWasm = await wasmCache.match(new Request(record.model_lib));
-            if (!cachedWasm) {
-              return false;
-            }
-          }
-
-          // Also verify required tokenizer file when config JSON is readable
-          if (typeof cachedConfig.clone === 'function') {
-            try {
-              const configObj = await cachedConfig.clone().json();
-              if (configObj && Array.isArray(configObj.tokenizer_files)) {
-                const requiredTokenizerFile = configObj.tokenizer_files.includes('tokenizer.json')
-                  ? 'tokenizer.json'
-                  : configObj.tokenizer_files.includes('tokenizer.model')
-                    ? 'tokenizer.model'
-                    : null;
-                if (requiredTokenizerFile) {
-                  const modelCache = await caches.open('webllm/model');
-                  const tokenizerUrl = new URL(requiredTokenizerFile, modelBaseUrl).href;
-                  const cachedTokenizer = await modelCache.match(new Request(tokenizerUrl));
-                  if (!cachedTokenizer) {
-                    return false;
-                  }
+        // Also verify required tokenizer file when config JSON is readable
+        if (typeof cachedConfig.clone === 'function') {
+          try {
+            const configObj = await cachedConfig.clone().json();
+            if (configObj && Array.isArray(configObj.tokenizer_files)) {
+              const requiredTokenizerFile = configObj.tokenizer_files.includes('tokenizer.json')
+                ? 'tokenizer.json'
+                : configObj.tokenizer_files.includes('tokenizer.model')
+                  ? 'tokenizer.model'
+                  : null;
+              if (requiredTokenizerFile) {
+                const modelCache = await caches.open('webllm/model');
+                const tokenizerUrl = new URL(requiredTokenizerFile, modelBaseUrl).href;
+                const cachedTokenizer = await modelCache.match(new Request(tokenizerUrl));
+                if (!cachedTokenizer) {
+                  return false;
                 }
               }
-            } catch (_) {
-              // Ignore non-JSON synthetic mock responses in unit tests
             }
+          } catch (_) {
+            // Ignore non-JSON synthetic mock responses in unit tests
           }
+        }
 
-          return true;
-        },
-        cacheCheckTimeoutMs,
-        (ms) => new Error(`Cache inspection timed out after ${formatDurationSeconds(ms)}`)
-      );
-    } catch (err) {
-      logWebLLMStage(
-        'cache_check_warning',
-        { modelId: targetId, error: err?.message || String(err) },
-        { level: 'warn' }
-      );
-      return false;
-    } finally {
-      inFlightCacheChecks.delete(targetId);
-    }
-  })();
-
-  inFlightCacheChecks.set(targetId, checkPromise);
-  return checkPromise;
+        return true;
+      },
+      cacheCheckTimeoutMs,
+      (ms) => new Error(`Cache inspection timed out after ${formatDurationSeconds(ms)}`)
+    );
+  } catch (err) {
+    logWebLLMStage(
+      'cache_check_warning',
+      { modelId, error: err?.message || String(err) },
+      { level: 'warn' }
+    );
+    return false;
+  }
 }
 
 /**
@@ -1259,7 +1100,7 @@ export async function inspectWebLLMReadiness(preferredModelId = DEFAULT_WEBLLM_M
   });
 
   if (!gpuSupport.supported) {
-    if (!activeInitPromise && !activeInitSession) {
+    if (!activeInitPromise) {
       updateEngineState({
         isCached: false,
         modelId: resolvedId,
@@ -1284,7 +1125,6 @@ export async function inspectWebLLMReadiness(preferredModelId = DEFAULT_WEBLLM_M
   // Never clobber an active initialization's status/progress from a background readiness check
   if (
     activeInitPromise ||
-    activeInitSession ||
     engineState.status === 'checking' ||
     engineState.status === 'downloading' ||
     engineState.status === 'loading'
@@ -1301,20 +1141,12 @@ export async function inspectWebLLMReadiness(preferredModelId = DEFAULT_WEBLLM_M
     };
   }
 
-  // Ensure status reflects the selected model's actual state in GPU memory and clears stale errors from other models
+  // If status is 'ready' or 'generating', ensure it matches actual loaded engine in GPU memory
   let nextStatus = engineState.status;
-  let nextError = engineState.error;
-  if (engineState.status === 'generating') {
+  if (engineState.status === 'ready' || engineState.status === 'generating') {
     if (!loadedModelId || !engineInstance) {
       nextStatus = 'idle';
     }
-  } else if (engineState.status === 'error') {
-    if (engineState.modelId && engineState.modelId !== resolvedId) {
-      nextStatus = loadedModelId === resolvedId && engineInstance ? 'ready' : 'idle';
-      nextError = null;
-    }
-  } else {
-    nextStatus = loadedModelId === resolvedId && engineInstance ? 'ready' : 'idle';
   }
 
   updateEngineState({
@@ -1322,8 +1154,7 @@ export async function inspectWebLLMReadiness(preferredModelId = DEFAULT_WEBLLM_M
     isCached,
     modelId: resolvedId,
     loadedModelId,
-    hasShaderF16: gpuSupport.hasShaderF16,
-    error: nextError
+    hasShaderF16: gpuSupport.hasShaderF16
   });
 
   logWebLLMStage(
@@ -1346,7 +1177,6 @@ export async function inspectWebLLMReadiness(preferredModelId = DEFAULT_WEBLLM_M
  * @param {string} [modelId]
  */
 export async function clearWebLLMModelCache(modelId = loadedModelId || DEFAULT_WEBLLM_MODEL_ID) {
-  inFlightCacheChecks.delete(modelId);
   if (loadedModelId === modelId) {
     await destroyWebLLMEngine();
   }
@@ -2098,495 +1928,421 @@ export async function downloadModelArtifactsToCache(modelRecord, options = {}) {
     throw createAbortError();
   }
 
-  const attachDownloadWaiter = (session) => {
-    const waiter = {
-      onProgress: typeof onProgress === 'function' ? onProgress : null,
-      aborted: false
-    };
-    session.waiters.add(waiter);
-    if (session.lastProgressReport && waiter.onProgress) {
-      try {
-        waiter.onProgress(session.lastProgressReport);
-      } catch (_) {
-        // Ignore
+  const shortLabel = catalogEntry?.shortLabel || modelId;
+  const fullLabel = catalogEntry?.label || shortLabel;
+  const startMs = Date.now();
+  const modelBaseUrl = normalizeModelBaseUrl(modelRecord.model);
+  const cacheOpTimeoutMs = customDownloadConfig?.cacheOpTimeoutMs ?? DEFAULT_CACHE_OP_TIMEOUT_MS;
+
+  const openScopedCache = (scopeName) =>
+    raceWithStageDeadline(
+      () => caches.open(scopeName),
+      cacheOpTimeoutMs,
+      (ms) =>
+        new WebLLMError(
+          `Browser Cache Storage (${scopeName}) did not respond within ${formatDurationSeconds(ms)}. Ensure site data/cookies are enabled and not blocked in private browsing, then click Retry.`,
+          {
+            code: WEBLLM_ERROR_CODES.DOWNLOAD_STALLED,
+            httpCode: 504,
+            timeout: true,
+            retryable: true
+          }
+        )
+    );
+
+  const [configCache, wasmCache, modelCache] = await Promise.all([
+    openScopedCache('webllm/config'),
+    openScopedCache('webllm/wasm'),
+    openScopedCache('webllm/model')
+  ]);
+
+  logWebLLMStage('caches_opened', { modelId, scopes: 3 }, { startMs });
+
+  let lastEmitMs = 0;
+  let lastLoggedPctBucket = -1;
+  const emitDownloadProgress = ({ progress, progressPercent, progressText, force = false }) => {
+    const now = Date.now();
+    if (!force && now - lastEmitMs < 90) {
+      return;
+    }
+    lastEmitMs = now;
+    if (typeof progressPercent === 'number') {
+      const bucket = Math.floor(progressPercent / 10) * 10;
+      if (bucket > lastLoggedPctBucket) {
+        lastLoggedPctBucket = bucket;
+        logWebLLMStage(
+          'download_progress_ui',
+          {
+            modelId,
+            progressPercent,
+            progressText
+          },
+          { startMs }
+        );
       }
     }
-
-    let removeAbort = null;
-    const waitPromise = new Promise((resolve, reject) => {
-      if (signal) {
-        const handleAbort = () => {
-          waiter.aborted = true;
-          session.waiters.delete(waiter);
-          if (session.waiters.size === 0) {
-            try {
-              session.controller.abort();
-            } catch (_) {
-              // Ignore
-            }
-          }
-          reject(createAbortError());
-        };
-        if (signal.aborted) {
-          handleAbort();
-          return;
-        }
-        signal.addEventListener('abort', handleAbort, { once: true });
-        removeAbort = () => signal.removeEventListener('abort', handleAbort);
+    if (typeof onProgress === 'function') {
+      try {
+        onProgress({
+          status: 'downloading',
+          modelId,
+          progress,
+          progressPercent,
+          progressText,
+          timeElapsed: Math.max(0, (now - startMs) / 1000),
+          isCached: false
+        });
+      } catch (_) {
+        // Never allow listener exceptions to interrupt downloads
       }
-      session.promise.then(resolve, reject);
-    });
-
-    return waitPromise.finally(() => {
-      session.waiters.delete(waiter);
-      if (removeAbort) removeAbort();
-    });
+    }
   };
 
-  const existingSession = activeDownloadSessions.get(modelId);
-  if (existingSession && !existingSession.controller.signal.aborted) {
-    logWebLLMStage('download_deduped', { modelId });
-    return attachDownloadWaiter(existingSession);
+  emitDownloadProgress({
+    progress: 0,
+    progressPercent: 0,
+    progressText: `Checking model metadata for ${shortLabel}...`,
+    force: true
+  });
+
+  // 1. Ensure mlc-chat-config.json in webllm/config
+  const chatConfigUrl = new URL('mlc-chat-config.json', modelBaseUrl).href;
+  let chatConfigObj = null;
+  let configSource = 'cache';
+  const existingConfig = await readVerifiedCachedEntry(configCache, chatConfigUrl, null);
+  if (existingConfig?.response && typeof existingConfig.response.clone === 'function') {
+    try {
+      chatConfigObj = await existingConfig.response.clone().json();
+    } catch (_) {
+      chatConfigObj = null;
+    }
   }
+  if (!chatConfigObj) {
+    configSource = 'network';
+    const dlConfig = await streamArtifactToCache({
+      cache: configCache,
+      url: chatConfigUrl,
+      artifactName: 'mlc-chat-config.json',
+      modelLabel: fullLabel,
+      contentType: 'application/json',
+      expectedBytes: null,
+      stallTimeoutMs,
+      signal,
+      fetchImpl,
+      returnArrayBuffer: true
+    });
+    chatConfigObj = JSON.parse(new TextDecoder().decode(dlConfig.arrayBuffer));
+  }
+  logWebLLMStage('metadata_config_ready', { modelId, source: configSource }, { startMs });
 
-  const sessionController = new AbortController();
-  const downloadSession = {
-    modelId,
-    controller: sessionController,
-    waiters: new Set(),
-    lastProgressReport: null,
-    promise: null
-  };
-  activeDownloadSessions.set(modelId, downloadSession);
-
-  downloadSession.promise = (async () => {
-    const downloadSignal = sessionController.signal;
-    const shortLabel = catalogEntry?.shortLabel || modelId;
-    const fullLabel = catalogEntry?.label || shortLabel;
-    const startMs = Date.now();
-    const modelBaseUrl = normalizeModelBaseUrl(modelRecord.model);
-    const cacheOpTimeoutMs = customDownloadConfig?.cacheOpTimeoutMs ?? DEFAULT_CACHE_OP_TIMEOUT_MS;
-
-    const openScopedCache = (scopeName) =>
-      raceWithStageDeadline(
-        () => caches.open(scopeName),
-        cacheOpTimeoutMs,
-        (ms) =>
-          new WebLLMError(
-            `Browser Cache Storage (${scopeName}) did not respond within ${formatDurationSeconds(ms)}. Ensure site data/cookies are enabled and not blocked in private browsing, then click Retry.`,
-            {
-              code: WEBLLM_ERROR_CODES.DOWNLOAD_STALLED,
-              httpCode: 504,
-              timeout: true,
-              retryable: true
-            }
-          )
-      );
-
-    const [configCache, wasmCache, modelCache] = await Promise.all([
-      openScopedCache('webllm/config'),
-      openScopedCache('webllm/wasm'),
-      openScopedCache('webllm/model')
-    ]);
-
-    logWebLLMStage('caches_opened', { modelId, scopes: 3 }, { startMs });
-
-    let lastEmitMs = 0;
-    let lastLoggedPctBucket = -1;
-    const emitDownloadProgress = ({ progress, progressPercent, progressText, force = false }) => {
-      const now = Date.now();
-      if (!force && now - lastEmitMs < 90) {
-        return;
-      }
-      lastEmitMs = now;
-      if (typeof progressPercent === 'number') {
-        const bucket = Math.floor(progressPercent / 10) * 10;
-        if (bucket > lastLoggedPctBucket) {
-          lastLoggedPctBucket = bucket;
-          logWebLLMStage(
-            'download_progress_ui',
-            {
-              modelId,
-              progressPercent,
-              progressText
-            },
-            { startMs }
-          );
-        }
-      }
-      const report = {
-        status: 'downloading',
-        modelId,
-        progress,
-        progressPercent,
-        progressText,
-        timeElapsed: Math.max(0, (now - startMs) / 1000),
-        isCached: false
-      };
-      downloadSession.lastProgressReport = report;
-      for (const waiter of downloadSession.waiters) {
-        if (!waiter.aborted && typeof waiter.onProgress === 'function') {
-          try {
-            waiter.onProgress(report);
-          } catch (_) {
-            // Never allow listener exceptions to interrupt downloads
-          }
-        }
-      }
-    };
-
+  // 2. Ensure tensor-cache.json in webllm/model
+  const tensorCacheUrl = new URL('tensor-cache.json', modelBaseUrl).href;
+  let tensorManifest = null;
+  let manifestSource = 'cache';
+  const existingManifest = await readVerifiedCachedEntry(modelCache, tensorCacheUrl, null);
+  if (existingManifest?.response && typeof existingManifest.response.clone === 'function') {
+    try {
+      tensorManifest = await existingManifest.response.clone().json();
+    } catch (_) {
+      tensorManifest = null;
+    }
+  }
+  if (!tensorManifest) {
+    manifestSource = 'network';
     emitDownloadProgress({
       progress: 0,
       progressPercent: 0,
-      progressText: `Checking model metadata for ${shortLabel}...`,
+      progressText: `Fetching shard manifest for ${shortLabel}...`,
+      force: true
+    });
+    const dlManifest = await streamArtifactToCache({
+      cache: modelCache,
+      url: tensorCacheUrl,
+      artifactName: 'tensor-cache.json',
+      modelLabel: fullLabel,
+      contentType: 'application/json',
+      expectedBytes: null,
+      stallTimeoutMs,
+      signal,
+      fetchImpl,
+      returnArrayBuffer: true
+    });
+    tensorManifest = JSON.parse(new TextDecoder().decode(dlManifest.arrayBuffer));
+  }
+
+  const shardRecords = Array.isArray(tensorManifest?.records) ? tensorManifest.records : [];
+  const shardItems = [];
+  const seenShardUrls = new Set();
+
+  for (let i = 0; i < shardRecords.length; i++) {
+    const rec = shardRecords[i];
+    if (!rec || !rec.dataPath) continue;
+    const shardUrl = new URL(rec.dataPath, modelBaseUrl).href;
+    if (seenShardUrls.has(shardUrl)) continue;
+    seenShardUrls.add(shardUrl);
+    const expectedBytes =
+      typeof rec.nbytes === 'number' && Number.isFinite(rec.nbytes) && rec.nbytes > 0
+        ? rec.nbytes
+        : null;
+    shardItems.push({
+      index: shardItems.length + 1,
+      name: String(rec.dataPath),
+      url: shardUrl,
+      expectedBytes
+    });
+  }
+
+  // 3. Inspect which shards are already complete & byte-verified in Cache Storage
+  let completedBytes = 0;
+  let totalExpectedBytes = 0;
+  const missingShards = [];
+
+  for (const shard of shardItems) {
+    const shardExpected = shard.expectedBytes || 0;
+    totalExpectedBytes += shardExpected;
+    const cachedShard = await readVerifiedCachedEntry(modelCache, shard.url, shard.expectedBytes);
+    if (cachedShard) {
+      completedBytes += cachedShard.byteLength || shardExpected;
+    } else {
+      missingShards.push(shard);
+    }
+  }
+
+  logWebLLMStage(
+    'metadata_manifest_ready',
+    {
+      modelId,
+      source: manifestSource,
+      shardCount: shardItems.length,
+      totalMB: formatMegabytes(totalExpectedBytes)
+    },
+    { startMs }
+  );
+
+  // Check tokenizer & WASM status as well
+  const tokenizerFiles = Array.isArray(chatConfigObj?.tokenizer_files) ? chatConfigObj.tokenizer_files : [];
+  const requiredTokenizerName = tokenizerFiles.includes('tokenizer.json')
+    ? 'tokenizer.json'
+    : tokenizerFiles.includes('tokenizer.model')
+      ? 'tokenizer.model'
+      : null;
+  const tokenizerUrl = requiredTokenizerName ? new URL(requiredTokenizerName, modelBaseUrl).href : null;
+  const cachedTokenizer = tokenizerUrl ? await readVerifiedCachedEntry(modelCache, tokenizerUrl, null) : null;
+
+  const wasmUrl =
+    modelRecord.model_lib &&
+    modelRecord.model_lib.startsWith('http') &&
+    !modelRecord.model_lib.includes('localhost')
+      ? modelRecord.model_lib
+      : null;
+  const cachedWasm = wasmUrl ? await readVerifiedCachedEntry(wasmCache, wasmUrl, null) : null;
+
+  logWebLLMStage(
+    'cache_inventory',
+    {
+      modelId,
+      cachedShards: shardItems.length - missingShards.length,
+      missingShards: missingShards.length,
+      cachedTokenizer: Boolean(cachedTokenizer),
+      cachedWasm: Boolean(cachedWasm)
+    },
+    { startMs }
+  );
+
+  const estimatedFallbackTotal = (catalogEntry?.estimatedDownloadMB || 270) * 1024 * 1024;
+  const progressDenominator = Math.max(totalExpectedBytes || estimatedFallbackTotal, 1);
+
+  // 4. Bounded CDN reachability & byte-transfer diagnostic probe BEFORE downloading large weight shards
+  let verifiedCdnHost = null;
+  if (missingShards.length > 0) {
+    emitDownloadProgress({
+      progress: 0,
+      progressPercent: 0,
+      progressText: `Verifying model CDN reachability for ${shortLabel}...`,
       force: true
     });
 
-    // 1. Ensure mlc-chat-config.json in webllm/config
-    const chatConfigUrl = new URL('mlc-chat-config.json', modelBaseUrl).href;
-    let chatConfigObj = null;
-    let configSource = 'cache';
-    const existingConfig = await readVerifiedCachedEntry(configCache, chatConfigUrl, null);
-    if (existingConfig?.response && typeof existingConfig.response.clone === 'function') {
-      try {
-        chatConfigObj = await existingConfig.response.clone().json();
-      } catch (_) {
-        chatConfigObj = null;
-      }
-    }
-    if (!chatConfigObj) {
-      configSource = 'network';
-      const dlConfig = await streamArtifactToCache({
-        cache: configCache,
-        url: chatConfigUrl,
-        artifactName: 'mlc-chat-config.json',
-        modelLabel: fullLabel,
-        contentType: 'application/json',
-        expectedBytes: null,
-        stallTimeoutMs,
-        signal: downloadSignal,
-        fetchImpl,
-        returnArrayBuffer: true
-      });
-      chatConfigObj = JSON.parse(new TextDecoder().decode(dlConfig.arrayBuffer));
-    }
-    logWebLLMStage('metadata_config_ready', { modelId, source: configSource }, { startMs });
+    const probe = await probeWebLLMModelCDN(missingShards[0].url, {
+      modelLabel: fullLabel,
+      signal,
+      timeoutMs: probeTimeoutMs,
+      fetchImpl
+    });
+    verifiedCdnHost = probe.redirectedHost;
 
-    // 2. Ensure tensor-cache.json in webllm/model
-    const tensorCacheUrl = new URL('tensor-cache.json', modelBaseUrl).href;
-    let tensorManifest = null;
-    let manifestSource = 'cache';
-    const existingManifest = await readVerifiedCachedEntry(modelCache, tensorCacheUrl, null);
-    if (existingManifest?.response && typeof existingManifest.response.clone === 'function') {
-      try {
-        tensorManifest = await existingManifest.response.clone().json();
-      } catch (_) {
-        tensorManifest = null;
-      }
-    }
-    if (!tensorManifest) {
-      manifestSource = 'network';
-      emitDownloadProgress({
-        progress: 0,
-        progressPercent: 0,
-        progressText: `Fetching shard manifest for ${shortLabel}...`,
-        force: true
-      });
-      const dlManifest = await streamArtifactToCache({
-        cache: modelCache,
-        url: tensorCacheUrl,
-        artifactName: 'tensor-cache.json',
-        modelLabel: fullLabel,
-        contentType: 'application/json',
-        expectedBytes: null,
-        stallTimeoutMs,
-        signal: downloadSignal,
-        fetchImpl,
-        returnArrayBuffer: true
-      });
-      tensorManifest = JSON.parse(new TextDecoder().decode(dlManifest.arrayBuffer));
-    }
+    const initialRatio = Math.min(0.99, Math.max(0.01, completedBytes / progressDenominator));
+    const initialPct = Math.min(99, Math.max(1, Math.round(initialRatio * 100)));
+    emitDownloadProgress({
+      progress: initialRatio,
+      progressPercent: initialPct,
+      progressText:
+        completedBytes > 0
+          ? `Resuming ${shortLabel} from ${verifiedCdnHost}: ${formatMegabytes(completedBytes)} / ${formatMegabytes(progressDenominator)} MB cached (${missingShards.length}/${shardItems.length} shards remaining)...`
+          : `Connected to ${verifiedCdnHost} — downloading ${shortLabel} (0.0 / ${formatMegabytes(progressDenominator)} MB)...`,
+      force: true
+    });
+  }
 
-    const shardRecords = Array.isArray(tensorManifest?.records) ? tensorManifest.records : [];
-    const shardItems = [];
-    const seenShardUrls = new Set();
-
-    for (let i = 0; i < shardRecords.length; i++) {
-      const rec = shardRecords[i];
-      if (!rec || !rec.dataPath) continue;
-      const shardUrl = new URL(rec.dataPath, modelBaseUrl).href;
-      if (seenShardUrls.has(shardUrl)) continue;
-      seenShardUrls.add(shardUrl);
-      const expectedBytes =
-        typeof rec.nbytes === 'number' && Number.isFinite(rec.nbytes) && rec.nbytes > 0
-          ? rec.nbytes
-          : null;
-      shardItems.push({
-        index: shardItems.length + 1,
-        name: String(rec.dataPath),
-        url: shardUrl,
-        expectedBytes
-      });
-    }
-
-    // 3. Inspect which shards are already complete & byte-verified in Cache Storage
-    let completedBytes = 0;
-    let totalExpectedBytes = 0;
-    const missingShards = [];
-
-    for (const shard of shardItems) {
-      const shardExpected = shard.expectedBytes || 0;
-      totalExpectedBytes += shardExpected;
-      const cachedShard = await readVerifiedCachedEntry(modelCache, shard.url, shard.expectedBytes);
-      if (cachedShard) {
-        completedBytes += cachedShard.byteLength || shardExpected;
-      } else {
-        missingShards.push(shard);
-      }
-    }
-
-    logWebLLMStage(
-      'metadata_manifest_ready',
-      {
-        modelId,
-        source: manifestSource,
-        shardCount: shardItems.length,
-        totalMB: formatMegabytes(totalExpectedBytes)
-      },
-      { startMs }
-    );
-
-    // Check tokenizer & WASM status as well
-    const tokenizerFiles = Array.isArray(chatConfigObj?.tokenizer_files) ? chatConfigObj.tokenizer_files : [];
-    const requiredTokenizerName = tokenizerFiles.includes('tokenizer.json')
-      ? 'tokenizer.json'
-      : tokenizerFiles.includes('tokenizer.model')
-        ? 'tokenizer.model'
-        : null;
-    const tokenizerUrl = requiredTokenizerName ? new URL(requiredTokenizerName, modelBaseUrl).href : null;
-    const cachedTokenizer = tokenizerUrl ? await readVerifiedCachedEntry(modelCache, tokenizerUrl, null) : null;
-
-    const wasmUrl =
-      modelRecord.model_lib &&
-      modelRecord.model_lib.startsWith('http') &&
-      !modelRecord.model_lib.includes('localhost')
-        ? modelRecord.model_lib
-        : null;
-    const cachedWasm = wasmUrl ? await readVerifiedCachedEntry(wasmCache, wasmUrl, null) : null;
-
-    logWebLLMStage(
-      'cache_inventory',
-      {
-        modelId,
-        cachedShards: shardItems.length - missingShards.length,
-        missingShards: missingShards.length,
-        cachedTokenizer: Boolean(cachedTokenizer),
-        cachedWasm: Boolean(cachedWasm)
-      },
-      { startMs }
-    );
-
-    const estimatedFallbackTotal = (catalogEntry?.estimatedDownloadMB || 270) * 1024 * 1024;
-    const progressDenominator = Math.max(totalExpectedBytes || estimatedFallbackTotal, 1);
-
-    // 4. Bounded CDN reachability & byte-transfer diagnostic probe BEFORE downloading large weight shards
-    let verifiedCdnHost = null;
-    if (missingShards.length > 0) {
-      emitDownloadProgress({
-        progress: 0,
-        progressPercent: 0,
-        progressText: `Verifying model CDN reachability for ${shortLabel}...`,
-        force: true
-      });
-
-      const probe = await probeWebLLMModelCDN(missingShards[0].url, {
-        modelLabel: fullLabel,
-        signal: downloadSignal,
-        timeoutMs: probeTimeoutMs,
-        fetchImpl
-      });
-      verifiedCdnHost = probe.redirectedHost;
-
-      const initialRatio = Math.min(0.99, Math.max(0.01, completedBytes / progressDenominator));
-      const initialPct = Math.min(99, Math.max(1, Math.round(initialRatio * 100)));
-      emitDownloadProgress({
-        progress: initialRatio,
-        progressPercent: initialPct,
-        progressText:
-          completedBytes > 0
-            ? `Resuming ${shortLabel} from ${verifiedCdnHost}: ${formatMegabytes(completedBytes)} / ${formatMegabytes(progressDenominator)} MB cached (${missingShards.length}/${shardItems.length} shards remaining)...`
-            : `Connected to ${verifiedCdnHost} — downloading ${shortLabel} (0.0 / ${formatMegabytes(progressDenominator)} MB)...`,
-        force: true
-      });
-    }
-
-    // 5. Ensure tokenizer & WASM runtime library are cached before GPU reload
-    if (tokenizerUrl && !cachedTokenizer) {
-      const baseRatio = Math.min(0.99, Math.max(0.01, completedBytes / progressDenominator));
-      const basePct = Math.min(99, Math.max(1, Math.round(baseRatio * 100)));
-      emitDownloadProgress({
-        progress: baseRatio,
-        progressPercent: basePct,
-        progressText: `Downloading ${requiredTokenizerName} for ${shortLabel}...`,
-        force: true
-      });
-      await streamArtifactToCache({
-        cache: modelCache,
-        url: tokenizerUrl,
-        artifactName: requiredTokenizerName,
-        modelLabel: fullLabel,
-        contentType: requiredTokenizerName.endsWith('.json') ? 'application/json' : 'application/octet-stream',
-        expectedBytes: null,
-        stallTimeoutMs,
-        signal: downloadSignal,
-        fetchImpl,
-        onBytesProgress: (bytesSoFar, totalTok) => {
-          emitDownloadProgress({
-            progress: baseRatio,
-            progressPercent: basePct,
-            progressText: `Downloading ${requiredTokenizerName} for ${shortLabel} (${formatMegabytes(bytesSoFar)}${totalTok ? ` / ${formatMegabytes(totalTok)}` : ''} MB)...`,
-            force: false
-          });
-        }
-      });
-    }
-
-    if (wasmUrl && !cachedWasm) {
-      const baseRatio = Math.min(0.99, Math.max(0.01, completedBytes / progressDenominator));
-      const basePct = Math.min(99, Math.max(1, Math.round(baseRatio * 100)));
-      emitDownloadProgress({
-        progress: baseRatio,
-        progressPercent: basePct,
-        progressText: `Downloading WebGPU runtime library for ${shortLabel}...`,
-        force: true
-      });
-      await streamArtifactToCache({
-        cache: wasmCache,
-        url: wasmUrl,
-        artifactName: 'WebGPU model WASM library',
-        modelLabel: fullLabel,
-        contentType: 'application/wasm',
-        expectedBytes: null,
-        stallTimeoutMs,
-        signal: downloadSignal,
-        fetchImpl,
-        onBytesProgress: (bytesSoFar, totalWasm) => {
-          emitDownloadProgress({
-            progress: baseRatio,
-            progressPercent: basePct,
-            progressText: `Downloading WebGPU runtime library for ${shortLabel} (${formatMegabytes(bytesSoFar)}${totalWasm ? ` / ${formatMegabytes(totalWasm)}` : ''} MB)...`,
-            force: false
-          });
-        }
-      });
-    }
-
-    // 6. Stream missing weight shards with controlled concurrency and per-chunk stall watchdog
-    if (missingShards.length > 0) {
-      const batchController = new AbortController();
-      const onParentAbort = () => batchController.abort();
-      if (downloadSignal) {
-        if (downloadSignal.aborted) {
-          throw createAbortError();
-        }
-        downloadSignal.addEventListener('abort', onParentAbort, { once: true });
-      }
-
-      const inFlightBytes = new Map();
-      let completedShardCount = shardItems.length - missingShards.length;
-      let queueCursor = 0;
-
-      const reportAggregatedShardProgress = (activeShard, force = false) => {
-        let currentInFlight = 0;
-        for (const b of inFlightBytes.values()) {
-          currentInFlight += b;
-        }
-        const currentTotal = Math.min(progressDenominator, completedBytes + currentInFlight);
-        const ratio = Math.min(0.99, Math.max(0.01, currentTotal / progressDenominator));
-        const pct = Math.min(99, Math.max(1, Math.round(ratio * 100)));
-        const shardCounter = Math.min(shardItems.length, completedShardCount + 1);
+  // 5. Ensure tokenizer & WASM runtime library are cached before GPU reload
+  if (tokenizerUrl && !cachedTokenizer) {
+    const baseRatio = Math.min(0.99, Math.max(0.01, completedBytes / progressDenominator));
+    const basePct = Math.min(99, Math.max(1, Math.round(baseRatio * 100)));
+    emitDownloadProgress({
+      progress: baseRatio,
+      progressPercent: basePct,
+      progressText: `Downloading ${requiredTokenizerName} for ${shortLabel}...`,
+      force: true
+    });
+    await streamArtifactToCache({
+      cache: modelCache,
+      url: tokenizerUrl,
+      artifactName: requiredTokenizerName,
+      modelLabel: fullLabel,
+      contentType: requiredTokenizerName.endsWith('.json') ? 'application/json' : 'application/octet-stream',
+      expectedBytes: null,
+      stallTimeoutMs,
+      signal,
+      fetchImpl,
+      onBytesProgress: (bytesSoFar, totalTok) => {
         emitDownloadProgress({
-          progress: ratio,
-          progressPercent: pct,
-          progressText: `Downloading ${shortLabel}: ${formatMegabytes(currentTotal)} / ${formatMegabytes(progressDenominator)} MB (${pct}%) — shard ${shardCounter}/${shardItems.length}`,
-          force
+          progress: baseRatio,
+          progressPercent: basePct,
+          progressText: `Downloading ${requiredTokenizerName} for ${shortLabel} (${formatMegabytes(bytesSoFar)}${totalTok ? ` / ${formatMegabytes(totalTok)}` : ''} MB)...`,
+          force: false
         });
-      };
-
-      const workerCount = Math.max(1, Math.min(concurrency, missingShards.length));
-      try {
-        const workers = Array.from({ length: workerCount }, async () => {
-          while (queueCursor < missingShards.length) {
-            if (batchController.signal.aborted) {
-              break;
-            }
-            const shard = missingShards[queueCursor++];
-            inFlightBytes.set(shard.url, 0);
-
-            try {
-              const result = await streamArtifactToCache({
-                cache: modelCache,
-                url: shard.url,
-                artifactName: shard.name,
-                modelLabel: fullLabel,
-                contentType: 'application/octet-stream',
-                expectedBytes: shard.expectedBytes,
-                stallTimeoutMs,
-                signal: batchController.signal,
-                fetchImpl,
-                onBytesProgress: (bytesSoFar) => {
-                  inFlightBytes.set(shard.url, bytesSoFar);
-                  reportAggregatedShardProgress(shard, false);
-                }
-              });
-
-              inFlightBytes.delete(shard.url);
-              completedBytes += result.byteLength;
-              completedShardCount += 1;
-              reportAggregatedShardProgress(shard, true);
-            } catch (shardErr) {
-              inFlightBytes.delete(shard.url);
-              // Abort sibling shard streams immediately on first failure so no zombie requests linger
-              batchController.abort();
-              throw shardErr;
-            }
-          }
-        });
-
-        await Promise.all(workers);
-      } finally {
-        if (downloadSignal) {
-          downloadSignal.removeEventListener('abort', onParentAbort);
-        }
       }
+    });
+  }
+
+  if (wasmUrl && !cachedWasm) {
+    const baseRatio = Math.min(0.99, Math.max(0.01, completedBytes / progressDenominator));
+    const basePct = Math.min(99, Math.max(1, Math.round(baseRatio * 100)));
+    emitDownloadProgress({
+      progress: baseRatio,
+      progressPercent: basePct,
+      progressText: `Downloading WebGPU runtime library for ${shortLabel}...`,
+      force: true
+    });
+    await streamArtifactToCache({
+      cache: wasmCache,
+      url: wasmUrl,
+      artifactName: 'WebGPU model WASM library',
+      modelLabel: fullLabel,
+      contentType: 'application/wasm',
+      expectedBytes: null,
+      stallTimeoutMs,
+      signal,
+      fetchImpl,
+      onBytesProgress: (bytesSoFar, totalWasm) => {
+        emitDownloadProgress({
+          progress: baseRatio,
+          progressPercent: basePct,
+          progressText: `Downloading WebGPU runtime library for ${shortLabel} (${formatMegabytes(bytesSoFar)}${totalWasm ? ` / ${formatMegabytes(totalWasm)}` : ''} MB)...`,
+          force: false
+        });
+      }
+    });
+  }
+
+  // 6. Stream missing weight shards with controlled concurrency and per-chunk stall watchdog
+  if (missingShards.length > 0) {
+    const batchController = new AbortController();
+    const onParentAbort = () => batchController.abort();
+    if (signal) {
+      if (signal.aborted) {
+        throw createAbortError();
+      }
+      signal.addEventListener('abort', onParentAbort, { once: true });
     }
 
-    logWebLLMStage(
-      'artifacts_all_verified',
-      {
-        modelId,
-        shardCount: shardItems.length,
-        downloadedShards: missingShards.length,
-        totalMB: formatMegabytes(totalExpectedBytes),
-        cdnHost: verifiedCdnHost || 'local-cache'
-      },
-      { startMs }
-    );
+    const inFlightBytes = new Map();
+    let completedShardCount = shardItems.length - missingShards.length;
+    let queueCursor = 0;
 
-    return {
+    const reportAggregatedShardProgress = (activeShard, force = false) => {
+      let currentInFlight = 0;
+      for (const b of inFlightBytes.values()) {
+        currentInFlight += b;
+      }
+      const currentTotal = Math.min(progressDenominator, completedBytes + currentInFlight);
+      const ratio = Math.min(0.99, Math.max(0.01, currentTotal / progressDenominator));
+      const pct = Math.min(99, Math.max(1, Math.round(ratio * 100)));
+      const shardCounter = Math.min(shardItems.length, completedShardCount + 1);
+      emitDownloadProgress({
+        progress: ratio,
+        progressPercent: pct,
+        progressText: `Downloading ${shortLabel}: ${formatMegabytes(currentTotal)} / ${formatMegabytes(progressDenominator)} MB (${pct}%) — shard ${shardCounter}/${shardItems.length}`,
+        force
+      });
+    };
+
+    const workerCount = Math.max(1, Math.min(concurrency, missingShards.length));
+    try {
+      const workers = Array.from({ length: workerCount }, async () => {
+        while (queueCursor < missingShards.length) {
+          if (batchController.signal.aborted) {
+            break;
+          }
+          const shard = missingShards[queueCursor++];
+          inFlightBytes.set(shard.url, 0);
+
+          try {
+            const result = await streamArtifactToCache({
+              cache: modelCache,
+              url: shard.url,
+              artifactName: shard.name,
+              modelLabel: fullLabel,
+              contentType: 'application/octet-stream',
+              expectedBytes: shard.expectedBytes,
+              stallTimeoutMs,
+              signal: batchController.signal,
+              fetchImpl,
+              onBytesProgress: (bytesSoFar) => {
+                inFlightBytes.set(shard.url, bytesSoFar);
+                reportAggregatedShardProgress(shard, false);
+              }
+            });
+
+            inFlightBytes.delete(shard.url);
+            completedBytes += result.byteLength;
+            completedShardCount += 1;
+            reportAggregatedShardProgress(shard, true);
+          } catch (shardErr) {
+            inFlightBytes.delete(shard.url);
+            // Abort sibling shard streams immediately on first failure so no zombie requests linger
+            batchController.abort();
+            throw shardErr;
+          }
+        }
+      });
+
+      await Promise.all(workers);
+    } finally {
+      if (signal) {
+        signal.removeEventListener('abort', onParentAbort);
+      }
+    }
+  }
+
+  logWebLLMStage(
+    'artifacts_all_verified',
+    {
       modelId,
       shardCount: shardItems.length,
       downloadedShards: missingShards.length,
-      totalBytes: totalExpectedBytes,
-      cdnHost: verifiedCdnHost
-    };
-  })().finally(() => {
-    if (activeDownloadSessions.get(modelId) === downloadSession) {
-      activeDownloadSessions.delete(modelId);
-    }
-  });
+      totalMB: formatMegabytes(totalExpectedBytes),
+      cdnHost: verifiedCdnHost || 'local-cache'
+    },
+    { startMs }
+  );
 
-  return attachDownloadWaiter(downloadSession);
+  return {
+    modelId,
+    shardCount: shardItems.length,
+    downloadedShards: missingShards.length,
+    totalBytes: totalExpectedBytes,
+    cdnHost: verifiedCdnHost
+  };
 }
 
 // ============================================================================
@@ -2792,22 +2548,22 @@ function terminateWorkerImmediate() {
       // Ignore worker termination errors
     }
     workerInstance = null;
-    runtimeStats.activeWorkerCount = Math.max(0, runtimeStats.activeWorkerCount - 1);
-    runtimeStats.totalWorkersTerminated += 1;
   }
   engineInstance = null;
   loadedModelId = null;
 }
 
-function abortActiveInitSessionImmediate(reasonMessage = 'Browser AI initialization was cancelled.') {
-  if (activeInitSession) {
-    activeInitSession.forceAborted = true;
-    try {
-      activeInitSession.controller.abort();
-    } catch (_) {
-      // Ignore
-    }
-  }
+/**
+ * Unloads any loaded model from WebGPU memory and terminates the dedicated Web Worker.
+ * Safe to call multiple times or during error recovery.
+ */
+export async function destroyWebLLMEngine() {
+  const currentEngine = engineInstance;
+  engineInstance = null;
+  loadedModelId = null;
+  isGeneratingNow = false;
+  manualStopRequested = false;
+
   if (activeInitAbortController) {
     try {
       activeInitAbortController.abort();
@@ -2816,67 +2572,39 @@ function abortActiveInitSessionImmediate(reasonMessage = 'Browser AI initializat
     }
     activeInitAbortController = null;
   }
+
   if (activeInitAbortReject) {
     const rejectInit = activeInitAbortReject;
     activeInitAbortReject = null;
-    terminateWorkerImmediate();
-    rejectInit(createAbortError(reasonMessage));
+    rejectInit(createAbortError('Browser AI engine was reset.'));
   }
-}
 
-/**
- * Unloads any loaded model from WebGPU memory and terminates the dedicated Web Worker.
- * Safe to call multiple times or during error recovery; serialized via activeUnloadPromise.
- */
-export async function destroyWebLLMEngine() {
-  const previousUnload = activeUnloadPromise ? activeUnloadPromise.catch(() => {}) : Promise.resolve();
-  const unloadTask = (async () => {
-    await previousUnload;
-
-    const currentEngine = engineInstance;
-    engineInstance = null;
-    loadedModelId = null;
-    isGeneratingNow = false;
-    manualStopRequested = false;
-
-    abortActiveInitSessionImmediate('Browser AI engine was reset.');
-
-    if (currentEngine) {
-      try {
-        currentEngine.interruptGenerate();
-      } catch (_) {
-        // Ignore
-      }
-      try {
-        await Promise.race([
-          currentEngine.unload(),
-          new Promise((resolve) => setTimeout(resolve, 1500))
-        ]);
-      } catch (_) {
-        // Ignore unload failure on lost GPU device
-      }
+  if (currentEngine) {
+    try {
+      currentEngine.interruptGenerate();
+    } catch (_) {
+      // Ignore
     }
-
-    terminateWorkerImmediate();
-
-    updateEngineState({
-      status: 'idle',
-      loadedModelId: null,
-      progress: 0,
-      progressPercent: null,
-      progressText: '',
-      error: null
-    });
-  })();
-
-  activeUnloadPromise = unloadTask;
-  try {
-    await unloadTask;
-  } finally {
-    if (activeUnloadPromise === unloadTask) {
-      activeUnloadPromise = null;
+    try {
+      await Promise.race([
+        currentEngine.unload(),
+        new Promise((resolve) => setTimeout(resolve, 1500))
+      ]);
+    } catch (_) {
+      // Ignore unload failure on lost GPU device
     }
   }
+
+  terminateWorkerImmediate();
+
+  updateEngineState({
+    status: 'idle',
+    loadedModelId: null,
+    progress: 0,
+    progressPercent: null,
+    progressText: '',
+    error: null
+  });
 }
 
 /**
@@ -2885,91 +2613,7 @@ export async function destroyWebLLMEngine() {
 export const unloadWebLLMEngine = destroyWebLLMEngine;
 
 /**
- * Attaches a caller waiter to an in-flight initialization session.
- * Forwards progress updates and ensures aborting one caller's signal only aborts the
- * underlying initialization when no active waiters remain.
- */
-function attachWaiterToInitSession(session, { onProgress, signal } = {}) {
-  if (signal?.aborted) {
-    return Promise.reject(createAbortError());
-  }
-
-  const waiter = {
-    onProgress: typeof onProgress === 'function' ? onProgress : null,
-    aborted: false
-  };
-  session.waiters.add(waiter);
-
-  if (session.lastProgressReport && waiter.onProgress) {
-    try {
-      waiter.onProgress(session.lastProgressReport);
-    } catch (_) {
-      // Ignore progress listener error
-    }
-  }
-
-  let removeAbort = null;
-  const waitPromise = new Promise((resolve, reject) => {
-    if (signal) {
-      const onCallerAbort = () => {
-        waiter.aborted = true;
-        session.waiters.delete(waiter);
-        if (session.waiters.size === 0 && !session.completed) {
-          session.forceAborted = true;
-          try {
-            session.controller.abort();
-          } catch (_) {
-            // Ignore
-          }
-          if (activeInitAbortReject) {
-            const rejectFn = activeInitAbortReject;
-            activeInitAbortReject = null;
-            terminateWorkerImmediate();
-            rejectFn(createAbortError('Model initialization cancelled by user.'));
-          }
-        }
-        reject(createAbortError('Model initialization cancelled by user.'));
-      };
-      if (signal.aborted) {
-        onCallerAbort();
-        return;
-      }
-      signal.addEventListener('abort', onCallerAbort, { once: true });
-      removeAbort = () => signal.removeEventListener('abort', onCallerAbort);
-    }
-
-    session.promise.then(resolve, reject);
-  });
-
-  return waitPromise.finally(() => {
-    session.waiters.delete(waiter);
-    if (removeAbort) {
-      removeAbort();
-    }
-  });
-}
-
-function doesSessionMatchModel(session, candidateBaseId, allowF32Fallback) {
-  if (!session || session.forceAborted || session.controller.signal.aborted) {
-    return false;
-  }
-  if (session.requestedBaseId === candidateBaseId || session.resolvedModelId === candidateBaseId) {
-    return true;
-  }
-  const entry = WEBLLM_MODEL_CATALOG[candidateBaseId];
-  if (
-    allowF32Fallback &&
-    entry?.f32FallbackModelId &&
-    (session.resolvedModelId === entry.f32FallbackModelId ||
-      session.requestedBaseId === entry.f32FallbackModelId)
-  ) {
-    return true;
-  }
-  return false;
-}
-
-/**
- * Lazily initializes the dedicated WebLLM worker and loads the requested Browser AI model onto WebGPU.
+ * Lazily initializes the dedicated WebLLM worker and loads the requested Qwen model onto WebGPU.
  * Reuses the active engine immediately if the resolved model is already loaded.
  *
  * @param {Object} [options]
@@ -3034,292 +2678,225 @@ export async function ensureWebLLMEngine(options = {}) {
     }
   }
 
-  const candidateBaseId = resolveWebLLMModelId(requestedModelId, {
-    hasShaderF16: true,
-    allowF32Fallback: false
+  // 1. Check WebGPU compatibility before loading the heavy @mlc-ai/web-llm chunk
+  updateEngineState({
+    status: 'checking',
+    error: null
   });
-  const candidateCatalogEntry = WEBLLM_MODEL_CATALOG[candidateBaseId];
 
-  // Zero-overhead synchronous fast path: if the requested model (or its active FP32 fallback)
-  // is already loaded in GPU memory with a healthy worker, reuse it immediately without
-  // flickering status to 'checking' or re-querying navigator.gpu.requestAdapter().
-  if (engineInstance && workerInstance && loadedModelId) {
-    const isDirectMatch = loadedModelId === candidateBaseId;
-    const isF32FallbackMatch =
-      allowF32Fallback &&
-      engineState.hasShaderF16 === false &&
-      candidateCatalogEntry?.f32FallbackModelId === loadedModelId;
+  logWebLLMStage('gpu_check_start', { requestedModelId }, { startMs: entryStartMs });
+  const gpuSupport = await checkWebGPUSupport();
+  logWebLLMStage(
+    'gpu_check_done',
+    {
+      supported: gpuSupport.supported,
+      hasShaderF16: gpuSupport.hasShaderF16,
+      reasonCode: gpuSupport.reasonCode || 'ok'
+    },
+    { startMs: entryStartMs }
+  );
 
-    if (isDirectMatch || isF32FallbackMatch) {
-      runtimeStats.fastPathHits += 1;
-      const readyPayload = {
-        status: 'ready',
-        modelId: loadedModelId,
-        loadedModelId,
-        progress: 1,
-        progressPercent: 100,
-        progressText: 'Model ready on device',
-        timeElapsed: engineState.timeElapsed || 0,
-        isCached: true
-      };
-      if (
-        engineState.status !== 'ready' ||
-        engineState.modelId !== loadedModelId ||
-        engineState.loadedModelId !== loadedModelId ||
-        engineState.error !== null
-      ) {
-        updateEngineState({
-          ...readyPayload,
-          error: null
-        });
+  if (!gpuSupport.supported) {
+    const gpuError = new WebLLMError(
+      gpuSupport.message || 'WebGPU is unavailable on this browser or device.',
+      {
+        code: gpuSupport.reasonCode || WEBLLM_ERROR_CODES.WEBGPU_UNSUPPORTED,
+        httpCode: 400,
+        retryable: false
       }
-      if (typeof onProgress === 'function') {
-        try {
-          onProgress(readyPayload);
-        } catch (_) {
-          // Ignore callback error
-        }
-      }
-      logWebLLMStage('init_fast_path_ready', { modelId: loadedModelId }, { startMs: entryStartMs });
-      return {
-        engine: engineInstance,
-        modelId: loadedModelId,
-        isCached: true
-      };
-    }
-  }
-
-  // Synchronous single-flight deduplication: if an initialization session for the same model
-  // is already in flight (even during its initial GPU check or prior-engine teardown), join it now.
-  if (doesSessionMatchModel(activeInitSession, candidateBaseId, allowF32Fallback)) {
-    logWebLLMStage(
-      'init_deduped',
-      { modelId: activeInitSession.resolvedModelId || candidateBaseId },
-      { startMs: entryStartMs }
     );
-    return attachWaiterToInitSession(activeInitSession, { onProgress, signal });
+    updateEngineState({
+      status: 'error',
+      hasShaderF16: false,
+      error: gpuError.message
+    });
+    logWebLLMStage(
+      'init_error',
+      { code: gpuError.errorCode, message: gpuError.message },
+      { startMs: entryStartMs, level: 'warn' }
+    );
+    throw gpuError;
   }
 
-  const priorSession =
-    activeInitSession && !doesSessionMatchModel(activeInitSession, candidateBaseId, allowF32Fallback)
-      ? activeInitSession
-      : null;
+  const resolvedModelId = resolveWebLLMModelId(requestedModelId, {
+    hasShaderF16: gpuSupport.hasShaderF16,
+    allowF32Fallback
+  });
 
-  if (priorSession) {
-    abortActiveInitSessionImmediate('Model initialization cancelled (switched model).');
-  }
-
-  // Synchronously register the new initialization session BEFORE the first `await` so concurrent
-  // callers for `candidateBaseId` coalesce into `initSession` with zero race window.
-  const initController = new AbortController();
-  const initSession = {
-    requestedBaseId: candidateBaseId,
-    resolvedModelId: candidateBaseId,
-    controller: initController,
-    waiters: new Set(),
-    lastProgressReport: null,
-    completed: false,
-    forceAborted: false,
-    promise: null
-  };
-
-  activeInitSession = initSession;
-  activeInitAbortController = initController;
-  activeInitModelId = candidateBaseId;
-
-  const broadcastInitProgress = (report) => {
-    initSession.lastProgressReport = report;
-    for (const waiter of initSession.waiters) {
-      if (!waiter.aborted && typeof waiter.onProgress === 'function') {
-        try {
-          waiter.onProgress(report);
-        } catch (_) {
-          // Never allow progress listener error to break initialization
-        }
+  const catalogEntry = WEBLLM_MODEL_CATALOG[resolvedModelId];
+  if (!catalogEntry) {
+    const unsuppErr = new WebLLMError(
+      `Unsupported Browser AI model "${requestedModelId || resolvedModelId}". Please select a supported Browser AI model.`,
+      {
+        code: WEBLLM_ERROR_CODES.UNSUPPORTED_MODEL,
+        httpCode: 400,
+        retryable: false
       }
-    }
-  };
+    );
+    updateEngineState({
+      status: 'error',
+      modelId: resolvedModelId,
+      error: unsuppErr.message
+    });
+    logWebLLMStage(
+      'init_error',
+      { modelId: resolvedModelId, code: unsuppErr.errorCode, message: unsuppErr.message },
+      { startMs: entryStartMs, level: 'warn' }
+    );
+    throw unsuppErr;
+  }
 
-  initSession.promise = (async () => {
+  if (catalogEntry?.prefersShaderF16 && !gpuSupport.hasShaderF16) {
+    const f16Err = new WebLLMError(
+      `Your GPU adapter does not support WebGPU shader-f16 required by ${catalogEntry.label}.`,
+      {
+        code: WEBLLM_ERROR_CODES.SHADER_F16_UNSUPPORTED,
+        httpCode: 400,
+        retryable: false
+      }
+    );
+    updateEngineState({
+      status: 'error',
+      modelId: resolvedModelId,
+      hasShaderF16: false,
+      error: f16Err.message
+    });
+    logWebLLMStage(
+      'init_error',
+      { modelId: resolvedModelId, code: f16Err.errorCode, message: f16Err.message },
+      { startMs: entryStartMs, level: 'warn' }
+    );
+    throw f16Err;
+  }
+
+  // Fast path: already loaded and healthy
+  if (engineInstance && workerInstance && loadedModelId === resolvedModelId) {
+    const readyPayload = {
+      status: 'ready',
+      modelId: resolvedModelId,
+      progress: 1,
+      progressPercent: 100,
+      progressText: 'Model ready on device',
+      timeElapsed: 0,
+      isCached: true
+    };
+    updateEngineState({
+      ...readyPayload,
+      hasShaderF16: gpuSupport.hasShaderF16,
+      error: null
+    });
+    if (typeof onProgress === 'function') {
+      onProgress(readyPayload);
+    }
+    logWebLLMStage('init_fast_path_ready', { modelId: resolvedModelId }, { startMs: entryStartMs });
+    return {
+      engine: engineInstance,
+      modelId: resolvedModelId,
+      isCached: true
+    };
+  }
+
+  // Deduplicate concurrent initialization requests for the same model
+  if (activeInitPromise && activeInitModelId === resolvedModelId) {
+    logWebLLMStage('init_deduped', { modelId: resolvedModelId }, { startMs: entryStartMs });
+    let unsub = null;
+    if (typeof onProgress === 'function') {
+      unsub = subscribeWebLLMState((st) => {
+        if (st.status === 'downloading' || st.status === 'loading' || st.status === 'ready') {
+          onProgress({
+            status: st.status,
+            modelId: st.modelId,
+            progress: st.progress,
+            progressPercent: st.progressPercent,
+            progressText: st.progressText,
+            timeElapsed: st.timeElapsed,
+            isCached: st.isCached
+          });
+        }
+      });
+    }
+    try {
+      if (!signal) {
+        return await activeInitPromise;
+      }
+      return await Promise.race([
+        activeInitPromise,
+        new Promise((_, reject) => {
+          if (signal.aborted) {
+            reject(createAbortError());
+            return;
+          }
+          signal.addEventListener('abort', () => reject(createAbortError()), { once: true });
+        })
+      ]);
+    } finally {
+      if (unsub) unsub();
+    }
+  }
+
+  // If another model was previously initializing, abort it immediately before loading the new model
+  if (activeInitPromise && activeInitModelId !== resolvedModelId) {
+    if (activeInitAbortController) {
+      try {
+        activeInitAbortController.abort();
+      } catch (_) {
+        // Ignore
+      }
+      activeInitAbortController = null;
+    }
+    if (activeInitAbortReject) {
+      const rejectPrior = activeInitAbortReject;
+      activeInitAbortReject = null;
+      terminateWorkerImmediate();
+      rejectPrior(createAbortError('Model initialization cancelled (switched model).'));
+    }
+    try {
+      await activeInitPromise;
+    } catch (_) {
+      // Ignore prior init error
+    }
+  }
+  if (engineInstance && loadedModelId && loadedModelId !== resolvedModelId) {
+    await destroyWebLLMEngine();
+  }
+
+  // Re-verify single-initialization invariant after any async teardown above
+  if (activeInitPromise && activeInitModelId === resolvedModelId) {
+    return await activeInitPromise;
+  }
+
+  const initController = new AbortController();
+  activeInitAbortController = initController;
+  activeInitModelId = resolvedModelId;
+  activeInitPromise = (async () => {
     const initStartMs = entryStartMs;
-    let resolvedModelId = candidateBaseId;
-    let catalogEntry = candidateCatalogEntry;
     let wasCachedBeforeInit = false;
     let hasVerifiedLocalCache = false;
+    let removeAbortListener = null;
     let clearWorkerWatchdog = null;
     let detachWorkerDiagListener = null;
 
     try {
-      // Wait for any superseded initialization or unload to settle cleanly first
-      if (priorSession?.promise) {
-        try {
-          await priorSession.promise;
-        } catch (_) {
-          // Ignore prior aborted/failed init
-        }
-      }
-      if (activeUnloadPromise) {
-        try {
-          await activeUnloadPromise;
-        } catch (_) {
-          // Ignore
-        }
-      }
-
-      if (initController.signal.aborted || initSession.forceAborted) {
+      if (signal?.aborted || initController.signal.aborted) {
         throw createAbortError();
       }
 
-      // 1. Check WebGPU compatibility before loading the heavy @mlc-ai/web-llm chunk
-      updateEngineState({
-        status: 'checking',
-        modelId: candidateBaseId,
-        error: null
-      });
-
-      logWebLLMStage('gpu_check_start', { requestedModelId: candidateBaseId }, { startMs: initStartMs });
-      const gpuSupport = await checkWebGPUSupport();
-      logWebLLMStage(
-        'gpu_check_done',
-        {
-          supported: gpuSupport.supported,
-          hasShaderF16: gpuSupport.hasShaderF16,
-          reasonCode: gpuSupport.reasonCode || 'ok'
-        },
-        { startMs: initStartMs }
-      );
-
-      if (initController.signal.aborted || initSession.forceAborted) {
-        throw createAbortError();
-      }
-
-      if (!gpuSupport.supported) {
-        const gpuError = new WebLLMError(
-          gpuSupport.message || 'WebGPU is unavailable on this browser or device.',
-          {
-            code: gpuSupport.reasonCode || WEBLLM_ERROR_CODES.WEBGPU_UNSUPPORTED,
-            httpCode: 400,
-            retryable: false
+      if (signal) {
+        const forwardCallerAbort = () => {
+          initController.abort();
+          if (activeInitAbortReject) {
+            const rejectFn = activeInitAbortReject;
+            activeInitAbortReject = null;
+            terminateWorkerImmediate();
+            rejectFn(createAbortError('Model initialization cancelled by user.'));
           }
-        );
-        updateEngineState({
-          status: 'error',
-          hasShaderF16: false,
-          error: gpuError.message
-        });
-        logWebLLMStage(
-          'init_error',
-          { code: gpuError.errorCode, message: gpuError.message },
-          { startMs: initStartMs, level: 'warn' }
-        );
-        throw gpuError;
-      }
-
-      resolvedModelId = resolveWebLLMModelId(requestedModelId, {
-        hasShaderF16: gpuSupport.hasShaderF16,
-        allowF32Fallback
-      });
-      initSession.resolvedModelId = resolvedModelId;
-      activeInitModelId = resolvedModelId;
-      catalogEntry = WEBLLM_MODEL_CATALOG[resolvedModelId];
-
-      if (!catalogEntry) {
-        const unsuppErr = new WebLLMError(
-          `Unsupported Browser AI model "${requestedModelId || resolvedModelId}". Please select a supported Browser AI model.`,
-          {
-            code: WEBLLM_ERROR_CODES.UNSUPPORTED_MODEL,
-            httpCode: 400,
-            retryable: false
-          }
-        );
-        updateEngineState({
-          status: 'error',
-          modelId: resolvedModelId,
-          error: unsuppErr.message
-        });
-        logWebLLMStage(
-          'init_error',
-          { modelId: resolvedModelId, code: unsuppErr.errorCode, message: unsuppErr.message },
-          { startMs: initStartMs, level: 'warn' }
-        );
-        throw unsuppErr;
-      }
-
-      if (catalogEntry?.prefersShaderF16 && !gpuSupport.hasShaderF16) {
-        const f16Err = new WebLLMError(
-          `Your GPU adapter does not support WebGPU shader-f16 required by ${catalogEntry.label}.`,
-          {
-            code: WEBLLM_ERROR_CODES.SHADER_F16_UNSUPPORTED,
-            httpCode: 400,
-            retryable: false
-          }
-        );
-        updateEngineState({
-          status: 'error',
-          modelId: resolvedModelId,
-          hasShaderF16: false,
-          error: f16Err.message
-        });
-        logWebLLMStage(
-          'init_error',
-          { modelId: resolvedModelId, code: f16Err.errorCode, message: f16Err.message },
-          { startMs: initStartMs, level: 'warn' }
-        );
-        throw f16Err;
-      }
-
-      // Check if resolvedModelId is already loaded after resolving FP32 fallback
-      if (engineInstance && workerInstance && loadedModelId === resolvedModelId) {
-        runtimeStats.fastPathHits += 1;
-        const readyPayload = {
-          status: 'ready',
-          modelId: resolvedModelId,
-          loadedModelId: resolvedModelId,
-          progress: 1,
-          progressPercent: 100,
-          progressText: 'Model ready on device',
-          timeElapsed: engineState.timeElapsed || 0,
-          isCached: true
         };
-        updateEngineState({
-          ...readyPayload,
-          hasShaderF16: gpuSupport.hasShaderF16,
-          error: null
-        });
-        broadcastInitProgress(readyPayload);
-        logWebLLMStage('init_fast_path_ready', { modelId: resolvedModelId }, { startMs: initStartMs });
-        return {
-          engine: engineInstance,
-          modelId: resolvedModelId,
-          isCached: true
-        };
-      }
-
-      // If a different model is currently resident in GPU memory, unload it cleanly before loading the new model
-      if (engineInstance && loadedModelId && loadedModelId !== resolvedModelId) {
-        const engineToUnload = engineInstance;
-        engineInstance = null;
-        loadedModelId = null;
-        isGeneratingNow = false;
-        manualStopRequested = false;
-        try {
-          engineToUnload.interruptGenerate();
-        } catch (_) {
-          // Ignore
+        if (signal.aborted) {
+          forwardCallerAbort();
+          throw createAbortError();
         }
-        try {
-          await Promise.race([
-            engineToUnload.unload(),
-            new Promise((resolve) => setTimeout(resolve, 1500))
-          ]);
-        } catch (_) {
-          // Ignore unload failure on lost GPU device
-        }
-        terminateWorkerImmediate();
-      }
-
-      if (initController.signal.aborted || initSession.forceAborted) {
-        throw createAbortError();
+        signal.addEventListener('abort', forwardCallerAbort, { once: true });
+        removeAbortListener = () => signal.removeEventListener('abort', forwardCallerAbort);
       }
 
       logWebLLMStage('init_pipeline_start', { modelId: resolvedModelId }, { startMs: initStartMs });
@@ -3366,10 +2943,6 @@ export async function ensureWebLLMEngine(options = {}) {
         await verifyBrowserStorageForDownload(resolvedModelId);
       }
 
-      if (initController.signal.aborted || initSession.forceAborted) {
-        throw createAbortError();
-      }
-
       const initialStatus = wasCachedBeforeInit ? 'loading' : 'downloading';
       const initialText = wasCachedBeforeInit
         ? `Loading cached ${catalogEntry?.shortLabel || resolvedModelId} into GPU memory...`
@@ -3388,15 +2961,17 @@ export async function ensureWebLLMEngine(options = {}) {
         error: null
       });
 
-      broadcastInitProgress({
-        status: initialStatus,
-        modelId: resolvedModelId,
-        progress: 0,
-        progressPercent: wasCachedBeforeInit ? null : 0,
-        progressText: initialText,
-        timeElapsed: 0,
-        isCached: wasCachedBeforeInit
-      });
+      if (typeof onProgress === 'function') {
+        onProgress({
+          status: initialStatus,
+          modelId: resolvedModelId,
+          progress: 0,
+          progressPercent: wasCachedBeforeInit ? null : 0,
+          progressText: initialText,
+          timeElapsed: 0,
+          isCached: wasCachedBeforeInit
+        });
+      }
 
       // 4. Pre-download & byte-verify uncached model artifacts with bounded CDN probe,
       //    streaming byte progress, and per-chunk stall protection (runs in real browsers and
@@ -3422,7 +2997,13 @@ export async function ensureWebLLMEngine(options = {}) {
               timeElapsed: dlReport.timeElapsed,
               isCached: false
             });
-            broadcastInitProgress(dlReport);
+            if (typeof onProgress === 'function') {
+              try {
+                onProgress(dlReport);
+              } catch (_) {
+                // Ignore callback error
+              }
+            }
           }
         });
 
@@ -3439,18 +3020,24 @@ export async function ensureWebLLMEngine(options = {}) {
           progressText: gpuStageText,
           isCached: true
         });
-        broadcastInitProgress({
-          status: 'loading',
-          modelId: resolvedModelId,
-          progress: 0,
-          progressPercent: null,
-          progressText: gpuStageText,
-          timeElapsed: engineState.timeElapsed || 0,
-          isCached: true
-        });
+        if (typeof onProgress === 'function') {
+          try {
+            onProgress({
+              status: 'loading',
+              modelId: resolvedModelId,
+              progress: 0,
+              progressPercent: null,
+              progressText: gpuStageText,
+              timeElapsed: engineState.timeElapsed || 0,
+              isCached: true
+            });
+          } catch (_) {
+            // Ignore callback error
+          }
+        }
       }
 
-      if (initController.signal.aborted || initSession.forceAborted) {
+      if (signal?.aborted || initController.signal.aborted) {
         throw createAbortError();
       }
 
@@ -3468,8 +3055,6 @@ export async function ensureWebLLMEngine(options = {}) {
             name: 'orvix-webllm-worker'
           });
       workerInstance = worker;
-      runtimeStats.totalWorkersSpawned += 1;
-      runtimeStats.activeWorkerCount += 1;
 
       const workerStallTimeoutMs =
         customDownloadConfig?.workerStallTimeoutMs ?? DEFAULT_WORKER_INIT_STALL_TIMEOUT_MS;
@@ -3628,13 +3213,10 @@ export async function ensureWebLLMEngine(options = {}) {
           (lowerText.includes('fetching') || lowerText.includes('downloading') || lowerText.includes('start to fetch')) &&
           (rawProgress === null || rawProgress < 1);
         const isGpuLoadStep =
-          lowerText.includes('loading') ||
-          lowerText.includes('initializing') ||
+          lowerText.includes('loading model from cache') ||
+          lowerText.includes('loading gpu') ||
           lowerText.includes('compiling') ||
-          lowerText.includes('shader') ||
-          lowerText.includes('gpu') ||
-          lowerText.includes('wasm') ||
-          lowerText.includes('finish');
+          lowerText.includes('finish loading');
 
         const stepStatus =
           (rawProgress !== null && rawProgress >= 1) || isGpuLoadStep || hasVerifiedLocalCache
@@ -3664,29 +3246,38 @@ export async function ensureWebLLMEngine(options = {}) {
           );
         }
 
-        const progressPayload = {
+        updateEngineState({
           status: stepStatus,
           modelId: resolvedModelId,
+          loadedModelId: null,
           progress: rawProgress ?? 0,
           progressPercent,
           progressText: text || initialText,
           timeElapsed,
           isCached: hasVerifiedLocalCache
-        };
-
-        updateEngineState({
-          ...progressPayload,
-          loadedModelId: null
         });
 
-        broadcastInitProgress(progressPayload);
+        if (typeof onProgress === 'function') {
+          try {
+            onProgress({
+              status: stepStatus,
+              modelId: resolvedModelId,
+              progress: rawProgress ?? 0,
+              progressPercent,
+              progressText: text || initialText,
+              timeElapsed,
+              isCached: hasVerifiedLocalCache
+            });
+          } catch (_) {
+            // Never allow progress listener error to break initialization
+          }
+        }
       };
 
       const chatOpts = {
         context_window_size: catalogEntry?.contextWindowSize || 4096
       };
 
-      runtimeStats.totalEngineInits += 1;
       const createdEngine = typeof customEngineFactory === 'function'
         ? await Promise.race([
             customEngineFactory({
@@ -3729,7 +3320,6 @@ export async function ensureWebLLMEngine(options = {}) {
 
       engineInstance = createdEngine;
       loadedModelId = resolvedModelId;
-      initSession.completed = true;
 
       const readyReport = {
         status: 'ready',
@@ -3754,7 +3344,13 @@ export async function ensureWebLLMEngine(options = {}) {
         { startMs: initStartMs }
       );
 
-      broadcastInitProgress(readyReport);
+      if (typeof onProgress === 'function') {
+        try {
+          onProgress(readyReport);
+        } catch (_) {
+          // Ignore callback error
+        }
+      }
 
       return {
         engine: createdEngine,
@@ -3795,28 +3391,11 @@ export async function ensureWebLLMEngine(options = {}) {
           { fromModelId: resolvedModelId, toModelId: catalogEntry.f32FallbackModelId },
           { startMs: initStartMs, level: 'warn' }
         );
-        // Update memoized GPU capabilities so future calls know shader-f16 failed at device creation
-        if (cachedGpuSupportResult) {
-          cachedGpuSupportResult = {
-            ...cachedGpuSupportResult,
-            hasShaderF16: false
-          };
-        }
-        // Clear activeInitSession BEFORE recursive fallback call so it does not self-deadlock
-        // waiting on `priorSession.promise`!
-        if (activeInitSession === initSession) {
-          activeInitSession = null;
-          activeInitPromise = null;
-          activeInitModelId = null;
-        }
-        if (activeInitAbortController === initController) {
-          activeInitAbortController = null;
-        }
         return await ensureWebLLMEngine({
           modelId: catalogEntry.f32FallbackModelId,
           allowF32Fallback: false,
-          onProgress: broadcastInitProgress,
-          signal: initController.signal
+          onProgress,
+          signal
         });
       }
 
@@ -3850,22 +3429,20 @@ export async function ensureWebLLMEngine(options = {}) {
 
       throw normalizedError;
     } finally {
-      initSession.completed = true;
       clearWorkerWatchdog?.();
       detachWorkerDiagListener?.();
+      if (removeAbortListener) {
+        removeAbortListener();
+      }
       if (activeInitAbortController === initController) {
         activeInitAbortController = null;
       }
-      if (activeInitSession === initSession) {
-        activeInitSession = null;
-        activeInitPromise = null;
-        activeInitModelId = null;
-      }
+      activeInitPromise = null;
+      activeInitModelId = null;
     }
   })();
 
-  activeInitPromise = initSession.promise;
-  return attachWaiterToInitSession(initSession, { onProgress, signal });
+  return activeInitPromise;
 }
 
 // ============================================================================
@@ -3968,14 +3545,25 @@ function trimMessagesToContextBudget(messages, maxInputChars = 12_500) {
  */
 export function stopWebLLMGeneration() {
   manualStopRequested = true;
-  activeGenerationId = 0;
-  runtimeStats.activeGenerationId = 0;
 
-  if (activeInitSession || activeInitAbortController || activeInitAbortReject) {
-    abortActiveInitSessionImmediate('Model initialization stopped by user.');
-    if (!engineInstance) {
-      return;
+  if ((activeInitAbortController || activeInitAbortReject) && !engineInstance) {
+    if (activeInitAbortController) {
+      try {
+        activeInitAbortController.abort();
+      } catch (_) {
+        // Ignore
+      }
+      activeInitAbortController = null;
     }
+    if (activeInitAbortReject) {
+      const rejectInit = activeInitAbortReject;
+      activeInitAbortReject = null;
+      terminateWorkerImmediate();
+      rejectInit(createAbortError('Model initialization stopped by user.'));
+    } else {
+      terminateWorkerImmediate();
+    }
+    return;
   }
 
   if (engineInstance) {
@@ -3988,7 +3576,7 @@ export function stopWebLLMGeneration() {
 }
 
 /**
- * Streams a chat completion from the local WebLLM engine running inside the browser worker.
+ * Streams a chat completion from the local WebLLM Qwen engine running inside the browser worker.
  *
  * @param {Object} params
  * @param {string} params.prompt - User prompt text
@@ -4002,8 +3590,6 @@ export function stopWebLLMGeneration() {
  * @param {(chunkText: string, accumulatedText: string) => void} [params.onChunk]
  * @param {(report: Object) => void} [params.onProgress]
  * @param {AbortSignal} [params.signal]
- * @param {() => boolean} [params.isRequestActive] - Optional request ownership validator
- * @param {number} [params.chunkBatchIntervalMs=24] - Window (ms) to coalesce rapid worker token bursts after first token
  * @returns {Promise<{ text: string, modelUsed: string, provider: string, usage?: Object }>}
  */
 export async function streamWebLLMMessage({
@@ -4019,8 +3605,6 @@ export async function streamWebLLMMessage({
   onChunk,
   onProgress,
   signal,
-  isRequestActive = null,
-  chunkBatchIntervalMs = 24,
   temperature = undefined,
   top_p = undefined,
   topP = undefined,
@@ -4106,65 +3690,21 @@ export async function streamWebLLMMessage({
     customRepetitionPenalty = numRep;
   }
 
-  const checkCallerActive = () => {
-    if (signal?.aborted) return false;
-    if (typeof isRequestActive === 'function' && !isRequestActive()) return false;
-    return true;
-  };
-
-  if (!checkCallerActive()) {
+  if (signal?.aborted) {
     throw createAbortError();
   }
 
-  // If a previous generation is currently running on the worker and its caller is already aborted/inactive,
-  // immediately interrupt the worker so the new request doesn't wait behind obsolete token generation.
-  if (
-    isGeneratingNow &&
-    engineInstance &&
-    typeof activeGenerationAbortCheck === 'function' &&
-    !activeGenerationAbortCheck()
-  ) {
-    try {
-      engineInstance.interruptGenerate();
-    } catch (_) {
-      // Ignore
-    }
-  }
-
-  // Serialize concurrent requests on the single WebGPU worker pipeline, while allowing
-  // queued requests to abort immediately if their caller signal aborts while waiting.
+  // Serialize concurrent requests on the single WebGPU worker pipeline
   const previousTurn = generationQueuePromise.catch(() => {});
   let releaseQueue;
   generationQueuePromise = new Promise((resolve) => {
     releaseQueue = resolve;
   });
 
-  try {
-    if (signal) {
-      let removeQueueAbort = null;
-      try {
-        await Promise.race([
-          previousTurn,
-          new Promise((_, reject) => {
-            if (signal.aborted) {
-              reject(createAbortError());
-              return;
-            }
-            const onQueueAbort = () => reject(createAbortError());
-            signal.addEventListener('abort', onQueueAbort, { once: true });
-            removeQueueAbort = () => signal.removeEventListener('abort', onQueueAbort);
-          })
-        ]);
-      } finally {
-        if (removeQueueAbort) {
-          removeQueueAbort();
-        }
-      }
-    } else {
-      await previousTurn;
-    }
+  await previousTurn;
 
-    if (!checkCallerActive()) {
+  try {
+    if (signal?.aborted) {
       throw createAbortError();
     }
 
@@ -4174,7 +3714,7 @@ export async function streamWebLLMMessage({
       signal
     });
 
-    if (!checkCallerActive()) {
+    if (signal?.aborted) {
       throw createAbortError();
     }
 
@@ -4242,7 +3782,7 @@ export async function streamWebLLMMessage({
 
       // Direct deterministic response when attached image/document has NO_TEXT_DETECTED or unreadable notice
       if (preparedContext.directAnswer && !preparedContext.formattedContext) {
-        if (!checkCallerActive()) {
+        if (signal?.aborted) {
           throw createAbortError();
         }
         if (typeof onStart === 'function') {
@@ -4291,27 +3831,17 @@ export async function streamWebLLMMessage({
 
     const boundedMessages = trimMessagesToContextBudget(rawMessages, genParams.maxInputChars);
 
-    if (!checkCallerActive()) {
+    if (signal?.aborted) {
       throw createAbortError();
     }
 
-    const myGenerationId = ++generationSequence;
-    activeGenerationId = myGenerationId;
-    runtimeStats.activeGenerationId = myGenerationId;
-    runtimeStats.totalGenerations += 1;
     manualStopRequested = false;
     isGeneratingNow = true;
-
-    const isGenerationStillValid = () =>
-      activeGenerationId === myGenerationId && !manualStopRequested && checkCallerActive();
-    activeGenerationAbortCheck = isGenerationStillValid;
 
     let removeAbortHandler = null;
     if (signal) {
       const handleAbort = () => {
-        if (activeGenerationId === myGenerationId) {
-          stopWebLLMGeneration();
-        }
+        stopWebLLMGeneration();
       };
       if (signal.aborted) {
         handleAbort();
@@ -4321,17 +3851,13 @@ export async function streamWebLLMMessage({
       removeAbortHandler = () => signal.removeEventListener('abort', handleAbort);
     }
 
-    const generationStartMs = Date.now();
-    let firstTokenReceived = false;
-
     updateEngineState({
       status: 'generating',
       modelId,
-      progressText: 'Preparing response on device GPU...',
       error: null
     });
 
-    if (typeof onStart === 'function' && isGenerationStillValid()) {
+    if (typeof onStart === 'function' && !signal?.aborted && !manualStopRequested) {
       onStart({
         modelUsed: modelId,
         provider: WEBLLM_PROVIDER_ID
@@ -4341,57 +3867,8 @@ export async function streamWebLLMMessage({
     let accumulatedText = '';
     let finalUsage = undefined;
 
-    // Zero-TTFT-penalty token coalescer:
-    // - First token chunk is emitted immediately (0ms delay) so time-to-first-token is never delayed.
-    // - Subsequent rapid token bursts arriving within `effectiveBatchWindowMs` are coalesced into a
-    //   single `onChunk(pendingDelta, latestAccumulated)` emission.
-    // - On stream end, stop, or abort, any buffered text is flushed synchronously before returning.
-    const effectiveBatchWindowMs =
-      typeof chunkBatchIntervalMs === 'number' && Number.isFinite(chunkBatchIntervalMs) && chunkBatchIntervalMs >= 0
-        ? chunkBatchIntervalMs
-        : 24;
-    let pendingDeltaBuffer = '';
-    let latestSanitizedAccumulated = '';
-    let lastEmitTimestampMs = 0;
-
-    const flushPendingChunksNow = () => {
-      if (!pendingDeltaBuffer) return;
-      const deltaToSend = pendingDeltaBuffer;
-      const accToSend = latestSanitizedAccumulated;
-      pendingDeltaBuffer = '';
-      lastEmitTimestampMs = Date.now();
-      if (typeof onChunk === 'function' && isGenerationStillValid()) {
-        runtimeStats.uiChunkEmissions += 1;
-        onChunk(deltaToSend, accToSend);
-      }
-    };
-
-    const handleSanitizedChunk = (sanitizedDelta, sanitizedAccumulated) => {
-      if (!sanitizedDelta || !isGenerationStillValid()) return;
-      pendingDeltaBuffer += sanitizedDelta;
-      latestSanitizedAccumulated = sanitizedAccumulated;
-
-      const now = Date.now();
-      if (!firstTokenReceived) {
-        firstTokenReceived = true;
-        runtimeStats.lastTtftMs = Math.max(0, now - generationStartMs);
-        updateEngineState({
-          status: 'generating',
-          modelId,
-          progressText: 'Generating response...',
-          error: null
-        });
-        flushPendingChunksNow();
-        return;
-      }
-
-      if (effectiveBatchWindowMs === 0 || now - lastEmitTimestampMs >= effectiveBatchWindowMs) {
-        flushPendingChunksNow();
-      }
-    };
-
     const streamSanitizer = createStreamingResponseSanitizer(modelId, {
-      onChunk: handleSanitizedChunk,
+      onChunk,
       onStopDetected: () => {
         try {
           engine.interruptGenerate();
@@ -4424,7 +3901,7 @@ export async function streamWebLLMMessage({
       const asyncChunkGenerator = await engine.chat.completions.create(completionPayload);
 
       for await (const chunk of asyncChunkGenerator) {
-        if (!isGenerationStillValid() || streamSanitizer.isStopped()) {
+        if (signal?.aborted || manualStopRequested || streamSanitizer.isStopped()) {
           try {
             engine.interruptGenerate();
           } catch (_) {
@@ -4434,8 +3911,7 @@ export async function streamWebLLMMessage({
         }
 
         const delta = chunk?.choices?.[0]?.delta?.content;
-        if (delta && isGenerationStillValid()) {
-          runtimeStats.rawTokenChunksReceived += 1;
+        if (delta && !signal?.aborted && !manualStopRequested) {
           accumulatedText += delta;
           streamSanitizer.feed(delta, accumulatedText);
         }
@@ -4446,10 +3922,8 @@ export async function streamWebLLMMessage({
       }
 
       streamSanitizer.flush();
-      flushPendingChunksNow();
 
-      if (!isGenerationStillValid()) {
-        runtimeStats.totalAbortedGenerations += 1;
+      if (signal?.aborted || manualStopRequested) {
         throw createAbortError();
       }
 
@@ -4463,12 +3937,9 @@ export async function streamWebLLMMessage({
         });
       }
 
-      runtimeStats.lastGenerationDurationMs = Math.max(0, Date.now() - generationStartMs);
-
       updateEngineState({
         status: 'ready',
         modelId,
-        progressText: 'Model ready for offline chat',
         error: null
       });
 
@@ -4479,16 +3950,11 @@ export async function streamWebLLMMessage({
         usage: finalUsage
       };
     } catch (genErr) {
-      flushPendingChunksNow();
-      if (isAbortError(genErr) || !isGenerationStillValid()) {
-        if (runtimeStats.activeGenerationId === myGenerationId) {
-          runtimeStats.totalAbortedGenerations += 1;
-        }
+      if (isAbortError(genErr) || signal?.aborted || manualStopRequested) {
         if (engineInstance) {
           updateEngineState({
             status: 'ready',
             modelId,
-            progressText: 'Model ready for offline chat',
             error: null
           });
         }
@@ -4497,13 +3963,11 @@ export async function streamWebLLMMessage({
 
       // Recover cleanly from GPU device lost / OOM / worker crash so next turn reloads cleanly
       if (isFatalEngineError(genErr) || !workerInstance) {
-        cachedGpuSupportResult = null;
         await destroyWebLLMEngine();
       } else {
         updateEngineState({
           status: 'ready',
           modelId,
-          progressText: 'Model ready for offline chat',
           error: null
         });
       }
@@ -4528,13 +3992,6 @@ export async function streamWebLLMMessage({
 
       throw normalized;
     } finally {
-      if (activeGenerationId === myGenerationId) {
-        activeGenerationId = 0;
-        runtimeStats.activeGenerationId = 0;
-      }
-      if (activeGenerationAbortCheck === isGenerationStillValid) {
-        activeGenerationAbortCheck = null;
-      }
       isGeneratingNow = false;
       manualStopRequested = false;
       if (removeAbortHandler) {

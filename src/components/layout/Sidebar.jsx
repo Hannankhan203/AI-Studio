@@ -8,7 +8,7 @@ import { useAuth } from '../../context/AuthContext.jsx';
 import { useSettings } from '../../context/SettingsContext.jsx';
 import { usePWAInstall } from '../../hooks/usePWAInstall.js';
 
-const Sidebar = React.memo(function Sidebar({
+export default function Sidebar({
   isOpen,
   onClose,
   onNewChat,
@@ -291,7 +291,4 @@ const Sidebar = React.memo(function Sidebar({
       </div>
     </aside>
   );
-});
-
-export default Sidebar;
-
+}

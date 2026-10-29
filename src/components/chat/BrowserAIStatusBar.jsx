@@ -132,9 +132,7 @@ export default function BrowserAIStatusBar({
       label: isGenerating ? 'Generating' : isOffline ? 'Offline Ready' : 'Ready',
       variant: isGenerating ? 'active' : 'ready'
     };
-    headline = isGenerating
-      ? `${activeCatalog.shortLabel} — Generating locally`
-      : `${activeCatalog.shortLabel} — Ready on device`;
+    headline = `${activeCatalog.shortLabel} — Ready on device`;
     detail = isGenerating
       ? 'Generating response locally via WebGPU (no server or API calls).'
       : 'Running locally in your browser via WebGPU. Cached for repeat use.';

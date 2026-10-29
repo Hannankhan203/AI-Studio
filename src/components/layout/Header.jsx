@@ -36,7 +36,7 @@ import { DEFAULT_WEBLLM_MODEL_ID } from '../../services/webllmService.js';
  * @param {() => void} [props.onExportText]
  * @param {boolean} [props.hasExportableMessages=false]
  */
-const Header = React.memo(function Header({
+export default function Header({
   sidebarOpen,
   onToggleSidebar,
   onNewChat,
@@ -552,7 +552,4 @@ const Header = React.memo(function Header({
       )}
     </header>
   );
-});
-
-export default Header;
-
+}

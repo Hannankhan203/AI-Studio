@@ -4,7 +4,7 @@
  * in-browser previews for supported formats (PDF, text, markdown, images), and downloads.
  */
 
-import { isVisionCapableProvider, classifySimpleGreetingIntent } from './documentContextService.js';
+import { isVisionCapableProvider } from './documentContextService.js';
 
 const DB_NAME = 'orvix_attachments_db';
 const DB_VERSION = 1;
@@ -941,21 +941,9 @@ export function sanitizeAttachmentForNetwork(att, options = {}) {
   return rest;
 }
 
-export const MAX_NETWORK_HISTORY_MESSAGES = 16;
-
 function sanitizeHistoryMessageForNetwork(msg) {
   if (!msg || typeof msg !== 'object') return msg;
-  const {
-    alternatives,
-    requestStartTime,
-    canSwitchProvider,
-    suggestedProviders,
-    failedPrompt,
-    failedProvider,
-    canonicalError,
-    ...next
-  } = msg;
-
+  const next = { ...msg };
   if (Array.isArray(next.attachments)) {
     next.attachments = next.attachments.map((att) => {
       if (!att || typeof att !== 'object') return att;
@@ -969,37 +957,33 @@ function sanitizeHistoryMessageForNetwork(msg) {
       const { base64, dataUrl, data, file, blob, previewUrl, ...metaOnly } = att;
       return metaOnly;
     });
-  } else if (Array.isArray(alternatives)) {
-    // Preserve any referenced attachment metadata from alternatives without sending duplicate full alternative texts
-    const altAttachments = [];
-    for (const alt of alternatives) {
-      if (alt && Array.isArray(alt.referencedAttachments)) {
-        for (const att of alt.referencedAttachments) {
-          if (att && typeof att === 'object') {
-            const { base64, dataUrl, data, file, blob, previewUrl, ...metaOnly } = att;
-            altAttachments.push(metaOnly);
-          }
-        }
-      }
-    }
-    if (altAttachments.length > 0) {
-      next.referencedAttachments = altAttachments;
-    }
+  }
+  if (Array.isArray(next.alternatives)) {
+    next.alternatives = next.alternatives.map((alt) => {
+      if (!alt || typeof alt !== 'object' || !Array.isArray(alt.referencedAttachments)) return alt;
+      return {
+        ...alt,
+        referencedAttachments: alt.referencedAttachments.map((att) => {
+          if (!att || typeof att !== 'object') return att;
+          const { base64, dataUrl, data, file, blob, previewUrl, ...metaOnly } = att;
+          return metaOnly;
+        })
+      };
+    });
   }
   return next;
 }
 
 /**
  * Normalizes a /api/chat request payload, ensures zero base64/dataUrl duplication,
- * strips raw image bytes for non-vision providers, bounds conversation history size,
- * and validates the complete UTF-8 JSON byte length against the deployed /api/chat budget.
+ * strips raw image bytes for non-vision providers, and validates the complete UTF-8 JSON
+ * byte length against the deployed /api/chat budget.
  *
  * @param {any} payload
  * @param {Object} [options={}]
  * @param {number} [options.maxImageBytes]
  * @param {number} [options.maxRequestBytes]
  * @param {boolean} [options.includeImageBytes]
- * @param {number} [options.maxHistoryMessages]
  * @returns {string} Validated JSON body string
  */
 export function prepareChatRequestBody(payload, options = {}) {
@@ -1024,23 +1008,9 @@ export function prepareChatRequestBody(payload, options = {}) {
       )
     : [];
 
-  const greetingCheck = classifySimpleGreetingIntent(payload?.prompt, {
-    attachments: normalizedAttachments,
-    isContinuation: Boolean(payload?.isContinuation)
-  });
-
-  const maxHistory =
-    typeof options.maxHistoryMessages === 'number' && options.maxHistoryMessages >= 0
-      ? options.maxHistoryMessages
-      : greetingCheck.isSimpleGreeting
-        ? greetingCheck.maxContextMessages
-        : MAX_NETWORK_HISTORY_MESSAGES;
-
-  const rawHistory = Array.isArray(payload?.history) ? payload.history : [];
-  const boundedHistory =
-    rawHistory.length > maxHistory ? rawHistory.slice(-maxHistory) : rawHistory;
-
-  const normalizedHistory = boundedHistory.map(sanitizeHistoryMessageForNetwork);
+  const normalizedHistory = Array.isArray(payload?.history)
+    ? payload.history.map(sanitizeHistoryMessageForNetwork)
+    : [];
 
   const normalizedPayload = {
     ...payload,

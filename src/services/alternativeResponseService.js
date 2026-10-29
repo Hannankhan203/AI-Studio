@@ -49,30 +49,33 @@ import { sanitizeStoredDisplayModel } from './providerModelSanitizer.js';
 export function createAlternativeRecord({
   id = null,
   parentMessageId = null,
+  interactionId = null,
   content = '',
   provider = 'gemini',
   modelUsed = null,
   responseTimeMs = null,
-  firstVisibleTextMs = null,
   timestamp = '',
   createdAt = null,
+  createdAtMs = null,
   referencedAttachments = [],
   isError = false,
   isStopped = false
 } = {}) {
   const chosenProvider = provider || 'gemini';
   const cleanModel = sanitizeStoredDisplayModel(chosenProvider, modelUsed);
+  const resolvedCreated = typeof createdAt === 'number' && !isNaN(createdAt) ? createdAt : Date.now();
   return {
     id: id || generateAlternativeId(chosenProvider),
     parentMessageId: parentMessageId || null,
+    interactionId: interactionId || null,
     sender: 'assistant',
     content: typeof content === 'string' ? content : '',
     provider: chosenProvider,
     modelUsed: cleanModel || null,
     responseTimeMs: typeof responseTimeMs === 'number' && !isNaN(responseTimeMs) ? responseTimeMs : null,
-    firstVisibleTextMs: typeof firstVisibleTextMs === 'number' && !isNaN(firstVisibleTextMs) ? firstVisibleTextMs : null,
     timestamp: timestamp || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-    createdAt: typeof createdAt === 'number' && !isNaN(createdAt) ? createdAt : Date.now(),
+    createdAt: resolvedCreated,
+    createdAtMs: typeof createdAtMs === 'number' && !isNaN(createdAtMs) ? createdAtMs : resolvedCreated,
     referencedAttachments: Array.isArray(referencedAttachments) ? [...referencedAttachments] : [],
     isError: Boolean(isError),
     isStopped: Boolean(isStopped)
@@ -99,6 +102,20 @@ export function normalizeAssistantMessage(message, precedingUserMessage = null) 
     baseMessage.parentMessageId ||
     (precedingUserMessage?.id ? precedingUserMessage.id : null);
 
+  const interactionId =
+    baseMessage.interactionId ||
+    (precedingUserMessage?.interactionId ? precedingUserMessage.interactionId : null);
+
+  const createdAt =
+    typeof baseMessage.createdAt === 'number' && !isNaN(baseMessage.createdAt)
+      ? baseMessage.createdAt
+      : Date.now();
+
+  const createdAtMs =
+    typeof baseMessage.createdAtMs === 'number' && !isNaN(baseMessage.createdAtMs)
+      ? baseMessage.createdAtMs
+      : createdAt;
+
   let alternatives = [];
 
   if (Array.isArray(baseMessage.alternatives) && baseMessage.alternatives.length > 0) {
@@ -107,13 +124,14 @@ export function normalizeAssistantMessage(message, precedingUserMessage = null) 
       createAlternativeRecord({
         id: alt.id,
         parentMessageId: alt.parentMessageId || parentMessageId,
+        interactionId: alt.interactionId || interactionId,
         content: alt.content,
         provider: alt.provider || message.provider || 'gemini',
         modelUsed: alt.modelUsed || message.modelUsed || null,
         responseTimeMs: alt.responseTimeMs,
-        firstVisibleTextMs: alt.firstVisibleTextMs,
         timestamp: alt.timestamp || message.timestamp,
-        createdAt: alt.createdAt,
+        createdAt: alt.createdAt || createdAt,
+        createdAtMs: alt.createdAtMs || createdAtMs,
         referencedAttachments: alt.referencedAttachments || message.referencedAttachments || [],
         isError: alt.isError,
         isStopped: alt.isStopped
@@ -126,13 +144,14 @@ export function normalizeAssistantMessage(message, precedingUserMessage = null) 
       createAlternativeRecord({
         id: initialAltId,
         parentMessageId,
+        interactionId,
         content: message.content || '',
         provider: message.provider || 'gemini',
         modelUsed: message.modelUsed || null,
         responseTimeMs: message.responseTimeMs,
-        firstVisibleTextMs: message.firstVisibleTextMs,
         timestamp: message.timestamp || '',
-        createdAt: message.createdAt || Date.now(),
+        createdAt,
+        createdAtMs,
         referencedAttachments: message.referencedAttachments || [],
         isError: message.isError,
         isStopped: message.isStopped
@@ -153,13 +172,15 @@ export function normalizeAssistantMessage(message, precedingUserMessage = null) 
   return {
     ...message,
     parentMessageId,
+    interactionId,
+    createdAt,
+    createdAtMs,
     activeAlternativeId,
     alternatives,
     content: activeAlt.content,
     provider: activeAlt.provider,
     modelUsed: activeAlt.modelUsed,
     responseTimeMs: activeAlt.responseTimeMs,
-    firstVisibleTextMs: activeAlt.firstVisibleTextMs,
     timestamp: activeAlt.timestamp || message.timestamp,
     referencedAttachments:
       activeAlt.referencedAttachments && activeAlt.referencedAttachments.length > 0
@@ -228,7 +249,6 @@ export function switchActiveAlternativeInMessage(assistantMessage, targetAlterna
     provider: targetAlt.provider,
     modelUsed: targetAlt.modelUsed,
     responseTimeMs: targetAlt.responseTimeMs,
-    firstVisibleTextMs: targetAlt.firstVisibleTextMs,
     timestamp: targetAlt.timestamp || assistantMessage.timestamp,
     referencedAttachments:
       targetAlt.referencedAttachments && targetAlt.referencedAttachments.length > 0
@@ -280,9 +300,7 @@ export function updateActiveAlternativeInMessage(assistantMessage, updates = {})
     provider: updates.provider || activeAlt.provider,
     modelUsed: updates.modelUsed !== undefined ? updates.modelUsed : activeAlt.modelUsed,
     responseTimeMs:
-      updates.responseTimeMs !== undefined ? updates.responseTimeMs : activeAlt.responseTimeMs,
-    firstVisibleTextMs:
-      updates.firstVisibleTextMs !== undefined ? updates.firstVisibleTextMs : activeAlt.firstVisibleTextMs
+      updates.responseTimeMs !== undefined ? updates.responseTimeMs : activeAlt.responseTimeMs
   };
 }
 

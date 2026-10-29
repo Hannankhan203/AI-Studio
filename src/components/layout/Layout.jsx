@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import Sidebar from './Sidebar.jsx';
 import Header from './Header.jsx';
 
@@ -569,31 +569,31 @@ export default function Layout({
     };
   }, []);
 
-  const toggleSidebar = useCallback(() => {
+  const toggleSidebar = () => {
     setSidebarOpen((prev) => !prev);
-  }, []);
+  };
 
-  const closeSidebar = useCallback(() => {
+  const closeSidebar = () => {
     setSidebarOpen(false);
-  }, []);
+  };
 
-  const handleSelectChat = useCallback((chatId) => {
+  const handleSelectChat = (chatId) => {
     if (onSelectChat) {
       onSelectChat(chatId);
     }
-    if (typeof window !== 'undefined' && window.innerWidth < 768) {
+    if (window.innerWidth < 768) {
       setSidebarOpen(false);
     }
-  }, [onSelectChat]);
+  };
 
-  const handleNewChat = useCallback(() => {
+  const handleNewChat = () => {
     if (onNewChat) {
       onNewChat();
     }
-    if (typeof window !== 'undefined' && window.innerWidth < 768) {
+    if (window.innerWidth < 768) {
       setSidebarOpen(false);
     }
-  }, [onNewChat]);
+  };
 
   return (
     <div className={`chatora-app ${sidebarOpen ? 'sidebar-is-open' : 'sidebar-is-collapsed'}`}>
