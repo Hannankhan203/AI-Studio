@@ -825,6 +825,7 @@ await runTest('21. Incremental output is delivered in order', async () => {
 
   const res = await streamWebLLMMessage({
     prompt: 'Stream test',
+    chunkBatchIntervalMs: 0,
     onChunk: (delta) => chunksEmitted.push(delta)
   });
 

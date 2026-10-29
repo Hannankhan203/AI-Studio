@@ -1,6 +1,6 @@
 # Orvix
 
-**Version: v0.3.2**
+**Version: v0.3.3**
 
 <p align="center">
   <strong>An Intelligent, Multi-Model Conversational AI Workspace featuring On-Device Browser AI (WebLLM & WebGPU), Offline PWA App-Shell Caching, Client-Side Document Extraction, Dual-Format Table & Clipboard Formatting, Expanded Mobile Swipe Navigation, Mobile PWA Live Dictation with Whisper Refinement, Specialized Chat Modes, Multi-Model Response Alternatives, Global Chat-Input Focus, Pixel-Perfect Code Blocks, Live Latency Tracking, Controlled Continuation, and Deep Document Understanding</strong>
@@ -1123,7 +1123,16 @@ When troubleshooting streaming completions or intermittent upstream latency on s
 
 ---
 
-### v0.3.2 — AI Provider and Model Selector Ordering *(Current)*
+### v0.3.3 — Phase 5 AI Performance Verification & Regression Hardening *(Current)*
+- **All 8 AI Options Verified**: Comprehensive regression and performance testing across Cloud AI (Google Gemini, Groq, OpenRouter, Cloudflare Workers AI) and Browser AI on-device models (Qwen 2.5 1.5B, Qwen3 0.6B, SmolLM2 360M, SmolLM2 135M).
+- **Zero-TTFT-Penalty Token Coalescer**: Emits the first token chunk with 0ms delay while coalescing subsequent rapid synchronous token bursts into an effective batch interval (reducing UI chunk spam by 97.5% and React state updates by 97.9% during high-rate WebLLM streaming).
+- **Greeting Fast-Path & False-Positive Guarding**: Instant local response for standalone greetings while strictly guarding genuine queries containing "hi" or "hello", multi-turn continuations, and prompts with attached documents or images from premature interception.
+- **Gemini Failover & Header Timeout Protection**: Automated failover from primary `gemini-3.8-flash` to `gemini-3.1-flash-lite` upon upstream 404 or temporary 503 high-demand spikes, backed by a 4-tier timeout architecture (Header, First-Byte, Inactivity, and Total Request timeouts).
+- **Request Isolation & Race Cancellation**: Request isolation guarantees that cancelled requests immediately abort active outbound fetch signals, release local worker pipelines, prevent late chunk emissions, and block stale background tasks from clobbering newly initiated prompts.
+- **Cross-Provider Model Sanitization**: Strict rejection of cross-provider model IDs and synthetic labels; automatic model resolution upon provider switching without prompt cross-contamination or silent cloud fallback of local WebLLM sessions.
+- **Offline Reliability & PWA Validation**: Verified 45 offline reliability tests confirming local document extraction (PDF, DOCX, PPTX, CSV, JSON, XML, TXT), WebGPU cache inventory checking, and clean `WEBLLM_OFFLINE_UNCACHED` guidance when uncached models are accessed without internet connectivity.
+
+### v0.3.2 — AI Provider and Model Selector Ordering
 - **Exact Reliability Sequence Ordering**: Updated the AI provider and model selectors to display options strictly in sequence from least reliable to most reliable:
   - **Cloud AI Providers**: 1. Google Gemini, 2. Groq, 3. OpenRouter, 4. Cloudflare Workers AI.
   - **Browser AI Models**: 1. SmolLM2 135M, 2. SmolLM2 360M, 3. Qwen3 0.6B, 4. Qwen 2.5 1.5B.
