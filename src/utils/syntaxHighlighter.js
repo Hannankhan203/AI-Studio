@@ -404,9 +404,14 @@ export function tokenizeCode(code = '', language = '') {
     }
 
     if (!matched) {
-      // Accumulate plain characters until the next potential token boundary
+      // Accumulate plain characters (including contiguous whitespace) until the next potential token boundary
       let plainEnd = index + 1;
       while (plainEnd < len) {
+        const ch = code.charCodeAt(plainEnd);
+        if (ch === 32 || ch === 9 || ch === 10 || ch === 13) {
+          plainEnd++;
+          continue;
+        }
         let isBoundary = false;
         for (let r = 0; r < rules.length; r++) {
           rules[r].regex.lastIndex = plainEnd;

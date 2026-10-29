@@ -27,31 +27,30 @@ export const TARGET_REFINED_MODEL_IDS = Object.freeze([
 ]);
 
 /**
- * Returns true strictly if the given modelId is one of the three refined models.
- * Returns false for Qwen 2.5 1.5B and all cloud models.
- */
-export function isRefinedTargetModel(modelId) {
-  if (!modelId || typeof modelId !== 'string') return false;
-  const trimmed = modelId.trim();
-  return TARGET_REFINED_MODEL_IDS.includes(trimmed);
-}
-
-/**
  * Maps model ID to profile key. Returns null for protected/unrefined models.
  */
 export function getModelProfileKey(modelId) {
   if (!modelId || typeof modelId !== 'string') return null;
   const trimmed = modelId.trim();
-  if (trimmed.startsWith('SmolLM2-135M-Instruct')) {
+  if (trimmed.startsWith('SmolLM2-135M-Instruct') || trimmed.toLowerCase().startsWith('smollm2-135m')) {
     return REFINED_MODEL_KEYS.SMOLLM2_135M;
   }
-  if (trimmed.startsWith('SmolLM2-360M-Instruct')) {
+  if (trimmed.startsWith('SmolLM2-360M-Instruct') || trimmed.toLowerCase().startsWith('smollm2-360m')) {
     return REFINED_MODEL_KEYS.SMOLLM2_360M;
   }
-  if (trimmed.startsWith('Qwen3-0.6B')) {
+  if (trimmed.startsWith('Qwen3-0.6B') || trimmed.toLowerCase().startsWith('qwen3-0.6b') || trimmed.toLowerCase().startsWith('qwen3-06b')) {
     return REFINED_MODEL_KEYS.QWEN3_06B;
   }
   return null;
+}
+
+/**
+ * Returns true strictly if the given modelId is one of the three refined models.
+ * Returns false for Qwen 2.5 1.5B and all cloud models.
+ */
+export function isRefinedTargetModel(modelId) {
+  if (!modelId || typeof modelId !== 'string') return false;
+  return Boolean(getModelProfileKey(modelId));
 }
 
 /**
@@ -63,25 +62,27 @@ export const BROWSER_AI_PROFILES = Object.freeze({
     label: 'SmolLM2 135M Instruct',
     tier: 'ultra-lightweight',
     temperature: Object.freeze({
-      general: 0.3,
-      coding: 0.2
+      general: 0.2,
+      coding: 0.1
     }),
     top_p: 0.85,
-    repetition_penalty: 1.15,
+    repetition_penalty: 1.03,
     maxTokens: Object.freeze({
-      concise: 256,
-      default: 512,
-      detailed: 768
+      concise: 128,
+      default: 256,
+      detailed: 512
     }),
     stop: Object.freeze([
       '<|endoftext|>',
       '<|im_end|>',
       '<|end_of_text|>',
       '\nUser:',
-      '\nuser:'
+      '\nuser:',
+      '\n\nUser:',
+      '\n\nuser:'
     ]),
     maxInputChars: 5_000,
-    systemPromptDescription: 'Compact, plain-language instruction optimized for ultra-lightweight ~135M parameter capacity.'
+    systemPromptDescription: 'Minimal, direct plain-language instruction optimized for ultra-lightweight ~135M parameter capacity.'
   }),
 
   [REFINED_MODEL_KEYS.SMOLLM2_360M]: Object.freeze({
@@ -89,25 +90,27 @@ export const BROWSER_AI_PROFILES = Object.freeze({
     label: 'SmolLM2 360M Instruct',
     tier: 'compact',
     temperature: Object.freeze({
-      general: 0.5,
-      coding: 0.25
+      general: 0.3,
+      coding: 0.15
     }),
-    top_p: 0.9,
-    repetition_penalty: 1.10,
+    top_p: 0.85,
+    repetition_penalty: 1.04,
     maxTokens: Object.freeze({
-      concise: 384,
-      default: 768,
-      detailed: 1024
+      concise: 256,
+      default: 512,
+      detailed: 896
     }),
     stop: Object.freeze([
       '<|endoftext|>',
       '<|im_end|>',
       '<|end_of_text|>',
       '\nUser:',
-      '\nuser:'
+      '\nuser:',
+      '\n\nUser:',
+      '\n\nuser:'
     ]),
     maxInputChars: 8_000,
-    systemPromptDescription: 'Structured, bullet-point and code-friendly instruction for compact ~360M parameter model.'
+    systemPromptDescription: 'Clean, direct instruction prioritizing structured answers and instruction following for compact ~360M parameter model.'
   }),
 
   [REFINED_MODEL_KEYS.QWEN3_06B]: Object.freeze({
@@ -115,15 +118,18 @@ export const BROWSER_AI_PROFILES = Object.freeze({
     label: 'Qwen3 0.6B',
     tier: 'lightweight',
     temperature: Object.freeze({
-      general: 0.6,
-      coding: 0.3
+      general: 0.3,
+      coding: 0.15
     }),
-    top_p: 0.9,
-    repetition_penalty: 1.08,
+    top_p: 0.85,
+    repetition_penalty: 1.05,
+    extra_body: Object.freeze({
+      enable_thinking: false
+    }),
     maxTokens: Object.freeze({
-      concise: 448,
-      default: 896,
-      detailed: 1280
+      concise: 256,
+      default: 512,
+      detailed: 1024
     }),
     stop: Object.freeze([
       '<|im_end|>',
@@ -132,10 +138,14 @@ export const BROWSER_AI_PROFILES = Object.freeze({
       '<|end_of_text|>',
       '<|assistant|>',
       '<|user|>',
-      '<|system|>'
+      '<|system|>',
+      '\nUser:',
+      '\nuser:',
+      '\n\nUser:',
+      '\n\nuser:'
     ]),
     maxInputChars: 10_000,
-    systemPromptDescription: 'Natural, coherent markdown framing preventing preamble and internal monologues.'
+    systemPromptDescription: 'Clean direct instruction bypassing reasoning drift with non-thinking execution for Qwen3 0.6B.'
   })
 });
 
@@ -161,90 +171,60 @@ export function buildProfileSystemInstruction(modelId, { username = null, prefer
     : null;
 
   if (profileKey === REFINED_MODEL_KEYS.SMOLLM2_135M) {
-    const parts = [
-      'You are Orvix, a helpful AI assistant. Give short, direct, and accurate answers in simple language. Answer one question at a time. Be concise, and avoid filler or repetition.'
-    ];
+    if (mode === 'coding') {
+      return 'You are a helpful assistant. Provide clean, working code directly.';
+    }
+
+    const parts = ['You are a helpful assistant. Answer the question directly in simple words.'];
 
     if (cleanName) {
-      parts.push(`The user's preferred name is ${cleanName}.`);
+      parts.push(`User name: ${cleanName}.`);
     }
 
     if (preferences?.responseLength === 'concise') {
-      parts.push('Keep answers very brief.');
+      parts.push('Keep answers brief.');
     } else if (preferences?.responseLength === 'detailed') {
-      parts.push('Provide a clear, simple explanation.');
-    }
-
-    if (mode === 'coding') {
-      parts.push('Provide short, working code with minimal explanation.');
-    } else if (mode === 'writing') {
-      parts.push('Write clearly and directly in simple prose.');
-    } else if (mode === 'learning') {
-      parts.push('Explain the concept simply step by step.');
+      parts.push('Explain clearly with simple steps.');
     }
 
     return parts.join(' ');
   }
 
   if (profileKey === REFINED_MODEL_KEYS.SMOLLM2_360M) {
-    const parts = [
-      'You are Orvix, a helpful and precise AI assistant. Answer questions directly with clear structure, bullet points, or concise code. Provide factual explanations and avoid unnecessary preamble, repetitive phrases, or filler.'
-    ];
+    if (mode === 'coding') {
+      return 'You are a helpful assistant. Provide clear, correct code with brief explanations.';
+    }
+
+    const parts = ['You are a helpful assistant. Answer the user\'s question directly and follow any formatting instructions.'];
 
     if (cleanName) {
-      parts.push(`The user's preferred name is ${cleanName}. Address the user naturally when appropriate.`);
+      parts.push(`User name: ${cleanName}.`);
     }
 
     if (preferences?.responseLength === 'concise') {
-      parts.push('Preferred response length: Concise. Keep explanations brief, compact, and directly to the point.');
+      parts.push('Keep answers brief and to the point.');
     } else if (preferences?.responseLength === 'detailed') {
-      parts.push('Preferred response length: Detailed. Provide structured explanations with step-by-step reasoning or practical examples.');
-    } else if (preferences?.responseLength === 'balanced') {
-      parts.push('Provide an optimal balance of clarity and conciseness.');
-    }
-
-    if (preferences?.beginnerFriendly) {
-      parts.push('Use accessible language and clear analogies without jargon.');
-    }
-
-    if (mode === 'coding') {
-      parts.push('Provide clean, well-formatted code blocks with language tags and concise explanations.');
-    } else if (mode === 'writing') {
-      parts.push('Focus on clear writing, structured paragraphs, and engaging phrasing.');
-    } else if (mode === 'learning') {
-      parts.push('Break concepts into logical, easy-to-digest parts with key takeaways.');
+      parts.push('Provide structured explanations with clear examples.');
     }
 
     return parts.join(' ');
   }
 
   if (profileKey === REFINED_MODEL_KEYS.QWEN3_06B) {
-    const parts = [
-      'You are Orvix, a knowledgeable and direct AI assistant. Provide natural, well-phrased, and coherent answers with clean markdown formatting. Answer the user prompt directly without conversational filler, internal monologues, or repetition.'
-    ];
+    if (mode === 'coding') {
+      return 'You are a helpful assistant. Provide clean, efficient code with clear explanations.';
+    }
+
+    const parts = ['You are a helpful assistant. Answer the user\'s question directly, accurately, and follow all instructions.'];
 
     if (cleanName) {
-      parts.push(`The user's preferred name is ${cleanName}. Address the user naturally when appropriate.`);
+      parts.push(`User name: ${cleanName}.`);
     }
 
     if (preferences?.responseLength === 'concise') {
-      parts.push('Preferred response length: Concise. Keep explanations brief, compact, and directly to the point.');
+      parts.push('Keep answers brief and to the point.');
     } else if (preferences?.responseLength === 'detailed') {
-      parts.push('Preferred response length: Detailed. Provide thorough, well-structured explanations with background context and practical examples.');
-    } else if (preferences?.responseLength === 'balanced') {
-      parts.push('Provide an optimal balance between conciseness and thoroughness.');
-    }
-
-    if (preferences?.beginnerFriendly) {
-      parts.push('Explanation style: Clear and approachable. Explain complex topics using plain language and helpful analogies.');
-    }
-
-    if (mode === 'coding') {
-      parts.push('Provide clean, robust code with syntax highlighting tags, clear variable names, and concise technical rationale.');
-    } else if (mode === 'writing') {
-      parts.push('Produce polished, expressive, and cohesive text adhering to the requested style and tone.');
-    } else if (mode === 'learning') {
-      parts.push('Structure educational answers with intuitive conceptual overviews, numbered steps, and actionable summaries.');
+      parts.push('Provide organized, thorough explanations.');
     }
 
     return parts.join(' ');
@@ -308,6 +288,7 @@ export function resolveProfileGenerationParams(modelId, {
       max_tokens: effectiveMaxTokens,
       repetition_penalty: repetition_penalty !== undefined ? Number(repetition_penalty) : undefined,
       stop: undefined,
+      extra_body: undefined,
       maxInputChars: 12_500,
       isRefined: false
     };
@@ -370,6 +351,7 @@ export function resolveProfileGenerationParams(modelId, {
     repetition_penalty: effectiveRepPenalty,
     max_tokens: effectiveMaxTokens,
     stop: [...profile.stop],
+    extra_body: profile.extra_body ? { ...profile.extra_body } : undefined,
     maxInputChars: profile.maxInputChars,
     isRefined: true
   };
@@ -411,21 +393,27 @@ export function cleanModelOutput(rawText, modelId) {
 
   let text = rawText;
 
-  // 1. Truncate at first explicit stop/EOS delimiter
-  const eosMatches = [
+  // 1. Truncate at first explicit stop/EOS delimiter or simulated turn
+  const turnStops = [
     '<|im_end|>',
     '<|endoftext|>',
-    '<|end_of_text|>'
+    '<|end_of_text|>',
+    '\nUser:',
+    '\nuser:',
+    '\n\nUser:',
+    '\n\nuser:',
+    '\nHuman:',
+    '\nhuman:'
   ];
-  let earliestEos = -1;
-  for (const eos of eosMatches) {
-    const idx = text.indexOf(eos);
-    if (idx !== -1 && (earliestEos === -1 || idx < earliestEos)) {
-      earliestEos = idx;
+  let earliestStop = -1;
+  for (const stopToken of turnStops) {
+    const idx = text.indexOf(stopToken);
+    if (idx !== -1 && (earliestStop === -1 || idx < earliestStop)) {
+      earliestStop = idx;
     }
   }
-  if (earliestEos !== -1) {
-    text = text.slice(0, earliestEos);
+  if (earliestStop !== -1) {
+    text = text.slice(0, earliestStop);
   }
 
   // 2. Strip leaked delimiter markers
@@ -449,9 +437,20 @@ export function cleanModelOutput(rawText, modelId) {
     } else {
       text = text.replace(/^<think>\s*/i, '');
     }
+  } else if (text.includes('</think>')) {
+    const parts = text.split('</think>');
+    const afterThink = parts.slice(1).join('</think>').trim();
+    if (afterThink.length > 0) {
+      text = afterThink;
+    } else {
+      text = text.replace(/<\/think>/gi, '').trim();
+    }
   }
 
-  // 4. Clean up degenerate ending repetitions
+  // 4. Strip leading assistant/system echoes if model prefixed its output
+  text = text.replace(/^(?:assistant|orvix|ai|system):\s*/i, '');
+
+  // 5. Clean up degenerate ending repetitions
   text = deduplicateTrailingLoops(text);
 
   return text.trim();
@@ -477,6 +476,8 @@ export function createStreamingResponseSanitizer(modelId, { onChunk, onStopDetec
   let buffer = '';
   let accumulatedClean = '';
   let stopped = false;
+  let inThinkBlock = false;
+  let hasEmittedFirstChunk = false;
 
   const STOP_PATTERNS = [
     '<|im_end|>',
@@ -484,7 +485,14 @@ export function createStreamingResponseSanitizer(modelId, { onChunk, onStopDetec
     '<|end_of_text|>',
     '<|im_start|>',
     '<|assistant|>',
-    '<|user|>'
+    '<|user|>',
+    '<|system|>',
+    '\nUser:',
+    '\nuser:',
+    '\n\nUser:',
+    '\n\nuser:',
+    '\nHuman:',
+    '\nhuman:'
   ];
 
   return {
@@ -492,12 +500,30 @@ export function createStreamingResponseSanitizer(modelId, { onChunk, onStopDetec
       if (stopped) return;
       buffer += delta;
 
+      // Handle <think>...</think> blocks
+      if (!inThinkBlock && buffer.includes('<think>')) {
+        inThinkBlock = true;
+      }
+      if (inThinkBlock) {
+        if (buffer.includes('</think>')) {
+          buffer = buffer.slice(buffer.indexOf('</think>') + 8);
+          inThinkBlock = false;
+        } else {
+          // Still accumulating think tokens, do not emit
+          return;
+        }
+      }
+
       // Check for full stop pattern in buffer
       for (const pattern of STOP_PATTERNS) {
         const idx = buffer.indexOf(pattern);
         if (idx !== -1) {
-          const validPart = buffer.slice(0, idx);
+          let validPart = buffer.slice(0, idx);
+          if (!hasEmittedFirstChunk) {
+            validPart = validPart.replace(/^(?:assistant|orvix|ai|system):\s*/i, '');
+          }
           if (validPart) {
+            hasEmittedFirstChunk = true;
             accumulatedClean += validPart;
             onChunk?.(validPart, accumulatedClean);
           }
@@ -507,7 +533,7 @@ export function createStreamingResponseSanitizer(modelId, { onChunk, onStopDetec
         }
       }
 
-      // Check if buffer ends with a prefix of a stop pattern (e.g. '<|' or '<|im_')
+      // Check if buffer ends with a prefix of a stop pattern (e.g. '<|' or '\nU')
       let longestPrefixLen = 0;
       for (const pattern of STOP_PATTERNS) {
         for (let len = 1; len < pattern.length; len++) {
@@ -519,20 +545,38 @@ export function createStreamingResponseSanitizer(modelId, { onChunk, onStopDetec
         }
       }
 
-      if (buffer.endsWith('<') || buffer.endsWith('<t') || buffer.endsWith('<th') || buffer.endsWith('<thi') || buffer.endsWith('<thin') || buffer.endsWith('<think')) {
+      if (
+        buffer.endsWith('<') ||
+        buffer.endsWith('<t') ||
+        buffer.endsWith('<th') ||
+        buffer.endsWith('<thi') ||
+        buffer.endsWith('<thin') ||
+        buffer.endsWith('<think')
+      ) {
         longestPrefixLen = Math.max(longestPrefixLen, buffer.length - buffer.lastIndexOf('<'));
       }
 
       if (longestPrefixLen > 0) {
-        const safePart = buffer.slice(0, buffer.length - longestPrefixLen);
+        let safePart = buffer.slice(0, buffer.length - longestPrefixLen);
+        if (!hasEmittedFirstChunk && safePart) {
+          safePart = safePart.replace(/^(?:assistant|orvix|ai|system):\s*/i, '');
+        }
         if (safePart) {
+          hasEmittedFirstChunk = true;
           accumulatedClean += safePart;
           onChunk?.(safePart, accumulatedClean);
           buffer = buffer.slice(buffer.length - longestPrefixLen);
         }
       } else {
-        accumulatedClean += buffer;
-        onChunk?.(buffer, accumulatedClean);
+        let emitPart = buffer;
+        if (!hasEmittedFirstChunk && emitPart) {
+          emitPart = emitPart.replace(/^(?:assistant|orvix|ai|system):\s*/i, '');
+        }
+        if (emitPart) {
+          hasEmittedFirstChunk = true;
+          accumulatedClean += emitPart;
+          onChunk?.(emitPart, accumulatedClean);
+        }
         buffer = '';
       }
     },
@@ -540,11 +584,21 @@ export function createStreamingResponseSanitizer(modelId, { onChunk, onStopDetec
       if (stopped) return;
       if (buffer) {
         let validPart = buffer;
+        if (inThinkBlock) {
+          if (validPart.includes('</think>')) {
+            validPart = validPart.slice(validPart.indexOf('</think>') + 8);
+          } else {
+            validPart = validPart.replace(/<\/?think>/gi, '');
+          }
+        }
         for (const pattern of STOP_PATTERNS) {
           const idx = validPart.indexOf(pattern);
           if (idx !== -1) {
             validPart = validPart.slice(0, idx);
           }
+        }
+        if (!hasEmittedFirstChunk) {
+          validPart = validPart.replace(/^(?:assistant|orvix|ai|system):\s*/i, '');
         }
         if (validPart) {
           accumulatedClean += validPart;

@@ -171,6 +171,7 @@ export function createRequestIsolationController() {
         isFinalized: false,
         partialText: '',
         displayedText: '',
+        firstVisibleTextMs: null,
         cancelAnimation: null
       };
 
@@ -281,6 +282,9 @@ export function createRequestIsolationController() {
       }
       if (patch.finalProvider) {
         activeEntry.finalProvider = patch.finalProvider;
+      }
+      if (typeof patch.firstVisibleTextMs === 'number' && activeEntry.firstVisibleTextMs === null) {
+        activeEntry.firstVisibleTextMs = patch.firstVisibleTextMs;
       }
       return true;
     },
@@ -496,6 +500,7 @@ export async function runIsolatedPromptStream({
   const requestStartTime =
     typeof customStartTime === 'number' && customStartTime > 0 ? customStartTime : nowFn();
   let measuredResponseTimeMs = null;
+  let measuredFirstVisibleTextMs = null;
 
   let targetText = '';
   let displayedText = '';
@@ -510,11 +515,24 @@ export async function runIsolatedPromptStream({
   /** @type {(() => void) | null} */
   let resolveDrainWait = null;
 
+  const isLocalBrowserAI = providerToUse === 'webllm';
+  const WEBLLM_FRAME_CADENCE_MS = 36;
+  const CLOUD_FRAME_CADENCE_MS = 16;
+
+  let removeVisibilityListener = null;
+
+  const isDocumentHidden = () =>
+    typeof document !== 'undefined' && document.visibilityState === 'hidden';
+
   const cancelCurrentAnimation = () => {
     isCancelled = true;
     if (timerId !== null) {
       clearTimeout(timerId);
       timerId = null;
+    }
+    if (removeVisibilityListener) {
+      removeVisibilityListener();
+      removeVisibilityListener = null;
     }
     if (resolveDrainWait) {
       const r = resolveDrainWait;
@@ -532,6 +550,11 @@ export async function runIsolatedPromptStream({
     isStopped = false,
     responseTime = null
   ) => {
+    if (removeVisibilityListener) {
+      removeVisibilityListener();
+      removeVisibilityListener = null;
+    }
+
     if (isCancelled || isFinalized || !controller.isRequestActive(requestId)) {
       if (resolveDrainWait) {
         const r = resolveDrainWait;
@@ -649,30 +672,42 @@ export async function runIsolatedPromptStream({
     const backlog = targetText.length - displayedText.length;
 
     if (backlog > 0) {
-      if (prefersReducedMotion) {
+      // When the browser tab is hidden, record progress without firing intermediate React DOM updates.
+      // As soon as the tab becomes visible (or the stream finishes), the full accumulated text flushes immediately.
+      if (isDocumentHidden() && !isStreamDone) {
+        displayedText = targetText;
+        controller.recordProgress(requestId, {
+          displayedText,
+          modelUsed: activeModel,
+          finalProvider
+        });
+        return;
+      }
+
+      if (
+        prefersReducedMotion ||
+        isLocalBrowserAI ||
+        isDocumentHidden() ||
+        displayedText.length === 0 ||
+        backlog <= 64
+      ) {
+        // Flush the first arrived chunk immediately and render arrived streaming chunks directly
+        // without holding back already-arrived tokens in a slow 1-3 char/tick queue.
         displayedText = targetText;
       } else {
-        let stepSize = 1;
-
-        if (backlog > 500) {
-          stepSize = Math.ceil(backlog / 16);
-        } else if (backlog > 200) {
-          stepSize = Math.ceil(backlog / 12);
-        } else if (backlog > 80) {
-          stepSize = Math.ceil(backlog / 8);
-        } else if (backlog > 30) {
-          stepSize = Math.ceil(backlog / 5);
-        } else if (backlog > 8) {
-          stepSize = 2;
-        }
-
+        const stepSize = Math.max(48, Math.ceil(backlog / 3));
         displayedText = targetText.slice(0, displayedText.length + stepSize);
+      }
+
+      if (measuredFirstVisibleTextMs === null && displayedText.trim().length > 0) {
+        measuredFirstVisibleTextMs = Math.max(1, Math.round(nowFn() - requestStartTime));
       }
 
       controller.recordProgress(requestId, {
         displayedText,
         modelUsed: activeModel,
-        finalProvider
+        finalProvider,
+        firstVisibleTextMs: measuredFirstVisibleTextMs ?? undefined
       });
 
       onUpdateMessages((previous) =>
@@ -689,8 +724,11 @@ export async function runIsolatedPromptStream({
         })
       );
 
-      timerId = setTimeout(pumpAnimation, 18);
-      return;
+      if (displayedText.length < targetText.length || !isStreamDone) {
+        const nextDelayMs = isLocalBrowserAI ? WEBLLM_FRAME_CADENCE_MS : CLOUD_FRAME_CADENCE_MS;
+        timerId = setTimeout(pumpAnimation, nextDelayMs);
+        return;
+      }
     }
 
     if (isStreamDone) {
@@ -708,13 +746,76 @@ export async function runIsolatedPromptStream({
     if (
       isCancelled ||
       isFinalized ||
-      timerId !== null ||
       !controller.canMutateChatUI(requestId, targetChatId, getActiveChatId())
     ) {
       return;
     }
-    timerId = setTimeout(pumpAnimation, 10);
+
+    if (isDocumentHidden() && !isStreamDone) {
+      displayedText = targetText;
+      if (measuredFirstVisibleTextMs === null && displayedText.trim().length > 0) {
+        measuredFirstVisibleTextMs = Math.max(1, Math.round(nowFn() - requestStartTime));
+      }
+      controller.recordProgress(requestId, {
+        displayedText,
+        modelUsed: activeModel,
+        finalProvider,
+        firstVisibleTextMs: measuredFirstVisibleTextMs ?? undefined
+      });
+      return;
+    }
+
+    // Flush the very first arrived chunk immediately (0ms visual delay) for ALL providers
+    // (both Cloud AI and Browser AI), then coalesce subsequent chunks on the frame timer.
+    if (displayedText.length === 0 && targetText.length > 0 && timerId === null) {
+      pumpAnimation();
+      return;
+    }
+
+    if (timerId !== null) {
+      return;
+    }
+
+    timerId = setTimeout(
+      pumpAnimation,
+      isLocalBrowserAI ? WEBLLM_FRAME_CADENCE_MS : CLOUD_FRAME_CADENCE_MS
+    );
   };
+
+  if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+    const handleVisibilityChange = () => {
+      if (
+        !isCancelled &&
+        !isFinalized &&
+        document.visibilityState === 'visible' &&
+        targetText.length > 0 &&
+        controller.canMutateChatUI(requestId, targetChatId, getActiveChatId())
+      ) {
+        displayedText = targetText;
+        controller.recordProgress(requestId, {
+          displayedText,
+          modelUsed: activeModel,
+          finalProvider
+        });
+        onUpdateMessages((previous) =>
+          previous.map((message) => {
+            if (message.id !== assistantMessageId) return message;
+            const normalized = normalizeAssistantMessage(message);
+            return updateActiveAlternativeInMessage(normalized, {
+              content: displayedText,
+              modelUsed: activeModel || message.modelUsed,
+              provider: finalProvider || message.provider,
+              isStreaming: !isStreamDone,
+              referencedAttachments: undefined
+            });
+          })
+        );
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    removeVisibilityListener = () =>
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }
 
   if (controller.canMutateChatUI(requestId, targetChatId, getActiveChatId())) {
     onUpdateMessages((previous) =>
@@ -874,7 +975,13 @@ export async function runIsolatedPromptStream({
         timerId = null;
       }
       displayedText = targetText;
-      controller.recordProgress(requestId, { displayedText });
+      if (measuredFirstVisibleTextMs === null && displayedText.trim().length > 0) {
+        measuredFirstVisibleTextMs = Math.max(1, Math.round(nowFn() - requestStartTime));
+      }
+      controller.recordProgress(requestId, {
+        displayedText,
+        firstVisibleTextMs: measuredFirstVisibleTextMs ?? undefined
+      });
       await finalizeAssistantMessage(
         targetText,
         activeModel,
@@ -884,7 +991,12 @@ export async function runIsolatedPromptStream({
       );
     }
 
-    return { status: 'completed', requestId };
+    return {
+      status: 'completed',
+      requestId,
+      firstVisibleTextMs: measuredFirstVisibleTextMs ?? measuredResponseTimeMs,
+      responseTimeMs: measuredResponseTimeMs
+    };
   } catch (error) {
     isStreamDone = true;
     cancelCurrentAnimation();

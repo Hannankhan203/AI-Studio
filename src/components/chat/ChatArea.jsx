@@ -865,11 +865,14 @@ export default function ChatArea({
     if (lastMessage?.isStreaming) {
       if (isUserFollowingBottomRef.current && !isTouchScrollingRef.current) {
         isAutoScrollingRef.current = true;
-        scrollContainer.scrollTop = scrollContainer.scrollHeight;
-        lastScrollTopRef.current = scrollContainer.scrollTop;
+        const targetScrollTop = scrollContainer.scrollHeight;
+        scrollContainer.scrollTop = targetScrollTop;
+        lastScrollTopRef.current = targetScrollTop;
+        setShowScrollBottom((prev) => (prev === false ? prev : false));
         requestAnimationFrame(() => {
           isAutoScrollingRef.current = false;
         });
+        return;
       }
       updateScrollButtonVisibility();
       return;

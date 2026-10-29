@@ -45,7 +45,10 @@ import {
   hydrateAttachmentsWithImageBytes,
   sanitizeAttachmentForNetwork
 } from '../services/attachmentStorageService.js';
-import { isVisionCapableProvider } from '../services/documentContextService.js';
+import {
+  isVisionCapableProvider,
+  classifySimpleGreetingIntent
+} from '../services/documentContextService.js';
 import {
   isContinuationRequest,
   resolveMultiPartContext,
@@ -215,8 +218,9 @@ export default function ChatPage() {
       findExistingAssistantMessage,
       stopLocalEngine: stopWebLLMGeneration,
       forceStopLocalEngine:
-        reason === 'stopped' &&
+        (reason === 'stopped' || reason === 'provider_switched' || reason === 'model_switched') &&
         (selectedProvider === 'webllm' ||
+          webllmState.status === 'checking' ||
           webllmState.status === 'generating' ||
           webllmState.status === 'downloading' ||
           webllmState.status === 'loading')
@@ -225,12 +229,18 @@ export default function ChatPage() {
 
   const handleSelectProvider = (provider) => {
     const normalized = normalizeProviderId(provider);
-    if (
-      normalized &&
-      normalized !== selectedProvider &&
-      requestControllerRef.current.hasActiveRequest()
-    ) {
-      cancelCurrentGeneration('provider_switched');
+    if (normalized && normalized !== selectedProvider) {
+      if (requestControllerRef.current.hasActiveRequest()) {
+        cancelCurrentGeneration('provider_switched');
+      } else if (
+        selectedProvider === 'webllm' &&
+        (webllmState.status === 'checking' ||
+          webllmState.status === 'downloading' ||
+          webllmState.status === 'loading' ||
+          webllmState.status === 'generating')
+      ) {
+        stopWebLLMGeneration();
+      }
     }
 
     setSelectedProvider(normalized);
@@ -243,6 +253,18 @@ export default function ChatPage() {
 
   const handleSelectWebLLMModel = (nextModelId) => {
     if (!nextModelId || !WEBLLM_MODEL_CATALOG[nextModelId]) return;
+    if (nextModelId !== webllmModelId) {
+      if (selectedProvider === 'webllm' && requestControllerRef.current.hasActiveRequest()) {
+        cancelCurrentGeneration('model_switched');
+      } else if (
+        webllmState.status === 'checking' ||
+        webllmState.status === 'downloading' ||
+        webllmState.status === 'loading' ||
+        webllmState.status === 'generating'
+      ) {
+        stopWebLLMGeneration();
+      }
+    }
     setWebllmModelId(nextModelId);
     if (typeof window !== 'undefined') {
       localStorage.setItem('orvix_webllm_model_id', nextModelId);
@@ -368,7 +390,8 @@ export default function ChatPage() {
         getActiveChatId: () => activeChatIdRef.current,
         onUpdateMessages: () => {},
         onSetLoadingState: () => {},
-        stopLocalEngine: stopWebLLMGeneration
+        stopLocalEngine: stopWebLLMGeneration,
+        forceStopLocalEngine: true
       });
     };
   }, [stopSpeech]);
@@ -1623,12 +1646,13 @@ export default function ChatPage() {
             const createdId = await createChatDocument(
               currentUser.uid,
               titleSnippet,
-              activeMode
+              activeMode,
+              { backgroundSync: true }
             );
             if (!isPreflightActive()) return false;
             currentChatId = createdId;
             skipNextChatLoadRef.current = currentChatId;
-            // Ensure offline-created conversations appear immediately in the sidebar
+            // Ensure newly created conversations appear immediately in the sidebar
             const cachedList = getCachedUserChats(currentUser.uid);
             if (cachedList.length > 0) {
               setUserChats(cachedList);
@@ -1711,11 +1735,26 @@ export default function ChatPage() {
         : { isContinuation: false, partNumber: 1, originalPrompt: trimmed, previousContentSummary: '', referencedAttachments: [] };
 
       // Check if current message has attachments, or if we should carry forward attachments from the conversation
-      // or from the multi-part sequence so follow-up questions and continuations maintain context
+      // or from the multi-part sequence so follow-up questions and continuations maintain context.
+      // Skip historical attachment carry-forward when the user sends a standalone greeting (e.g. "Hi", "Hello").
+      const greetingIntent = classifySimpleGreetingIntent(trimmed, {
+        attachments: processedAttachments,
+        isContinuation
+      });
+
       let activeAttachments = processedAttachments;
-      if ((!activeAttachments || activeAttachments.length === 0) && isContinuation && Array.isArray(multiPartContext.referencedAttachments) && multiPartContext.referencedAttachments.length > 0) {
+      if (
+        (!activeAttachments || activeAttachments.length === 0) &&
+        isContinuation &&
+        Array.isArray(multiPartContext.referencedAttachments) &&
+        multiPartContext.referencedAttachments.length > 0
+      ) {
         activeAttachments = multiPartContext.referencedAttachments;
-      } else if ((!activeAttachments || activeAttachments.length === 0) && currentMessagesSnapshot.length > 0) {
+      } else if (
+        (!activeAttachments || activeAttachments.length === 0) &&
+        !greetingIntent.isSimpleGreeting &&
+        currentMessagesSnapshot.length > 0
+      ) {
         const found = [];
         const seenIds = new Set();
         for (let i = currentMessagesSnapshot.length - 1; i >= 0; i--) {
@@ -2293,6 +2332,9 @@ export default function ChatPage() {
       return;
     }
 
+    // Lock submission synchronously before any state updates or async operations
+    isSubmittingRef.current = true;
+
     const initialChatId = activeChatIdRef.current;
     const editPreflight = requestControllerRef.current.beginRequest({
       chatId: initialChatId,
@@ -2315,7 +2357,12 @@ export default function ChatPage() {
         const titleSnippet = generateChatTitle(trimmed);
         if (isCloudEnabled && currentUser?.uid) {
           try {
-            const createdId = await createChatDocument(currentUser.uid, titleSnippet, activeMode);
+            const createdId = await createChatDocument(
+              currentUser.uid,
+              titleSnippet,
+              activeMode,
+              { backgroundSync: true }
+            );
             if (!requestControllerRef.current.isRequestActive(editRequestId)) return;
             currentChatId = createdId;
             skipNextChatLoadRef.current = currentChatId;
@@ -2577,6 +2624,7 @@ export default function ChatPage() {
       isOffline={isOffline}
       selectedProvider={selectedProvider}
       onSelectProvider={handleSelectProvider}
+      selectedModelId={webllmModelId}
       activeMode={activeMode}
       onSelectMode={handleSelectMode}
       onExportMarkdown={handleExportMarkdown}
@@ -2597,7 +2645,11 @@ export default function ChatPage() {
 
           <span className="persistence-alert-text">
             {selectedProvider === 'webllm'
-              ? (webllmState.status === 'ready' || webllmState.isCached)
+              ? (webllmState.isCached ||
+                  (webllmState.loadedModelId &&
+                    (webllmState.loadedModelId === webllmModelId ||
+                      WEBLLM_MODEL_CATALOG[webllmModelId]?.f32FallbackModelId ===
+                        webllmState.loadedModelId)))
                 ? (appShellState.isAppShellCached
                     ? `Offline mode — App shell & ${webllmState.modelId ? (WEBLLM_MODEL_CATALOG[webllmState.modelId]?.shortLabel || 'Browser AI') : 'Browser AI'} are cached on this device. Supported documents (PDF, DOCX, PPTX, TXT, MD, CSV, JSON, XML) can be extracted locally.`
                     : `Offline mode — ${webllmState.modelId ? (WEBLLM_MODEL_CATALOG[webllmState.modelId]?.shortLabel || 'Browser AI') : 'Browser AI'} is cached on this device. Supported documents can be extracted locally.`)

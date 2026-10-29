@@ -359,14 +359,27 @@ export function generateLocalChatId(userId = '') {
   return `local-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 8)}`;
 }
 
+const pendingChatCreationPromises = new Map();
+
 /**
  * Creates a new chat conversation document in Firestore with automatic offline local fallback.
+ * When `options.backgroundSync === true`, returns the locally persisted `chatId` immediately (<1ms)
+ * and completes the Firestore `setDoc` write asynchronously in the background so AI prompt
+ * dispatch is never blocked by Firestore network latency.
+ *
  * @param {string} userId - Authenticated user UID
  * @param {string} [initialTitle='New Conversation']
  * @param {string} [mode='general'] - Active chat mode (general | coding | writing | learning)
+ * @param {Object} [options={}]
+ * @param {boolean} [options.backgroundSync=false]
  * @returns {Promise<string>} The generated chatId
  */
-export async function createChatDocument(userId, initialTitle = 'New Conversation', mode = 'general') {
+export async function createChatDocument(
+  userId,
+  initialTitle = 'New Conversation',
+  mode = 'general',
+  options = {}
+) {
   if (!userId) {
     throw new Error('Valid userId is required to create a conversation.');
   }
@@ -405,22 +418,38 @@ export async function createChatDocument(userId, initialTitle = 'New Conversatio
     pinnedAt: null
   };
 
-  try {
-    await withBoundedTimeout(setDoc(newChatDoc, chatData), FIRESTORE_OP_TIMEOUT_MS, 'createChatDocument');
-    upsertCachedUserChat(userId, {
-      id: chatId,
-      pendingSync: false,
-      createdOffline: false
-    });
-  } catch (err) {
-    if (isOfflineOrNetworkError(err)) {
-      console.warn('Offline/network fallback: created conversation locally for later sync:', chatId);
-      return chatId;
+  const syncKey = `${userId}:${chatId}`;
+  const performFirestoreCreate = async () => {
+    try {
+      await withBoundedTimeout(setDoc(newChatDoc, chatData), FIRESTORE_OP_TIMEOUT_MS, 'createChatDocument');
+      upsertCachedUserChat(userId, {
+        id: chatId,
+        pendingSync: false,
+        createdOffline: false
+      });
+    } catch (err) {
+      if (isOfflineOrNetworkError(err)) {
+        console.warn('Offline/network fallback: created conversation locally for later sync:', chatId);
+        return chatId;
+      }
+      throw err;
+    } finally {
+      pendingChatCreationPromises.delete(syncKey);
     }
-    throw err;
+    return chatId;
+  };
+
+  const syncPromise = performFirestoreCreate();
+  pendingChatCreationPromises.set(syncKey, syncPromise);
+
+  if (options?.backgroundSync === true) {
+    syncPromise.catch((err) => {
+      console.warn('Background Firestore chat creation warning (cached locally):', err?.message || err);
+    });
+    return chatId;
   }
 
-  return chatId;
+  return await syncPromise;
 }
 
 /**
@@ -522,6 +551,11 @@ export async function saveChatMessage(userId, chatId, message) {
   });
 
   try {
+    const inFlightCreate = pendingChatCreationPromises.get(`${userId}:${chatId}`);
+    if (inFlightCreate) {
+      await inFlightCreate.catch(() => {});
+    }
+
     // Ensure parent chat exists in Firestore if it was originally created offline
     if (cachedChat?.createdOffline) {
       await withBoundedTimeout(
