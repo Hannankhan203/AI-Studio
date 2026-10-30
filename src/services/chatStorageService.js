@@ -647,7 +647,10 @@ export async function toggleChatPinned(userId, chatId, isPinned) {
   }
 
   const cachedChats = getCachedUserChats(userId);
-  if (isPinned) {
+  const targetChat = cachedChats.find((c) => c.id === chatId);
+  const targetPinnedState = typeof isPinned === 'boolean' ? isPinned : !targetChat?.isPinned;
+
+  if (targetPinnedState) {
     const localPinnedCount = cachedChats.filter((c) => c.isPinned && c.id !== chatId).length;
     if (localPinnedCount >= 5) {
       throw new Error('You can pin up to 5 chats. Unpin a chat before pinning another.');
@@ -659,18 +662,18 @@ export async function toggleChatPinned(userId, chatId, isPinned) {
   if (!db || !isFirebaseConfigured() || !isBrowserOnline()) {
     upsertCachedUserChat(userId, {
       id: chatId,
-      isPinned: Boolean(isPinned),
-      pinnedAt: isPinned ? nowMs : null,
+      isPinned: Boolean(targetPinnedState),
+      pinnedAt: targetPinnedState ? nowMs : null,
       rawUpdatedAt: nowMs,
       pendingMetaSync: true
     });
-    return Boolean(isPinned);
+    return Boolean(targetPinnedState);
   }
 
   const chatDocRef = doc(db, 'users', userId, 'chats', chatId);
 
   try {
-    if (isPinned) {
+    if (targetPinnedState) {
       const chatsRef = collection(db, 'users', userId, 'chats');
       const pinnedQuery = query(chatsRef, where('isPinned', '==', true));
       const snapshot = await withBoundedTimeout(getDocs(pinnedQuery), FIRESTORE_OP_TIMEOUT_MS, 'checkPinnedLimit');
