@@ -639,6 +639,7 @@ export default function Layout({
           providerConfig={providerConfig}
           selectedModelId={selectedModelId}
           isSharedView={isSharedView}
+          isImported={Boolean(recentChats.find((c) => c.id === activeChatId)?.isImported)}
           onSignInClick={onSignInClick}
         />
         {children}

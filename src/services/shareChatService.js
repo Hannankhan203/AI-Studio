@@ -2,13 +2,22 @@ import {
   doc,
   setDoc,
   getDoc,
+  writeBatch,
   serverTimestamp,
 } from 'firebase/firestore';
-import { db, auth, isFirebaseConfigured } from '../config/firebaseConfig.js';
+import { db, auth, isFirebaseConfigured, isBrowserOnline } from '../config/firebaseConfig.js';
 import {
   orderConversationMessages,
   ensureConversationAlternatives,
 } from './alternativeResponseService.js';
+import {
+  upsertCachedUserChat,
+  saveCachedChatMessages,
+  getCachedUserChats,
+  getCachedChatMessages,
+  generateLocalChatId,
+  buildFirestoreMessagePayload,
+} from './chatStorageService.js';
 
 /**
  * Firestore hard limit is 1,048,576 bytes (1 MiB).
@@ -1339,8 +1348,9 @@ export function getSharedPreviewActionPermissions({
   isShareRoute = false,
   user = null,
   hasSentFirstMessage = false,
+  isImported = false,
 } = {}) {
-  if (!isShareRoute) {
+  if (!isShareRoute || isImported) {
     return {
       canRead: true,
       canReadOriginal: true,
@@ -1361,16 +1371,24 @@ export function getSharedPreviewActionPermissions({
       canShare: true,
       canShareChat: true,
       canEditUserMessage: true,
+      canEditResend: true,
       canEditOriginal: true,
       canDeleteMessage: true,
       canDelete: true,
+      canRename: true,
       canPin: true,
+      canSwitchMode: true,
+      canSwitchProvider: true,
+      canExport: true,
       canNewChat: true,
       isHistoryCreated: true,
+      showInHistory: true,
+      isPermanentChat: true,
       isSharedPreview: false,
       isAuthenticatedSharedPreview: false,
       isPublicSharedViewer: false,
-      hasSentFirstMessage: false
+      hasSentFirstMessage: Boolean(hasSentFirstMessage),
+      isImported: Boolean(isImported),
     };
   }
 
@@ -1399,27 +1417,36 @@ export function getSharedPreviewActionPermissions({
     canShare: false,
     canShareChat: false,
     canEditUserMessage: false,
+    canEditResend: false,
     canEditOriginal: false,
     canDeleteMessage: false,
     canDelete: false,
+    canRename: false,
     canPin: false,
+    canSwitchMode: false,
+    canSwitchProvider: false,
+    canExport: true,
     canNewChat: true,
-    // History creation is strictly false in Prompt 5
+    // History creation is strictly false in Prompt 5 preview
     isHistoryCreated: false,
+    showInHistory: false,
+    isPermanentChat: false,
     isSharedPreview: true,
     isAuthenticatedSharedPreview: isAuthedPreview,
     isPublicSharedViewer: !isAuthedPreview,
     hasSentFirstMessage: Boolean(hasSentFirstMessage),
+    isImported: false,
   };
 }
 
 /**
- * Stage 5: State machine factory for temporary shared preview state.
+ * Stage 5 & 6: State machine factory for shared preview and permanent import states.
  * Encapsulates the distinct lifecycle states:
  * 1. 'idle' (opened, typed or un-typed, not submitted)
  * 2. 'submitting' (first message actively processing)
- * 3. 'complete' / 'completed' (first message generation finished, awaiting Prompt 6 permanent import)
+ * 3. 'complete' / 'completed' (first message generation finished)
  * 4. 'failed' (submission error or user cancellation, can retry)
+ * 5. 'imported' (permanently imported into recipient's private history)
  *
  * @param {Object} params
  * @param {boolean} [params.isShareRoute=false]
@@ -1427,6 +1454,8 @@ export function getSharedPreviewActionPermissions({
  * @param {boolean} [params.hasSentFirstMessage=false]
  * @param {boolean} [params.isSubmitting=false]
  * @param {boolean} [params.hasFailed=false]
+ * @param {boolean} [params.isImported=false]
+ * @param {string|null} [params.importedChatId=null]
  * @returns {Object}
  */
 export function createSharedPreviewState({
@@ -1435,7 +1464,34 @@ export function createSharedPreviewState({
   hasSentFirstMessage = false,
   isSubmitting = false,
   hasFailed = false,
+  isImported = false,
+  importedChatId = null,
 } = {}) {
+  if (isImported) {
+    return {
+      isSharedRoute: false,
+      isSharedPreview: false,
+      isAuthenticatedSharedPreview: false,
+      isPublicSharedViewer: false,
+      hasSentFirstMessage: true,
+      hasSharedPreviewFirstMessageBeenSent: true,
+      isSubmitting: false,
+      isSubmittingFirstSharedMessage: false,
+      hasFailed: false,
+      firstSharedMessageSubmissionFailed: false,
+      submissionPhase: 'imported',
+      submissionState: 'imported',
+      isImported: true,
+      importedChatId: importedChatId || null,
+      permissions: getSharedPreviewActionPermissions({
+        isShareRoute: false,
+        user,
+        hasSentFirstMessage: true,
+        isImported: true,
+      }),
+    };
+  }
+
   const isAuthedPreview = Boolean(isShareRoute && isEligibleShareUser(user));
   const isPublicViewer = Boolean(isShareRoute && !isAuthedPreview);
 
@@ -1461,11 +1517,713 @@ export function createSharedPreviewState({
     firstSharedMessageSubmissionFailed: Boolean(hasFailed),
     submissionPhase,
     submissionState: submissionPhase,
+    isImported: false,
+    importedChatId: null,
     permissions: getSharedPreviewActionPermissions({
       isShareRoute,
       user,
       hasSentFirstMessage,
+      isImported: false,
     }),
   };
 }
+
+// Track in-flight and completed import operations to ensure strict idempotency and zero duplicate chats
+const inFlightImports = new Map();
+const completedImports = new Map();
+
+/**
+ * Generates a stable deduplication key for a shared conversation import request.
+ * Format: {shareId}::{recipientUserId}::{firstInteractionIdentity}
+ *
+ * @param {string} shareId
+ * @param {string} userId
+ * @param {string} interactionIdentity
+ * @returns {string}
+ */
+export function getImportDeduplicationKey(shareId, userId, interactionIdentity) {
+  const safeShare = String(shareId || '').trim();
+  const safeUser = String(userId || '').trim();
+  const safeInteraction = String(interactionIdentity || '').trim();
+  return `${safeShare}::${safeUser}::${safeInteraction}`;
+}
+
+/**
+ * Resets in-memory import lock caches (primarily used in automated test suites).
+ */
+export function clearImportLocks() {
+  inFlightImports.clear();
+  completedImports.clear();
+}
+
+/**
+ * Generates a collision-resistant, recipient-owned ID for imported messages, interactions, or chats.
+ * Never reuses original shared snapshot IDs.
+ *
+ * @param {string} [prefix='imp']
+ * @returns {string}
+ */
+export function generateImportedId(prefix = 'imp') {
+  let rand = '';
+  if (typeof globalThis !== 'undefined' && globalThis.crypto?.getRandomValues) {
+    const bytes = new Uint8Array(6);
+    globalThis.crypto.getRandomValues(bytes);
+    rand = Array.from(bytes, (b) => (b % 36).toString(36)).join('');
+  } else {
+    rand = Date.now().toString(36).slice(-6);
+  }
+  return `${prefix}-${Date.now().toString(36)}-${rand}`;
+}
+
+/**
+ * Remaps every message in a shared conversation snapshot with fresh recipient-owned IDs
+ * while strictly preserving:
+ * - message ordering
+ * - sender
+ * - content
+ * - mode
+ * - modelUsed / provider / responseTimeMs
+ * - logical parent-child relationships (parentMessageId remapped to new parent ID)
+ * - interaction relationships (interactionId remapped to new interaction ID)
+ * - alternative response information & activeAlternativeId (remapped to new alternative ID)
+ * - attachment metadata (sanitized plain metadata only, strictly zero raw blobs, files, or paths)
+ *
+ * @param {Array} originalMessages
+ * @returns {{ remappedMessages: Array, messageIdMap: Map<string, string>, interactionIdMap: Map<string, string>, lastMessageId: string|null }}
+ */
+export function remapSharedSnapshotMessages(originalMessages) {
+  if (!Array.isArray(originalMessages) || originalMessages.length === 0) {
+    return {
+      remappedMessages: [],
+      messageIdMap: new Map(),
+      interactionIdMap: new Map(),
+      lastMessageId: null,
+    };
+  }
+
+  const messageIdMap = new Map();
+  const interactionIdMap = new Map();
+  const alternativeIdMap = new Map();
+
+  // Pass 1: Allocate fresh IDs for all messages, interactions, and alternatives
+  originalMessages.forEach((msg, idx) => {
+    if (!msg || typeof msg !== 'object') return;
+    const oldMsgId = String(msg.id || `orig_${idx}`);
+    const newMsgId = generateImportedId(msg.sender === 'user' ? 'msg_imp_user' : 'msg_imp_asst');
+    messageIdMap.set(oldMsgId, newMsgId);
+
+    if (msg.interactionId && !interactionIdMap.has(msg.interactionId)) {
+      interactionIdMap.set(msg.interactionId, generateImportedId('inter_imp'));
+    }
+
+    if (Array.isArray(msg.alternatives)) {
+      msg.alternatives.forEach((alt, altIdx) => {
+        if (alt && alt.id && !alternativeIdMap.has(alt.id)) {
+          alternativeIdMap.set(alt.id, generateImportedId(`alt_imp_${altIdx}`));
+        }
+      });
+    }
+  });
+
+  // Pass 2: Remap relationships and sanitize all attachments
+  let lastMessageId = null;
+  const remappedMessages = originalMessages.map((msg, idx) => {
+    const oldMsgId = String(msg.id || `orig_${idx}`);
+    const newMsgId = messageIdMap.get(oldMsgId) || generateImportedId('msg');
+    lastMessageId = newMsgId;
+
+    const newParentId =
+      msg.parentMessageId && messageIdMap.has(msg.parentMessageId)
+        ? messageIdMap.get(msg.parentMessageId)
+        : null;
+
+    const newInteractionId =
+      msg.interactionId && interactionIdMap.has(msg.interactionId)
+        ? interactionIdMap.get(msg.interactionId)
+        : null;
+
+    let newActiveAltId = null;
+    if (msg.activeAlternativeId) {
+      newActiveAltId =
+        alternativeIdMap.get(msg.activeAlternativeId) ||
+        messageIdMap.get(msg.activeAlternativeId) ||
+        null;
+    }
+
+    let remappedAlternatives = null;
+    if (Array.isArray(msg.alternatives)) {
+      remappedAlternatives = msg.alternatives.map((alt, altIdx) => {
+        const altOldId = alt?.id || `alt_${altIdx}`;
+        const altNewId = alternativeIdMap.get(altOldId) || generateImportedId('alt');
+        const altParentId =
+          alt?.parentMessageId && messageIdMap.has(alt.parentMessageId)
+            ? messageIdMap.get(alt.parentMessageId)
+            : newParentId;
+
+        return {
+          id: altNewId,
+          parentMessageId: altParentId,
+          sender: 'assistant',
+          content: typeof alt?.content === 'string' ? alt.content : '',
+          provider: alt?.provider || msg.provider || 'gemini',
+          modelUsed: alt?.modelUsed || msg.modelUsed || null,
+          mode: alt?.mode || msg.mode || 'general',
+          responseTimeMs:
+            typeof alt?.responseTimeMs === 'number' ? alt.responseTimeMs : null,
+          createdAt: typeof alt?.createdAt === 'number' ? alt.createdAt : Date.now(),
+          timestamp: alt?.timestamp || '',
+          referencedAttachments: Array.isArray(alt?.referencedAttachments)
+            ? alt.referencedAttachments
+                .map((a, i) => sanitizeAttachmentForShare(a, i))
+                .filter(Boolean)
+            : [],
+          isError: Boolean(alt?.isError),
+          isStopped: Boolean(alt?.isStopped),
+        };
+      });
+    }
+
+    const sanitizedAttachments = Array.isArray(msg.attachments)
+      ? msg.attachments
+          .map((a, i) => sanitizeAttachmentForShare(a, i))
+          .filter(Boolean)
+      : [];
+
+    const sanitizedReferencedAttachments = Array.isArray(msg.referencedAttachments)
+      ? msg.referencedAttachments
+          .map((a, i) => sanitizeAttachmentForShare(a, i))
+          .filter(Boolean)
+      : [];
+
+    return {
+      id: newMsgId,
+      sender: msg.sender,
+      content: msg.content,
+      modelUsed: msg.modelUsed || null,
+      provider: msg.provider || null,
+      mode: msg.mode || 'general',
+      responseTimeMs:
+        typeof msg.responseTimeMs === 'number' ? msg.responseTimeMs : null,
+      parentMessageId: newParentId,
+      interactionId: newInteractionId,
+      activeAlternativeId: newActiveAltId,
+      alternatives: remappedAlternatives && remappedAlternatives.length > 0 ? remappedAlternatives : null,
+      attachments: sanitizedAttachments,
+      referencedAttachments: sanitizedReferencedAttachments,
+      createdAtMs: typeof msg.createdAtMs === 'number' ? msg.createdAtMs : Date.now(),
+      clientTimestamp: msg.clientTimestamp || msg.timestamp || '',
+      timestamp: msg.timestamp || msg.clientTimestamp || '',
+      isImported: true,
+    };
+  });
+
+  return {
+    remappedMessages,
+    messages: remappedMessages,
+    messageIdMap,
+    mapping: messageIdMap,
+    interactionIdMap,
+    lastMessageId,
+  };
+}
+
+/**
+ * Constructs the complete data payload for an imported private conversation:
+ * - Independent conversation metadata marked with isImported: true & importedFromShareId: shareId
+ * - Remapped original shared conversation messages with fresh recipient-owned IDs
+ * - Recipient's first user message linked to the last original message
+ * - Generated AI response linked to recipient's user message
+ *
+ * @param {Object} params
+ * @param {string} params.shareId
+ * @param {Object} params.snapshot - Validated shared chat snapshot
+ * @param {string} params.recipientUserId - Authenticated recipient UID
+ * @param {Object} params.recipientUserMessage - First recipient user message
+ * @param {Object} params.recipientAssistantMessage - First recipient AI response
+ * @param {string} [params.customChatId] - Optional chatId override
+ * @returns {{ chatMetadata: Object, messages: Array, newChatId: string }}
+ */
+export function createImportedConversationData({
+  shareId,
+  snapshot,
+  recipientUserId,
+  recipientUserMessage,
+  recipientAssistantMessage,
+  customChatId = null,
+}) {
+  if (!isValidShareId(shareId)) {
+    throw new ShareChatError('Invalid share ID for import.', 'INVALID_SHARE_ID');
+  }
+  if (!recipientUserId || typeof recipientUserId !== 'string' || !recipientUserId.trim()) {
+    throw new ShareChatError('Valid recipient user ID is required.', 'INVALID_USER_ID');
+  }
+  if (!snapshot || typeof snapshot !== 'object') {
+    throw new ShareChatError('Invalid snapshot for import.', 'MALFORMED_SNAPSHOT');
+  }
+
+  const newChatId = customChatId || generateLocalChatId(recipientUserId) || generateImportedId('chat');
+  const safeMode = ALLOWED_CHAT_MODES.includes(snapshot.mode) ? snapshot.mode : 'general';
+  const rawTitle = typeof snapshot.title === 'string' && snapshot.title.trim() ? snapshot.title.trim() : 'Imported Chat';
+  const safeTitle = rawTitle.slice(0, MAX_SHARED_TITLE_LENGTH);
+
+  // 1. Remap all original shared snapshot messages
+  const { remappedMessages, lastMessageId } = remapSharedSnapshotMessages(snapshot.messages || []);
+
+  const nowMs = Date.now();
+
+  // 2. Prepare recipient's first user message with fresh IDs and linked parent
+  const recipientUserMsgId = recipientUserMessage?.id || generateImportedId('user');
+  const recipientInteractionId = recipientUserMessage?.interactionId || generateImportedId('interaction');
+
+  const remappedRecipientUserMsg = {
+    id: recipientUserMsgId,
+    sender: 'user',
+    content: recipientUserMessage?.content || '',
+    modelUsed: null,
+    provider: null,
+    mode: safeMode,
+    responseTimeMs: null,
+    parentMessageId: lastMessageId, // Links recipient's first prompt to the end of the original conversation
+    interactionId: recipientInteractionId,
+    activeAlternativeId: null,
+    alternatives: null,
+    attachments: [],
+    referencedAttachments: [],
+    createdAtMs: typeof recipientUserMessage?.createdAtMs === 'number' ? recipientUserMessage.createdAtMs : nowMs,
+    clientTimestamp: recipientUserMessage?.timestamp || recipientUserMessage?.clientTimestamp || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    timestamp: recipientUserMessage?.timestamp || recipientUserMessage?.clientTimestamp || '',
+    isImportedRecipientMessage: true,
+  };
+
+  // 3. Prepare recipient's AI response message
+  const recipientAsstMsgId = recipientAssistantMessage?.id || generateImportedId('asst');
+  const remappedRecipientAsstMsg = {
+    id: recipientAsstMsgId,
+    sender: 'assistant',
+    content: recipientAssistantMessage?.content || '',
+    modelUsed: recipientAssistantMessage?.modelUsed || null,
+    provider: recipientAssistantMessage?.provider || 'gemini',
+    mode: safeMode,
+    responseTimeMs: typeof recipientAssistantMessage?.responseTimeMs === 'number' ? recipientAssistantMessage.responseTimeMs : null,
+    parentMessageId: recipientUserMsgId,
+    interactionId: recipientInteractionId,
+    activeAlternativeId: recipientAssistantMessage?.activeAlternativeId || null,
+    alternatives: Array.isArray(recipientAssistantMessage?.alternatives) ? recipientAssistantMessage.alternatives : null,
+    attachments: [],
+    referencedAttachments: [],
+    createdAtMs: typeof recipientAssistantMessage?.createdAtMs === 'number' ? recipientAssistantMessage.createdAtMs : nowMs + 1,
+    clientTimestamp: recipientAssistantMessage?.timestamp || recipientAssistantMessage?.clientTimestamp || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    timestamp: recipientAssistantMessage?.timestamp || recipientAssistantMessage?.clientTimestamp || '',
+    isStreaming: false,
+    isStopped: Boolean(recipientAssistantMessage?.isStopped),
+    isImportedRecipientMessage: true,
+  };
+
+  const combinedMessages = [
+    ...remappedMessages,
+    remappedRecipientUserMsg,
+    remappedRecipientAsstMsg,
+  ];
+
+  const orderedMessages = orderConversationMessages(
+    ensureConversationAlternatives(combinedMessages)
+  );
+
+  const chatMetadata = {
+    id: newChatId,
+    title: safeTitle,
+    mode: safeMode,
+    userId: recipientUserId,
+    isImported: true,
+    importedFromShareId: shareId,
+    isPinned: false,
+    pinnedAt: null,
+    createdAtMs: nowMs,
+    rawUpdatedAt: nowMs,
+    timestamp: 'Just now',
+  };
+
+  return {
+    chatMetadata,
+    messages: orderedMessages,
+    newChatId,
+  };
+}
+
+/**
+ * Persists an imported conversation and all its messages to Cloud Firestore using
+ * batched writes (chunked into batches of at most 400 operations to safely honor the
+ * Firestore 500-op limit for up to 500 snapshot messages + recipient messages).
+ * Implements a rollback-safe strategy if any multi-batch commit fails.
+ *
+ * @param {Object} params
+ * @param {Object} [params.firestoreDb]
+ * @param {string} params.userId
+ * @param {Object} params.chatMetadata
+ * @param {Array} params.messages
+ * @param {Function} [params.docImpl]
+ * @param {Function} [params.writeBatchImpl]
+ * @param {number} [params.timeoutMs=15000]
+ * @returns {Promise<void>}
+ */
+export async function persistImportedConversationToFirestore({
+  firestoreDb,
+  userId,
+  chatMetadata,
+  messages,
+  docImpl = doc,
+  writeBatchImpl = writeBatch,
+  timeoutMs = 15000,
+}) {
+  const targetDb = firestoreDb !== undefined ? firestoreDb : db;
+  if (!targetDb) {
+    throw new ShareChatError('Firestore instance is unavailable for import.', 'FIREBASE_UNAVAILABLE');
+  }
+
+  const chatDocRef = docImpl(targetDb, 'users', userId, 'chats', chatMetadata.id);
+  const chatPayload = {
+    id: chatMetadata.id,
+    title: chatMetadata.title,
+    mode: chatMetadata.mode || 'general',
+    userId,
+    isImported: true,
+    importedFromShareId: chatMetadata.importedFromShareId,
+    isPinned: false,
+    pinnedAt: null,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+
+  // Compile all operations: 1 chat setDoc + M message setDocs
+  const operations = [
+    { type: 'set', ref: chatDocRef, payload: chatPayload }
+  ];
+
+  messages.forEach((msg) => {
+    const msgRef = docImpl(targetDb, 'users', userId, 'chats', chatMetadata.id, 'messages', msg.id);
+    const msgPayload = buildFirestoreMessagePayload(msg);
+    operations.push({ type: 'set', ref: msgRef, payload: msgPayload });
+  });
+
+  const BATCH_SIZE = 400; // Well within Firestore's 500 operations per batch limit
+  const batches = [];
+  for (let i = 0; i < operations.length; i += BATCH_SIZE) {
+    batches.push(operations.slice(i, i + BATCH_SIZE));
+  }
+
+  const committedBatches = [];
+
+  try {
+    for (const chunk of batches) {
+      const batch = writeBatchImpl(targetDb);
+      chunk.forEach((op) => {
+        if (op.type === 'set') {
+          batch.set(op.ref, op.payload);
+        }
+      });
+
+      await withPublishTimeout(batch.commit(), timeoutMs);
+      committedBatches.push(chunk);
+    }
+  } catch (err) {
+    // If a multi-batch commit fails on batch > 1, clean up committed messages to avoid orphaned partial chat
+    if (committedBatches.length > 0) {
+      try {
+        const cleanupBatch = writeBatchImpl(targetDb);
+        committedBatches.forEach((chunk) => {
+          chunk.forEach((op) => {
+            cleanupBatch.delete(op.ref);
+          });
+        });
+        await cleanupBatch.commit();
+      } catch (cleanupErr) {
+        console.warn('Import rollback notice:', cleanupErr?.message || cleanupErr);
+      }
+    }
+
+    if (err instanceof ShareChatError) throw err;
+    const rawMsg = String(err?.message || '');
+    if (rawMsg.includes('permission-denied') || err?.code === 'permission-denied') {
+      throw new ShareChatError(
+        'Permission denied while saving imported conversation.',
+        'PERMISSION_DENIED'
+      );
+    }
+    throw new ShareChatError(
+      'Failed to persist imported conversation to Cloud Firestore.',
+      'PERSISTENCE_FAILED'
+    );
+  }
+}
+
+/**
+ * Orchestrates the complete permanent import transition for an authenticated recipient:
+ * 1. Verifies non-anonymous authenticated user eligibility
+ * 2. Checks deduplication lock so identical first interactions never produce duplicate chats
+ * 3. Remaps original messages with fresh IDs and appends recipient interaction
+ * 4. Updates local cache and history
+ * 5. Persists atomically (or multi-batch safely) to Cloud Firestore
+ * 6. Returns the permanent imported conversation metadata and messages
+ *
+ * @param {Object} params
+ * @param {string} params.shareId
+ * @param {Object} params.snapshot - Validated shared snapshot
+ * @param {Object} params.recipientUser - Current authenticated Firebase user
+ * @param {Object} params.recipientUserMessage - First recipient user message
+ * @param {Object} params.recipientAssistantMessage - First recipient AI response
+ * @param {Object} [params.options] - Optional overrides for testing
+ * @returns {Promise<{ success: boolean, chatId: string, chatMetadata: Object, messages: Array, alreadyImported: boolean }>}
+ */
+export async function importSharedConversationToAccount({
+  shareId,
+  snapshot,
+  recipientUser,
+  recipientUserMessage,
+  recipientAssistantMessage,
+  options = {},
+}) {
+  // 1. Strict authentication check: must be a real non-anonymous Firebase user
+  if (!isEligibleShareUser(recipientUser)) {
+    throw new ShareChatError(
+      'Only signed-in accounts can import shared conversations. Please log in first.',
+      'AUTH_REQUIRED'
+    );
+  }
+
+  if (!isValidShareId(shareId)) {
+    throw new ShareChatError('Invalid shared conversation identifier.', 'INVALID_SHARE_ID');
+  }
+
+  if (!snapshot || typeof snapshot !== 'object') {
+    throw new ShareChatError('Invalid shared conversation snapshot.', 'MALFORMED_SNAPSHOT');
+  }
+
+  const interactionIdentity =
+    recipientUserMessage?.interactionId ||
+    recipientUserMessage?.id ||
+    `interaction_${shareId}`;
+
+  const dedupKey = getImportDeduplicationKey(shareId, recipientUser.uid, interactionIdentity);
+
+  // 2. Check in-memory completed cache
+  if (completedImports.has(dedupKey)) {
+    return {
+      success: true,
+      ...completedImports.get(dedupKey),
+      alreadyImported: true,
+    };
+  }
+
+  // Check sessionStorage for reload resilience
+  const sessionStorageInstance = getSessionStorageInstance();
+  if (sessionStorageInstance) {
+    try {
+      const stored = sessionStorageInstance.getItem(`orvix_import_${dedupKey}`);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed?.chatId) {
+          completedImports.set(dedupKey, parsed);
+          return {
+            success: true,
+            ...parsed,
+            alreadyImported: true,
+          };
+        }
+      }
+    } catch (_) {}
+  }
+
+  // Check in-flight lock to deduplicate concurrent requests
+  if (inFlightImports.has(dedupKey)) {
+    return await inFlightImports.get(dedupKey);
+  }
+
+  // 3. Check if recipient's local chat history already contains an imported chat from this share
+  const existingUserChats = getCachedUserChats(recipientUser.uid);
+  const existingImportedChat = existingUserChats.find(
+    (c) => c && c.isImported && c.importedFromShareId === shareId
+  );
+
+  if (existingImportedChat) {
+    const existingMessages = getCachedChatMessages(recipientUser.uid, existingImportedChat.id);
+    const hasSameFirstMessage = existingMessages.some(
+      (m) =>
+        m.sender === 'user' &&
+        recipientUserMessage?.content &&
+        m.content === recipientUserMessage.content
+    );
+
+    if (hasSameFirstMessage) {
+      const result = {
+        chatId: existingImportedChat.id,
+        chatMetadata: existingImportedChat,
+        messages: existingMessages,
+      };
+      completedImports.set(dedupKey, result);
+      return {
+        success: true,
+        ...result,
+        alreadyImported: true,
+      };
+    }
+  }
+
+  // 4. Create in-flight task
+  const importTask = (async () => {
+    // Build remapped payload
+    const { chatMetadata, messages: orderedMessages, newChatId } = createImportedConversationData({
+      shareId,
+      snapshot,
+      recipientUserId: recipientUser.uid,
+      recipientUserMessage,
+      recipientAssistantMessage,
+      customChatId: options.customChatId || null,
+    });
+
+    const isOnline = options.isOnline !== undefined ? options.isOnline : isBrowserOnline();
+    const canUseFirestore =
+      options.firestoreDb !== undefined ||
+      (isFirebaseConfigured() && Boolean(db) && isOnline && !options.skipFirestore);
+
+    // Always update user-scoped local cache first for instant UI response and offline resilience
+    upsertCachedUserChat(recipientUser.uid, {
+      ...chatMetadata,
+      pendingSync: !canUseFirestore,
+      createdOffline: !canUseFirestore,
+    });
+
+    saveCachedChatMessages(recipientUser.uid, newChatId, orderedMessages);
+
+    // Persist to Cloud Firestore if enabled
+    if (canUseFirestore) {
+      await persistImportedConversationToFirestore({
+        firestoreDb: options.firestoreDb,
+        userId: recipientUser.uid,
+        chatMetadata,
+        messages: orderedMessages,
+        docImpl: options.docImpl,
+        writeBatchImpl: options.writeBatchImpl,
+        timeoutMs: options.timeoutMs || 15000,
+      });
+
+      // Clear pendingSync flag once Firestore write succeeds
+      upsertCachedUserChat(recipientUser.uid, {
+        id: newChatId,
+        pendingSync: false,
+        createdOffline: false,
+      });
+    }
+
+    const completedRecord = {
+      chatId: newChatId,
+      chatMetadata,
+      messages: orderedMessages,
+    };
+
+    completedImports.set(dedupKey, completedRecord);
+
+    if (sessionStorageInstance) {
+      try {
+        sessionStorageInstance.setItem(
+          `orvix_import_${dedupKey}`,
+          JSON.stringify(completedRecord)
+        );
+      } catch (_) {}
+    }
+
+    return {
+      success: true,
+      ...completedRecord,
+      alreadyImported: false,
+    };
+  })();
+
+  inFlightImports.set(dedupKey, importTask);
+
+  try {
+    return await importTask;
+  } finally {
+    inFlightImports.delete(dedupKey);
+  }
+}
+
+/**
+ * Checks whether a conversation object represents an imported shared conversation.
+ *
+ * @param {Object|null} chat
+ * @returns {boolean}
+ */
+export function isImportedConversation(chat) {
+  return Boolean(chat && typeof chat === 'object' && chat.isImported === true);
+}
+
+/**
+ * Retrieves the original public share ID that an imported conversation originated from.
+ *
+ * @param {Object|null} chat
+ * @returns {string|null}
+ */
+export function getImportedOriginShareId(chat) {
+  if (chat && typeof chat === 'object' && typeof chat.importedFromShareId === 'string' && chat.importedFromShareId.trim()) {
+    return chat.importedFromShareId.trim();
+  }
+  return null;
+}
+
+/**
+ * Validates that a reshared conversation snapshot is fully independent,
+ * contains all historical messages and subsequent continuation turns,
+ * has a fresh share ID, and strips all private metadata.
+ *
+ * @param {Object} params
+ * @param {Object} params.originalSnapshot
+ * @param {Object} params.reSharedSnapshot
+ * @param {Array} params.continuationMessages
+ * @returns {{ valid: boolean, errors: string[] }}
+ */
+export function verifyReshareIntegrity({
+  originalSnapshot,
+  reSharedSnapshot,
+  continuationMessages = [],
+}) {
+  const errors = [];
+
+  if (!reSharedSnapshot || typeof reSharedSnapshot !== 'object') {
+    errors.push('Reshared snapshot is missing or not an object.');
+    return { valid: false, errors };
+  }
+
+  if (!isValidShareId(reSharedSnapshot.id)) {
+    errors.push('Reshared snapshot does not have a valid URL-safe share ID.');
+  }
+
+  if (originalSnapshot && reSharedSnapshot.id === originalSnapshot.id) {
+    errors.push('Reshared snapshot must have a brand-new share ID, not reuse original.');
+  }
+
+  const expectedCount = (originalSnapshot?.messageCount || 0) + continuationMessages.length;
+  if (reSharedSnapshot.messageCount !== expectedCount) {
+    errors.push(
+      `Message count mismatch: expected ${expectedCount}, got ${reSharedSnapshot.messageCount}.`
+    );
+  }
+
+  if (!Array.isArray(reSharedSnapshot.messages) || reSharedSnapshot.messages.length !== expectedCount) {
+    errors.push(
+      `Messages array length mismatch: expected ${expectedCount}, got ${reSharedSnapshot.messages?.length}.`
+    );
+  }
+
+  // Ensure no private metadata leaked
+  if ('isImported' in reSharedSnapshot || 'importedFromShareId' in reSharedSnapshot || 'userId' in reSharedSnapshot) {
+    errors.push('Private conversation metadata leaked into public reshared snapshot.');
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+  };
+}
+
+
 

@@ -570,6 +570,18 @@ html, body {
   color: var(--text-muted);
 }
 
+.chat-item-imported-badge {
+  font-size: 0.65rem;
+  font-weight: 600;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background-color: rgba(99, 102, 241, 0.12);
+  color: #818cf8;
+  border: 1px solid rgba(99, 102, 241, 0.25);
+  line-height: 1.2;
+  letter-spacing: 0.02em;
+}
+
 /* Action Controls (Pin, Rename, Delete) */
 .chat-item-actions {
   position: absolute;
@@ -1010,6 +1022,21 @@ html, body {
   .header-thread-title {
     max-width: 850px;
   }
+}
+
+.header-imported-pill {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.68rem;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 9999px;
+  background-color: rgba(99, 102, 241, 0.15);
+  color: #a5b4fc;
+  border: 1px solid rgba(99, 102, 241, 0.3);
+  margin-left: 6px;
+  vertical-align: middle;
+  line-height: 1.3;
 }
 
 .header-right {

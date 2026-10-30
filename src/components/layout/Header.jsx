@@ -51,6 +51,7 @@ export default function Header({
   providerConfig = null,
   selectedModelId = DEFAULT_WEBLLM_MODEL_ID,
   isSharedView = false,
+  isImported = false,
   onSignInClick = undefined
 }) {
   const activeGuidanceText = getAISelectionGuidance(selectedProvider, selectedModelId);
@@ -185,6 +186,11 @@ export default function Header({
               <span className="header-thread-title" title={activeTitle}>
                 {activeTitle}
               </span>
+              {isImported && (
+                <span className="header-imported-pill" title="Imported conversation">
+                  Imported
+                </span>
+              )}
             </div>
           )}
         </div>
@@ -399,6 +405,11 @@ export default function Header({
             {activeTitle ? (
               <div className="mobile-thread-context" title={activeTitle}>
                 <span className="mobile-thread-name">{activeTitle}</span>
+                {isImported && (
+                  <span className="header-imported-pill" title="Imported conversation">
+                    Imported
+                  </span>
+                )}
               </div>
             ) : (
               <div className="mobile-status-pill">

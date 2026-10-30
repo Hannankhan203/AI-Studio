@@ -99,7 +99,8 @@ import {
   isValidShareId,
   isEligibleShareUser,
   getSharedPreviewActionPermissions,
-  createSharedPreviewState
+  createSharedPreviewState,
+  importSharedConversationToAccount
 } from '../services/shareChatService.js';
 import ShareChatModal from '../components/chat/ShareChatModal.jsx';
 import { AlertCircle, X, Check, WifiOff } from 'lucide-react';
@@ -1329,6 +1330,93 @@ export default function ChatPage({
     });
   };
 
+  // Handle the permanent import transition of a shared conversation to an authenticated user's account
+  // triggered strictly after the recipient's first message and AI response successfully complete and persist
+  const handleSharedPreviewImportTransition = async ({
+    userMessage,
+    assistantMessageId,
+    submitProvider,
+    promptResult
+  }) => {
+    if (!isAuthenticatedSharedPreview) return false;
+
+    const isSuccessful =
+      promptResult?.status === 'completed' &&
+      isEligibleShareUser(currentUser) &&
+      Boolean(sharedSnapshot);
+
+    if (!isSuccessful) {
+      setIsSubmittingFirstSharedMessage(false);
+      setFirstSharedMessageSubmissionFailed(true);
+      setSharedPreviewSubmissionState('failed');
+      return false;
+    }
+
+    const completedAssistantMsg =
+      messagesRef.current.find((m) => m.id === assistantMessageId) || {
+        id: assistantMessageId,
+        sender: 'assistant',
+        content: promptResult?.resolvedText || '',
+        provider: submitProvider,
+        mode: activeMode || 'general'
+      };
+
+    if (completedAssistantMsg?.isError || completedAssistantMsg?.isStopped) {
+      setIsSubmittingFirstSharedMessage(false);
+      setFirstSharedMessageSubmissionFailed(true);
+      setSharedPreviewSubmissionState('failed');
+      return false;
+    }
+
+    try {
+      setSharedPreviewSubmissionState('importing');
+      const importResult = await importSharedConversationToAccount({
+        shareId: sharedShareId,
+        snapshot: sharedSnapshot,
+        recipientUser: currentUser,
+        recipientUserMessage: userMessage,
+        recipientAssistantMessage: completedAssistantMsg
+      });
+
+      if (importResult?.success && importResult.chatId) {
+        skipNextChatLoadRef.current = importResult.chatId;
+        activeChatIdRef.current = importResult.chatId;
+        setActiveChatId(importResult.chatId);
+        sessionStorage.setItem('orvix_active_chat', importResult.chatId);
+        updateMessagesState(importResult.messages);
+
+        if (currentUser?.uid) {
+          const updatedChats = getCachedUserChats(currentUser.uid);
+          if (updatedChats && updatedChats.length > 0) {
+            setUserChats(updatedChats);
+          }
+        }
+
+        clearSharedSnapshotSession(sharedShareId);
+        setIsSubmittingFirstSharedMessage(false);
+        setSharedPreviewSubmissionState('imported');
+
+        if (typeof window !== 'undefined') {
+          window.history.pushState(null, '', '/');
+          window.dispatchEvent(new PopStateEvent('popstate'));
+        }
+        return true;
+      }
+    } catch (importErr) {
+      console.error('Import failed:', importErr);
+      setIsSubmittingFirstSharedMessage(false);
+      setFirstSharedMessageSubmissionFailed(true);
+      setSharedPreviewSubmissionState('failed');
+      setPersistenceError('Failed to import shared conversation to your account.');
+      return false;
+    }
+
+    setIsSubmittingFirstSharedMessage(false);
+    setFirstSharedMessageSubmissionFailed(true);
+    setSharedPreviewSubmissionState('failed');
+    return false;
+  };
+
   // Submit a new message.
   const handleSubmit = async (attachments = [], promptOverride = null) => {
     if (isPublicSharedViewer) return false;
@@ -2004,7 +2092,7 @@ export default function ChatPage({
         setSharedPreviewSubmissionState('streaming');
       }
 
-      await executePrompt(
+      const promptResult = await executePrompt(
         promptText,
         validHistory,
         currentChatId,
@@ -2018,8 +2106,12 @@ export default function ChatPage({
       );
 
       if (isAuthenticatedSharedPreview) {
-        setIsSubmittingFirstSharedMessage(false);
-        setSharedPreviewSubmissionState('complete');
+        return await handleSharedPreviewImportTransition({
+          userMessage,
+          assistantMessageId,
+          submitProvider,
+          promptResult
+        });
       }
       return true;
     } catch (error) {
@@ -2040,7 +2132,7 @@ export default function ChatPage({
   };
 
   // Retry a failed AI response with the same provider.
-  const handleRetry = (failedMessage) => {
+  const handleRetry = async (failedMessage) => {
     if (isPublicSharedViewer) return;
     stopSpeech();
 
@@ -2055,6 +2147,12 @@ export default function ChatPage({
     const providerToUse = failedMessage.failedProvider || selectedProvider;
     if (!guardOfflineProviderAction(providerToUse)) {
       return;
+    }
+
+    if (isAuthenticatedSharedPreview) {
+      setIsSubmittingFirstSharedMessage(true);
+      setFirstSharedMessageSubmissionFailed(false);
+      setSharedPreviewSubmissionState('streaming');
     }
 
     setLoadingAndSubmitting(true);
@@ -2147,7 +2245,7 @@ export default function ChatPage({
       ? resolveMultiPartContext(validHistory, failedMessage.failedPrompt)
       : { isContinuation: false, partNumber: 1, originalPrompt: failedMessage.failedPrompt, previousContentSummary: '' };
 
-    void executePrompt(
+    const promptResult = await executePrompt(
       failedMessage.failedPrompt,
       validHistory,
       currentChatId,
@@ -2157,10 +2255,22 @@ export default function ChatPage({
       retryMultiPart,
       requestStartTime
     );
+
+    if (isAuthenticatedSharedPreview) {
+      const targetUser = parentUser || messagesRef.current.find((m) => m.id === parentMessageId);
+      if (targetUser) {
+        await handleSharedPreviewImportTransition({
+          userMessage: targetUser,
+          assistantMessageId,
+          submitProvider: providerToUse,
+          promptResult
+        });
+      }
+    }
   };
 
   // User-controlled provider switch & retry without duplicating conversation messages
-  const handleSwitchProviderAndRetry = (failedMessage, newProviderId) => {
+  const handleSwitchProviderAndRetry = async (failedMessage, newProviderId) => {
     if (isPublicSharedViewer) return;
     stopSpeech();
 
@@ -2177,6 +2287,12 @@ export default function ChatPage({
     }
 
     handleSelectProvider(newProviderId);
+
+    if (isAuthenticatedSharedPreview) {
+      setIsSubmittingFirstSharedMessage(true);
+      setFirstSharedMessageSubmissionFailed(false);
+      setSharedPreviewSubmissionState('streaming');
+    }
 
     const requestStartTime = performance.now();
 
@@ -2268,7 +2384,7 @@ export default function ChatPage({
       ? resolveMultiPartContext(validHistory, failedMessage.failedPrompt)
       : { isContinuation: false, partNumber: 1, originalPrompt: failedMessage.failedPrompt, previousContentSummary: '' };
 
-    void executePrompt(
+    const promptResult = await executePrompt(
       failedMessage.failedPrompt,
       validHistory,
       currentChatId,
@@ -2278,6 +2394,18 @@ export default function ChatPage({
       switchMultiPart,
       requestStartTime
     );
+
+    if (isAuthenticatedSharedPreview) {
+      const targetUser = parentSwitchUser || messagesRef.current.find((m) => m.id === parentMessageId);
+      if (targetUser) {
+        await handleSharedPreviewImportTransition({
+          userMessage: targetUser,
+          assistantMessageId,
+          submitProvider: newProviderId,
+          promptResult
+        });
+      }
+    }
   };
 
   // Restore a failed prompt to the input field.
