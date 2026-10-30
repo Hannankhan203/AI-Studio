@@ -96,7 +96,10 @@ import {
   evaluateShareEligibility,
   loadSharedChatSnapshot,
   clearSharedSnapshotSession,
-  isValidShareId
+  isValidShareId,
+  isEligibleShareUser,
+  getSharedPreviewActionPermissions,
+  createSharedPreviewState
 } from '../services/shareChatService.js';
 import ShareChatModal from '../components/chat/ShareChatModal.jsx';
 import { AlertCircle, X, Check, WifiOff } from 'lucide-react';
@@ -113,6 +116,15 @@ export default function ChatPage({
   const { currentUser, username } = useAuth();
   const { settings } = useSettings();
   const { stopSpeech } = useSpeech();
+
+  const isRealUser = isEligibleShareUser(currentUser);
+  const isAuthenticatedSharedPreview = Boolean(isSharedView && isRealUser);
+  const isPublicSharedViewer = Boolean(isSharedView && !isRealUser);
+
+  const [hasSharedPreviewFirstMessageBeenSent, setHasSharedPreviewFirstMessageBeenSent] = useState(false);
+  const [isSubmittingFirstSharedMessage, setIsSubmittingFirstSharedMessage] = useState(false);
+  const [firstSharedMessageSubmissionFailed, setFirstSharedMessageSubmissionFailed] = useState(false);
+  const [sharedPreviewSubmissionState, setSharedPreviewSubmissionState] = useState('idle');
 
   const isGuestUser = Boolean(
     !currentUser?.uid ||
@@ -346,6 +358,27 @@ export default function ChatPage({
       cancelled = true;
     };
   }, [isSharedView, sharedShareId, isMalformedShareId]);
+
+  // Smoothly manage auth state transitions while on the shared route (/share/{shareId})
+  const prevIsRealUserRef = useRef(isRealUser);
+  useEffect(() => {
+    if (!isSharedView) {
+      prevIsRealUserRef.current = isRealUser;
+      return;
+    }
+
+    const wasRealUser = prevIsRealUserRef.current;
+    prevIsRealUserRef.current = isRealUser;
+
+    // Transition: authenticated preview -> unauthenticated public viewer (logout)
+    if (wasRealUser && !isRealUser) {
+      cancelCurrentGeneration('auth_logged_out');
+      setIsSubmittingFirstSharedMessage(false);
+      setFirstSharedMessageSubmissionFailed(false);
+      setSharedPreviewSubmissionState('idle');
+      setLoadingAndSubmitting(false);
+    }
+  }, [isSharedView, isRealUser]);
 
   // Subscribe to real Browser AI engine state updates
   useEffect(() => {
@@ -845,6 +878,12 @@ export default function ChatPage({
       if (sharedShareId) {
         clearSharedSnapshotSession(sharedShareId);
       }
+      setHasSharedPreviewFirstMessageBeenSent(false);
+      setIsSubmittingFirstSharedMessage(false);
+      setFirstSharedMessageSubmissionFailed(false);
+      setSharedPreviewSubmissionState('idle');
+      cancelCurrentGeneration('conversation_switched');
+
       if (onNavigateHome) {
         onNavigateHome();
       } else if (typeof window !== 'undefined') {
@@ -882,6 +921,10 @@ export default function ChatPage({
     stopSpeech();
 
     if (isSharedView) {
+      setHasSharedPreviewFirstMessageBeenSent(false);
+      setIsSubmittingFirstSharedMessage(false);
+      setFirstSharedMessageSubmissionFailed(false);
+      setSharedPreviewSubmissionState('idle');
       if (onNavigateHome) {
         onNavigateHome();
       } else if (typeof window !== 'undefined') {
@@ -1288,7 +1331,14 @@ export default function ChatPage({
 
   // Submit a new message.
   const handleSubmit = async (attachments = [], promptOverride = null) => {
-    if (isSharedView) return false;
+    if (isPublicSharedViewer) return false;
+    if (isSharedView && !isAuthenticatedSharedPreview) return false;
+
+    if (isAuthenticatedSharedPreview && Array.isArray(attachments) && attachments.length > 0) {
+      setPersistenceError('Attachments are not supported in shared conversation preview mode.');
+      return false;
+    }
+
     stopSpeech();
 
     const rawText = promptOverride !== null ? promptOverride : inputValue;
@@ -1330,11 +1380,23 @@ export default function ChatPage({
       if (errMsg) {
         setPersistenceError(errMsg);
       }
+      if (isAuthenticatedSharedPreview) {
+        setIsSubmittingFirstSharedMessage(false);
+        setFirstSharedMessageSubmissionFailed(true);
+        setSharedPreviewSubmissionState('failed');
+      }
       if (!requestControllerRef.current.hasActiveRequest()) {
         setLoadingAndSubmitting(false);
       }
       return false;
     };
+
+    if (isAuthenticatedSharedPreview) {
+      setHasSharedPreviewFirstMessageBeenSent(true);
+      setIsSubmittingFirstSharedMessage(true);
+      setFirstSharedMessageSubmissionFailed(false);
+      setSharedPreviewSubmissionState('submitting');
+    }
 
     setLoadingAndSubmitting(true);
     setPersistenceError(null);
@@ -1752,34 +1814,59 @@ export default function ChatPage({
     try {
       // Create a conversation only when the user sends their first message.
       if (!currentChatId) {
-        const titleSnippet = generateChatTitle(
-          trimmed ||
-            (processedAttachments.length > 0
-              ? `Files: ${processedAttachments.map((a) => a.name || a.originalName).join(', ')}`
-              : 'New Conversation')
-        );
+        if (isAuthenticatedSharedPreview) {
+          // Provision an isolated temporary preview chat ID in memory without creating Firestore or guest docs
+          currentChatId = `shared-preview-${sharedShareId || Date.now()}`;
+          activeChatIdRef.current = currentChatId;
+          setActiveChatId(currentChatId);
+        } else {
+          const titleSnippet = generateChatTitle(
+            trimmed ||
+              (processedAttachments.length > 0
+                ? `Files: ${processedAttachments.map((a) => a.name || a.originalName).join(', ')}`
+                : 'New Conversation')
+          );
 
-        if (isCloudEnabled && currentUser?.uid) {
-          try {
-            const createdId = await createChatDocument(
-              currentUser.uid,
-              titleSnippet,
-              activeMode
-            );
-            if (!isPreflightActive()) return false;
-            currentChatId = createdId;
-            skipNextChatLoadRef.current = currentChatId;
-            // Ensure offline-created conversations appear immediately in the sidebar
-            const cachedList = getCachedUserChats(currentUser.uid);
-            if (cachedList.length > 0) {
-              setUserChats(cachedList);
+          if (isCloudEnabled && currentUser?.uid) {
+            try {
+              const createdId = await createChatDocument(
+                currentUser.uid,
+                titleSnippet,
+                activeMode
+              );
+              if (!isPreflightActive()) return false;
+              currentChatId = createdId;
+              skipNextChatLoadRef.current = currentChatId;
+              // Ensure offline-created conversations appear immediately in the sidebar
+              const cachedList = getCachedUserChats(currentUser.uid);
+              if (cachedList.length > 0) {
+                setUserChats(cachedList);
+              }
+            } catch (error) {
+              if (!isPreflightActive()) return false;
+              console.warn('Could not create Firestore chat doc, falling back to local conversation:', error);
+              currentChatId = `local-${Date.now()}`;
+              skipNextChatLoadRef.current = currentChatId;
+              const fallbackChat = {
+                id: currentChatId,
+                title: titleSnippet,
+                mode: activeMode || 'general',
+                timestamp: 'Just now',
+                rawUpdatedAt: Date.now(),
+                isPinned: false,
+                pinnedAt: null,
+                pendingSync: true
+              };
+              setUserChats((previous) => [fallbackChat, ...previous]);
             }
-          } catch (error) {
-            if (!isPreflightActive()) return false;
-            console.warn('Could not create Firestore chat doc, falling back to local conversation:', error);
-            currentChatId = `local-${Date.now()}`;
+          } else {
+            currentChatId = `guest-${Date.now()}`;
+
+            // Prevent the history effect from replacing the new chat's
+            // messages with an empty guest list before they are persisted.
             skipNextChatLoadRef.current = currentChatId;
-            const fallbackChat = {
+
+            const newGuestChat = {
               id: currentChatId,
               title: titleSnippet,
               mode: activeMode || 'general',
@@ -1787,44 +1874,26 @@ export default function ChatPage({
               rawUpdatedAt: Date.now(),
               isPinned: false,
               pinnedAt: null,
-              pendingSync: true
+              messages: []
             };
-            setUserChats((previous) => [fallbackChat, ...previous]);
+
+            setUserChats((previous) => {
+              const next = [newGuestChat, ...previous];
+              saveGuestChats(next);
+              return next;
+            });
           }
-        } else {
-          currentChatId = `guest-${Date.now()}`;
 
-          // Prevent the history effect from replacing the new chat's
-          // messages with an empty guest list before they are persisted.
-          skipNextChatLoadRef.current = currentChatId;
+          // Update the ref immediately; setState alone does not do this
+          // synchronously, and the first AI chunks may arrive before rerender.
+          activeChatIdRef.current = currentChatId;
+          setActiveChatId(currentChatId);
 
-          const newGuestChat = {
-            id: currentChatId,
-            title: titleSnippet,
-            mode: activeMode || 'general',
-            timestamp: 'Just now',
-            rawUpdatedAt: Date.now(),
-            isPinned: false,
-            pinnedAt: null,
-            messages: []
-          };
-
-          setUserChats((previous) => {
-            const next = [newGuestChat, ...previous];
-            saveGuestChats(next);
-            return next;
-          });
+          sessionStorage.setItem(
+            'orvix_active_chat',
+            currentChatId
+          );
         }
-
-        // Update the ref immediately; setState alone does not do this
-        // synchronously, and the first AI chunks may arrive before rerender.
-        activeChatIdRef.current = currentChatId;
-        setActiveChatId(currentChatId);
-
-        sessionStorage.setItem(
-          'orvix_active_chat',
-          currentChatId
-        );
       }
 
       const currentMessagesSnapshot = messagesRef.current;
@@ -1931,6 +2000,10 @@ export default function ChatPage({
           ? `[User attached ${processedAttachments.length} file${processedAttachments.length > 1 ? 's' : ''}: ${processedAttachments.map((a) => `${a.name || a.originalName} (${a.formattedSize})`).join(', ')}]`
           : '');
 
+      if (isAuthenticatedSharedPreview) {
+        setSharedPreviewSubmissionState('streaming');
+      }
+
       await executePrompt(
         promptText,
         validHistory,
@@ -1943,9 +2016,19 @@ export default function ChatPage({
         null,
         preflightRequestId
       );
+
+      if (isAuthenticatedSharedPreview) {
+        setIsSubmittingFirstSharedMessage(false);
+        setSharedPreviewSubmissionState('complete');
+      }
       return true;
     } catch (error) {
       console.error('Submission error:', error);
+      if (isAuthenticatedSharedPreview) {
+        setIsSubmittingFirstSharedMessage(false);
+        setFirstSharedMessageSubmissionFailed(true);
+        setSharedPreviewSubmissionState('failed');
+      }
       if (requestControllerRef.current.isRequestActive(preflightRequestId)) {
         requestControllerRef.current.markFinalized(preflightRequestId);
       }
@@ -1958,6 +2041,7 @@ export default function ChatPage({
 
   // Retry a failed AI response with the same provider.
   const handleRetry = (failedMessage) => {
+    if (isPublicSharedViewer) return;
     stopSpeech();
 
     if (
@@ -2077,6 +2161,7 @@ export default function ChatPage({
 
   // User-controlled provider switch & retry without duplicating conversation messages
   const handleSwitchProviderAndRetry = (failedMessage, newProviderId) => {
+    if (isPublicSharedViewer) return;
     stopSpeech();
 
     if (
@@ -2197,6 +2282,7 @@ export default function ChatPage({
 
   // Restore a failed prompt to the input field.
   const handleRestorePrompt = (promptText) => {
+    if (isPublicSharedViewer) return;
     setInputValue(promptText);
 
     updateMessagesState((previous) =>
@@ -2208,6 +2294,7 @@ export default function ChatPage({
 
   // Regenerate an assistant response in-place using the model of the response currently being viewed
   const handleRegenerate = async (assistantMessage) => {
+    if (isSharedView) return;
     stopSpeech();
 
     if (isLoading || isSubmittingRef.current || !assistantMessage?.id) return;
@@ -2316,6 +2403,7 @@ export default function ChatPage({
 
   // Generate an alternative response for an existing assistant message using another provider/model
   const handleGenerateAlternative = async (assistantMessage, targetProvider) => {
+    if (isSharedView) return;
     stopSpeech();
 
     if (isLoading || isSubmittingRef.current || !assistantMessage?.id || !targetProvider) return;
@@ -2434,6 +2522,7 @@ export default function ChatPage({
 
   // Switch the active alternative response for an assistant message
   const handleSwitchAlternative = (assistantMessageId, targetAlternativeId) => {
+    if (isSharedView) return;
     stopSpeech();
 
     if (isLoading || isSubmittingRef.current) return;
@@ -2457,11 +2546,15 @@ export default function ChatPage({
   const handleStopGenerating = () => {
     stopSpeech();
     cancelCurrentGeneration('stopped');
+    if (isAuthenticatedSharedPreview) {
+      setIsSubmittingFirstSharedMessage(false);
+      setSharedPreviewSubmissionState('cancelled');
+    }
   };
 
   // Start inline editing mode for a user message
   const handleStartEdit = (messageId) => {
-    if (isLoading || isSubmittingRef.current) return;
+    if (isSharedView || isLoading || isSubmittingRef.current) return;
     setEditingMessageId(messageId);
   };
 
@@ -2472,6 +2565,7 @@ export default function ChatPage({
 
   // Edit and resend an eligible user message with contextual branch truncation
   const handleEditResend = async (userMessageId, newPromptText) => {
+    if (isSharedView) return;
     stopSpeech();
 
     const trimmed = (newPromptText || '')
@@ -3026,6 +3120,12 @@ export default function ChatPage({
         onDismissShareError={() => setShareErrorNotice(null)}
         isReadOnly={isSharedView}
         isSharedView={isSharedView}
+        isAuthenticatedSharedPreview={isAuthenticatedSharedPreview}
+        isPublicSharedViewer={isPublicSharedViewer}
+        hasSharedPreviewFirstMessageBeenSent={hasSharedPreviewFirstMessageBeenSent}
+        isSubmittingFirstSharedMessage={isSubmittingFirstSharedMessage}
+        firstSharedMessageSubmissionFailed={firstSharedMessageSubmissionFailed}
+        sharedPreviewSubmissionState={sharedPreviewSubmissionState}
         sharedSnapshot={sharedSnapshot}
         sharedError={sharedError}
         sharedLoading={sharedLoading}

@@ -1304,3 +1304,168 @@ export async function loadSharedChatSnapshot(shareId, options = {}) {
 
   return validated;
 }
+
+/**
+ * Stage 5: Evaluates whether a given route and user represent an authenticated shared preview.
+ * Strictly requires a valid /share/{shareId} route and a real, non-anonymous user.
+ *
+ * @param {Object} params
+ * @param {boolean} [params.isShareRoute=false]
+ * @param {Object|null} [params.user=null]
+ * @returns {boolean}
+ */
+export function isAuthenticatedSharedPreview({ isShareRoute = false, user = null } = {}) {
+  return Boolean(isShareRoute && isEligibleShareUser(user));
+}
+
+/**
+ * Stage 5: Action-bar & composer permission evaluator for shared preview states.
+ * Centralizes deterministic permissions:
+ * - Public visitor: read-only, copy, read aloud enabled; composer & actions disabled.
+ * - Authenticated preview before first message persistence:
+ *     canRead, canCopy, canReadAloud enabled;
+ *     canType, canSubmit enabled (text-only);
+ *     canAttach, canRecordVoice, canDragDrop disabled;
+ *     canRegenerate, canGenerateAlternative, canShare, canEditUserMessage disabled;
+ *     isHistoryCreated: false.
+ *
+ * @param {Object} params
+ * @param {boolean} [params.isShareRoute=false]
+ * @param {Object|null} [params.user=null]
+ * @param {boolean} [params.hasSentFirstMessage=false]
+ * @returns {Object} Deterministic permission flags
+ */
+export function getSharedPreviewActionPermissions({
+  isShareRoute = false,
+  user = null,
+  hasSentFirstMessage = false,
+} = {}) {
+  if (!isShareRoute) {
+    return {
+      canRead: true,
+      canReadOriginal: true,
+      canCopy: true,
+      canReadAloud: true,
+      canType: true,
+      canSubmit: true,
+      canSubmitFirstMessage: true,
+      canAttach: true,
+      canRecordVoice: true,
+      canDictate: true,
+      canDragDrop: true,
+      canPasteFile: true,
+      canRegenerate: true,
+      canRegenerateOriginal: true,
+      canGenerateAlternative: true,
+      canRegenerateAlternative: true,
+      canShare: true,
+      canShareChat: true,
+      canEditUserMessage: true,
+      canEditOriginal: true,
+      canDeleteMessage: true,
+      canDelete: true,
+      canPin: true,
+      canNewChat: true,
+      isHistoryCreated: true,
+      isSharedPreview: false,
+      isAuthenticatedSharedPreview: false,
+      isPublicSharedViewer: false,
+      hasSentFirstMessage: false
+    };
+  }
+
+  const isAuthedPreview = isEligibleShareUser(user);
+
+  return {
+    canRead: true,
+    canReadOriginal: true,
+    canCopy: true,
+    canReadAloud: true,
+    // Composer text entry is enabled strictly for authenticated preview
+    canType: isAuthedPreview,
+    canSubmit: isAuthedPreview,
+    canSubmitFirstMessage: isAuthedPreview,
+    // Attachments, voice dictation, drag-and-drop, and file paste remain disabled for shared preview
+    canAttach: false,
+    canRecordVoice: false,
+    canDictate: false,
+    canDragDrop: false,
+    canPasteFile: false,
+    // Conversational mutations on original messages remain disabled before Prompt 6 import
+    canRegenerate: false,
+    canRegenerateOriginal: false,
+    canGenerateAlternative: false,
+    canRegenerateAlternative: false,
+    canShare: false,
+    canShareChat: false,
+    canEditUserMessage: false,
+    canEditOriginal: false,
+    canDeleteMessage: false,
+    canDelete: false,
+    canPin: false,
+    canNewChat: true,
+    // History creation is strictly false in Prompt 5
+    isHistoryCreated: false,
+    isSharedPreview: true,
+    isAuthenticatedSharedPreview: isAuthedPreview,
+    isPublicSharedViewer: !isAuthedPreview,
+    hasSentFirstMessage: Boolean(hasSentFirstMessage),
+  };
+}
+
+/**
+ * Stage 5: State machine factory for temporary shared preview state.
+ * Encapsulates the distinct lifecycle states:
+ * 1. 'idle' (opened, typed or un-typed, not submitted)
+ * 2. 'submitting' (first message actively processing)
+ * 3. 'complete' / 'completed' (first message generation finished, awaiting Prompt 6 permanent import)
+ * 4. 'failed' (submission error or user cancellation, can retry)
+ *
+ * @param {Object} params
+ * @param {boolean} [params.isShareRoute=false]
+ * @param {Object|null} [params.user=null]
+ * @param {boolean} [params.hasSentFirstMessage=false]
+ * @param {boolean} [params.isSubmitting=false]
+ * @param {boolean} [params.hasFailed=false]
+ * @returns {Object}
+ */
+export function createSharedPreviewState({
+  isShareRoute = false,
+  user = null,
+  hasSentFirstMessage = false,
+  isSubmitting = false,
+  hasFailed = false,
+} = {}) {
+  const isAuthedPreview = Boolean(isShareRoute && isEligibleShareUser(user));
+  const isPublicViewer = Boolean(isShareRoute && !isAuthedPreview);
+
+  let submissionPhase = 'idle';
+  if (isSubmitting) {
+    submissionPhase = 'submitting';
+  } else if (hasFailed) {
+    submissionPhase = 'failed';
+  } else if (hasSentFirstMessage) {
+    submissionPhase = 'complete';
+  }
+
+  return {
+    isSharedRoute: Boolean(isShareRoute),
+    isSharedPreview: Boolean(isShareRoute),
+    isAuthenticatedSharedPreview: isAuthedPreview,
+    isPublicSharedViewer: isPublicViewer,
+    hasSentFirstMessage: Boolean(hasSentFirstMessage),
+    hasSharedPreviewFirstMessageBeenSent: Boolean(hasSentFirstMessage),
+    isSubmitting: Boolean(isSubmitting),
+    isSubmittingFirstSharedMessage: Boolean(isSubmitting),
+    hasFailed: Boolean(hasFailed),
+    firstSharedMessageSubmissionFailed: Boolean(hasFailed),
+    submissionPhase,
+    submissionState: submissionPhase,
+    permissions: getSharedPreviewActionPermissions({
+      isShareRoute,
+      user,
+      hasSentFirstMessage,
+    }),
+  };
+}
+

@@ -268,12 +268,20 @@ export default function ChatArea({
   onDismissShareError,
   isReadOnly = false,
   isSharedView = false,
+  isAuthenticatedSharedPreview = false,
+  isPublicSharedViewer = false,
+  hasSharedPreviewFirstMessageBeenSent = false,
+  isSubmittingFirstSharedMessage = false,
+  firstSharedMessageSubmissionFailed = false,
+  sharedPreviewSubmissionState = 'idle',
   sharedSnapshot = null,
   sharedError = null,
   sharedLoading = false,
   onSignInClick = undefined,
   onNavigateHome = undefined
 }) {
+  const isComposerDisabled = isPublicSharedViewer || (isReadOnly && !isAuthenticatedSharedPreview);
+
   const textareaRef = useRef(null);
   const langMenuRef = useRef(null);
   const scrollViewportRef = useRef(null);
@@ -322,7 +330,7 @@ export default function ChatArea({
   }, []);
 
   const handleAttachClick = () => {
-    if (isReadOnly) return;
+    if (isReadOnly || isSharedView) return;
     if (attachments.length > 0) {
       setAttachmentNotice('Only one attachment can be added per message. Remove the current attachment first to select a different one.');
       return;
@@ -337,6 +345,7 @@ export default function ChatArea({
    * Enforces 1-attachment limit, 25MB size restriction, format whitelist, and image preview generation.
    */
   const processAttachment = (rawFile, { isPaste = false, isDrop = false } = {}) => {
+    if (isSharedView) return;
     if (!rawFile) return;
 
     // Strict Rule 1: One-attachment limit check
@@ -472,7 +481,7 @@ export default function ChatArea({
    * into attachments, while allowing normal text paste to proceed unhindered.
    */
   const handlePaste = (e) => {
-    if (isReadOnly) {
+    if (isComposerDisabled) {
       e.preventDefault();
       return;
     }
@@ -507,6 +516,13 @@ export default function ChatArea({
       return;
     }
 
+    // In shared view, file attachments are disabled; let plain text proceed, do not attach files
+    if (isSharedView) {
+      e.preventDefault();
+      setAttachmentNotice('Attachments are disabled in shared conversation preview.');
+      return;
+    }
+
     // An image or file was pasted: intercept the paste event so raw paths/data aren't typed
     e.preventDefault();
 
@@ -534,7 +550,7 @@ export default function ChatArea({
    * Allows dragging and dropping an image or supported file directly into the chatbot.
    */
   const handleDragEnter = (e) => {
-    if (isReadOnly || !isFileDragEvent(e)) return;
+    if (isReadOnly || isSharedView || !isFileDragEvent(e)) return;
     e.preventDefault();
     e.stopPropagation();
     dragDepthRef.current += 1;
@@ -542,7 +558,7 @@ export default function ChatArea({
   };
 
   const handleDragOver = (e) => {
-    if (isReadOnly || !isFileDragEvent(e)) return;
+    if (isReadOnly || isSharedView || !isFileDragEvent(e)) return;
     e.preventDefault();
     e.stopPropagation();
     if (e.dataTransfer) {
@@ -554,7 +570,7 @@ export default function ChatArea({
   };
 
   const handleDragLeave = (e) => {
-    if (isReadOnly || !isFileDragEvent(e)) return;
+    if (isReadOnly || isSharedView || !isFileDragEvent(e)) return;
     e.preventDefault();
     e.stopPropagation();
     dragDepthRef.current -= 1;
@@ -565,7 +581,7 @@ export default function ChatArea({
   };
 
   const handleDrop = (e) => {
-    if (isReadOnly || !isFileDragEvent(e)) return;
+    if (isReadOnly || isSharedView || !isFileDragEvent(e)) return;
     e.preventDefault();
     e.stopPropagation();
     dragDepthRef.current = 0;
@@ -1054,7 +1070,7 @@ export default function ChatArea({
   };
 
   const handleToggleListening = () => {
-    if (isReadOnly) return;
+    if (isReadOnly || isSharedView) return;
     if (recordingState === 'listening') {
       void handleStopListening();
     } else if (recordingState === 'paused') {
@@ -1253,7 +1269,7 @@ export default function ChatArea({
     return () => window.removeEventListener('keydown', handleGlobalKeyDown);
   }, []);
   const submitComposerMessage = async (textToSend) => {
-    if (isReadOnly || !onSubmit || (!textToSend.trim() && attachments.length === 0) || isLoading) {
+    if (isComposerDisabled || !onSubmit || (!textToSend.trim() && attachments.length === 0) || isLoading) {
       return;
     }
     const currentAttachments = [...attachments];
@@ -1272,7 +1288,7 @@ export default function ChatArea({
   };
 
   const handleKeyDown = async (e) => {
-    if (isReadOnly) {
+    if (isComposerDisabled) {
       return;
     }
 
@@ -1323,7 +1339,7 @@ export default function ChatArea({
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (isReadOnly) return;
+    if (isComposerDisabled) return;
     let textToSend = inputValue;
     if (isListening || isPaused || isRequesting) {
       const completed = await stopListening();
@@ -1473,7 +1489,15 @@ Transcript:
     : 'Message Orvix...';
 
   // Single source of truth for composer placeholder:
-  const composerPlaceholder = isReadOnly
+  const composerPlaceholder = isPublicSharedViewer
+    ? 'This is a read-only shared conversation.'
+    : isAuthenticatedSharedPreview
+    ? isLoading
+      ? isCompactViewport
+        ? 'Generating response...'
+        : 'Generating response — press Esc to stop...'
+      : 'Send a message to continue this conversation...'
+    : isReadOnly
     ? 'This is a read-only shared conversation.'
     : isLoading
     ? isCompactViewport
@@ -1552,17 +1576,25 @@ Transcript:
           ) : (
             <>
               {isSharedView && sharedSnapshot && (
-                <div className="shared-chat-indicator-banner" role="region" aria-label="Shared conversation banner">
+                <div
+                  className={`shared-chat-indicator-banner ${isAuthenticatedSharedPreview ? 'is-authenticated-preview' : 'is-public-viewer'}`}
+                  role="region"
+                  aria-label="Shared conversation banner"
+                >
                   <div className="shared-banner-left">
                     <div className="shared-banner-badge">
-                      <span className="shared-badge-dot" aria-hidden="true" />
-                      <span className="shared-badge-title">Shared Conversation · Read Only</span>
+                      <span className={`shared-badge-dot ${isAuthenticatedSharedPreview ? 'is-preview-dot' : ''}`} aria-hidden="true" />
+                      <span className="shared-badge-title">
+                        {isAuthenticatedSharedPreview ? 'Shared Conversation · Preview' : 'Shared Conversation · Read Only'}
+                      </span>
                     </div>
                     <p className="shared-banner-description">
-                      You are viewing a published snapshot of this conversation. Messaging and edits are disabled in read-only mode.
+                      {isAuthenticatedSharedPreview
+                        ? 'You are viewing a shared conversation preview. Type and send a message to continue this conversation.'
+                        : 'You are viewing a published snapshot of this conversation. Messaging and edits are disabled in read-only mode.'}
                     </p>
                   </div>
-                  {onSignInClick && (
+                  {!isAuthenticatedSharedPreview && onSignInClick && (
                     <div className="shared-banner-right">
                       <button
                         type="button"
@@ -2209,17 +2241,21 @@ Transcript:
                 type="button"
                 variant="ghost"
                 size="icon-round"
-                disabled={isLoading || isReadOnly}
+                disabled={isLoading || isReadOnly || isSharedView || isComposerDisabled}
                 onClick={handleAttachClick}
                 title={
-                  isReadOnly
+                  isSharedView
+                    ? 'Attachments are disabled in shared preview mode'
+                    : isReadOnly
                     ? 'Attachments are disabled in read-only shared mode'
                     : attachments.length > 0
                     ? `Attached: ${attachments[0].name} (1 file max per message)`
                     : 'Attach file or image (PDF, DOCX, TXT, CSV, PNG, JPG — max 25MB)'
                 }
                 ariaLabel={
-                  isReadOnly
+                  isSharedView
+                    ? 'Attachments are disabled in shared preview mode'
+                    : isReadOnly
                     ? 'Attachments are disabled in read-only shared mode'
                     : attachments.length > 0
                     ? `Attachment selected: ${attachments[0].name}. Maximum one attachment per message.`
@@ -2235,7 +2271,7 @@ Transcript:
                 placeholder={composerPlaceholder}
                 value={inputValue}
                 rows={1}
-                disabled={isReadOnly}
+                disabled={isComposerDisabled || isLoading}
                 onChange={(e) => onInputChange && onInputChange(e.target.value)}
                 onFocus={() => {
                   if (scrollViewportRef.current && messagesLengthRef.current > 0) {
@@ -2305,10 +2341,12 @@ Transcript:
                     type="button"
                     variant={isListening ? 'primary' : (isRequesting || isTranscribing || recordingState === 'stopping') ? 'outline' : 'ghost'}
                     size="icon-round"
-                    disabled={isLoading || isTranscribing || isFinalizing || recordingState === 'stopping' || recordingState === 'success' || isReadOnly}
+                    disabled={isLoading || isTranscribing || isFinalizing || recordingState === 'stopping' || recordingState === 'success' || isReadOnly || isSharedView || isComposerDisabled}
                     onClick={handleToggleListening}
                     title={
-                      isReadOnly
+                      isSharedView
+                        ? 'Voice dictation is disabled in shared preview mode'
+                        : isReadOnly
                         ? 'Voice dictation is disabled in read-only shared mode'
                         : !isSupported
                         ? 'Voice dictation is not supported in this browser.'
@@ -2323,7 +2361,9 @@ Transcript:
                         : `Voice dictation (${activeLang.label})`
                     }
                     ariaLabel={
-                      isReadOnly
+                      isSharedView
+                        ? 'Voice dictation is disabled in shared preview mode'
+                        : isReadOnly
                         ? 'Voice dictation is disabled in read-only shared mode'
                         : !isSupported
                         ? 'Voice dictation not supported'
@@ -2369,14 +2409,14 @@ Transcript:
                 ) : (
                   <Button
                     type="submit"
-                    variant={hasContent && !isReadOnly ? 'primary' : 'ghost'}
+                    variant={hasContent && !isComposerDisabled ? 'primary' : 'ghost'}
                     size="icon-round"
-                    disabled={!hasContent || isReadOnly}
+                    disabled={!hasContent || isComposerDisabled}
                     title={
-                      isReadOnly
+                      isComposerDisabled
                         ? 'Messaging is disabled in read-only shared mode'
                         : !hasContent
-                        ? 'Type a message or attach a file to send'
+                        ? 'Type a message to send'
                         : enterToSend
                         ? 'Send message (Enter)'
                         : 'Send message (Ctrl+Enter / ⌘+Enter)'

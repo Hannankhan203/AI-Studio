@@ -12824,6 +12824,21 @@ body.theme-light .notice-retry-btn,
   flex-shrink: 0;
 }
 
+.shared-badge-dot.is-preview-dot {
+  background-color: #3b82f6;
+  box-shadow: 0 0 8px rgba(59, 130, 246, 0.6);
+}
+
+.shared-chat-indicator-banner.is-authenticated-preview {
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.08) 0%, rgba(16, 185, 129, 0.04) 100%);
+  border-color: rgba(37, 99, 235, 0.24);
+  box-shadow: 0 4px 16px -4px rgba(37, 99, 235, 0.08);
+}
+
+.shared-chat-indicator-banner.is-authenticated-preview .shared-badge-title {
+  color: #60a5fa;
+}
+
 .shared-badge-title {
   font-size: 0.82rem;
   font-weight: 700;
@@ -13020,6 +13035,15 @@ body.theme-light .notice-retry-btn,
 [data-theme="light"] .shared-chat-indicator-banner {
   background: linear-gradient(135deg, rgba(99, 102, 241, 0.07) 0%, rgba(139, 92, 246, 0.03) 100%);
   border-color: rgba(99, 102, 241, 0.28);
+}
+
+[data-theme="light"] .shared-chat-indicator-banner.is-authenticated-preview {
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.07) 0%, rgba(16, 185, 129, 0.03) 100%);
+  border-color: rgba(37, 99, 235, 0.28);
+}
+
+[data-theme="light"] .shared-chat-indicator-banner.is-authenticated-preview .shared-badge-title {
+  color: #2563eb;
 }
 
 [data-theme="light"] .shared-badge-title {
