@@ -1,6 +1,7 @@
 import {
   doc,
   setDoc,
+  getDoc,
   serverTimestamp,
 } from 'firebase/firestore';
 import { db, auth, isFirebaseConfigured } from '../config/firebaseConfig.js';
@@ -994,4 +995,312 @@ export async function triggerNativeShare({ shareUrl, title = 'Shared Chat' }) {
     }
     throw err;
   }
+}
+
+/**
+ * Extracts and parses a share ID from a window pathname (e.g. '/share/abc123_456').
+ * Returns the shareId string if matched, or null otherwise.
+ *
+ * @param {string} [pathname]
+ * @returns {string|null}
+ */
+export function parseSharePath(pathname) {
+  const target =
+    typeof pathname === 'string'
+      ? pathname.trim()
+      : typeof window !== 'undefined'
+      ? window.location?.pathname || ''
+      : '';
+
+  if (!target) return null;
+  const match = target.match(/^\/share\/([a-zA-Z0-9_-]+)\/?$/);
+  return match ? match[1] : null;
+}
+
+/**
+ * Analyzes whether a given pathname represents a /share route and evaluates ID validity.
+ *
+ * @param {string} [pathname]
+ * @returns {{ isShareRoute: boolean, shareId: string|null, rawShareId: string|null, isValid: boolean, isMalformed: boolean }}
+ */
+export function getShareRouteDetails(pathname) {
+  const target =
+    typeof pathname === 'string'
+      ? pathname.trim()
+      : typeof window !== 'undefined'
+      ? window.location?.pathname || ''
+      : '';
+
+  if (!target || !target.startsWith('/share')) {
+    return { isShareRoute: false, shareId: null, rawShareId: null, isValid: false, isMalformed: false };
+  }
+
+  // Handle bare /share or /share/
+  if (target === '/share' || target === '/share/') {
+    return { isShareRoute: true, shareId: null, rawShareId: '', isValid: false, isMalformed: true };
+  }
+
+  const match = target.match(/^\/share\/([^/?#]+)\/?$/);
+  if (!match) {
+    return { isShareRoute: true, shareId: null, rawShareId: null, isValid: false, isMalformed: true };
+  }
+
+  const rawShareId = match[1];
+  const isValid = isValidShareId(rawShareId);
+
+  return {
+    isShareRoute: true,
+    shareId: isValid ? rawShareId : null,
+    rawShareId,
+    isValid,
+    isMalformed: !isValid
+  };
+}
+
+function getSessionStorageInstance() {
+  if (typeof window !== 'undefined' && window.sessionStorage) {
+    return window.sessionStorage;
+  }
+  if (typeof sessionStorage !== 'undefined') {
+    return sessionStorage;
+  }
+  return null;
+}
+
+/**
+ * Reads a cached validated shared snapshot from sessionStorage for reload resilience.
+ *
+ * @param {string} shareId
+ * @returns {Object|null}
+ */
+export function getSharedSnapshotSession(shareId) {
+  const storage = getSessionStorageInstance();
+  if (!isValidShareId(shareId) || !storage) {
+    return null;
+  }
+  try {
+    const raw = storage.getItem(`orvix_shared_snapshot_${shareId}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return validateSharedSnapshotPayload(parsed, shareId);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Stores a validated shared snapshot in sessionStorage under a share-specific key.
+ * Never touches orvix_active_chat, orvix_guest_chats, or orvix_user_chats.
+ *
+ * @param {string} shareId
+ * @param {Object} snapshot
+ */
+export function setSharedSnapshotSession(shareId, snapshot) {
+  const storage = getSessionStorageInstance();
+  if (!isValidShareId(shareId) || !snapshot || !storage) {
+    return;
+  }
+  try {
+    storage.setItem(
+      `orvix_shared_snapshot_${shareId}`,
+      JSON.stringify(snapshot)
+    );
+  } catch {
+    // Non-fatal if session storage is full
+  }
+}
+
+/**
+ * Removes a shared snapshot cache entry from sessionStorage.
+ *
+ * @param {string} shareId
+ */
+export function clearSharedSnapshotSession(shareId) {
+  const storage = getSessionStorageInstance();
+  if (!shareId || !storage) {
+    return;
+  }
+  try {
+    storage.removeItem(`orvix_shared_snapshot_${shareId}`);
+  } catch {}
+}
+
+/**
+ * Validates the complete structure and contents of a shared chat snapshot document.
+ * Enforces strict consistency with firestore.rules:
+ * - Top-level keys: id, title, mode, messageCount, messages (and optional createdAt)
+ * - id matches the expected shareId exactly
+ * - title is a non-empty string <= MAX_SHARED_TITLE_LENGTH
+ * - mode is in ALLOWED_CHAT_MODES
+ * - messageCount matches messages.length (1 to 500)
+ * - Every single message is validated against allowed sender, keys, content length, and structure
+ * - Rejects malformed snapshots safely without modifying or creating chat history
+ *
+ * @param {Object} data - Raw document data from Firestore or session cache
+ * @param {string} [expectedShareId=null] - The requested shareId
+ * @returns {Object} Clean, validated, and canonically ordered snapshot
+ */
+export function validateSharedSnapshotPayload(data, expectedShareId = null) {
+  const targetShareId = expectedShareId || data?.id;
+  if (!targetShareId || !isValidShareId(targetShareId)) {
+    throw new ShareChatError('Invalid or malformed share ID.', 'INVALID_SHARE_ID');
+  }
+
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new ShareChatError('Invalid shared conversation structure.', 'MALFORMED_SNAPSHOT');
+  }
+
+  if (typeof data.id === 'string' && expectedShareId && data.id !== expectedShareId) {
+    throw new ShareChatError('Shared conversation identifier mismatch.', 'MALFORMED_SNAPSHOT');
+  }
+
+  if (typeof data.title !== 'string' || !data.title.trim()) {
+    throw new ShareChatError('Shared conversation is missing a title.', 'MALFORMED_SNAPSHOT');
+  }
+
+  const cleanTitle = data.title.trim().slice(0, MAX_SHARED_TITLE_LENGTH);
+
+  if (!ALLOWED_CHAT_MODES.includes(data.mode)) {
+    throw new ShareChatError(
+      `Shared conversation has an unsupported chat mode ("${String(data.mode)}").`,
+      'MALFORMED_SNAPSHOT'
+    );
+  }
+
+  if (!Array.isArray(data.messages) || data.messages.length === 0) {
+    throw new ShareChatError('Shared conversation contains no messages.', 'EMPTY_SNAPSHOT');
+  }
+
+  if (data.messages.length > MAX_SHARED_MESSAGE_COUNT) {
+    throw new ShareChatError(
+      `Shared conversation exceeds the maximum message limit of ${MAX_SHARED_MESSAGE_COUNT}.`,
+      'MALFORMED_SNAPSHOT'
+    );
+  }
+
+  if (typeof data.messageCount === 'number' && data.messageCount !== data.messages.length) {
+    throw new ShareChatError(
+      'Shared conversation message count does not match the actual messages array length.',
+      'MALFORMED_SNAPSHOT'
+    );
+  }
+
+  // Pre-validate and sanitize EVERY individual message in the snapshot
+  const sanitizedMessages = data.messages.map((rawMsg, idx) => {
+    return sanitizeMessageForShare(rawMsg, idx, data.mode);
+  });
+
+  // Canonical chronological ordering and alternatives preservation
+  const orderedMessages = orderConversationMessages(
+    ensureConversationAlternatives(sanitizedMessages)
+  );
+
+  return {
+    id: targetShareId,
+    title: cleanTitle,
+    mode: data.mode,
+    createdAt: data.createdAt || null,
+    messageCount: orderedMessages.length,
+    messages: orderedMessages,
+    isSharedSnapshot: true,
+  };
+}
+
+/**
+ * Loads and validates a single shared chat snapshot from Firestore (`sharedChats/{shareId}`)
+ * using a single getDoc() call (no collection querying or enumeration).
+ *
+ * Implements strict error handling:
+ * - Validates shareId format before attempting network call
+ * - Consults session cache first for fast reload resilience
+ * - Rejects nonexistent or missing shared documents
+ * - Handles network, permission-denied, and offline scenarios gracefully
+ * - Completely validates and sanitizes all document data and message fields
+ * - Does NOT write to the shared document or modify chat history
+ *
+ * @param {string} shareId
+ * @param {Object} [options]
+ * @param {Object} [options.firestoreDb] - Optional Firestore instance override for testing
+ * @param {Function} [options.docImpl] - Optional `doc` override for testing
+ * @param {Function} [options.getDocImpl] - Optional `getDoc` override for testing
+ * @param {boolean} [options.forceNetwork=false] - If true, bypasses session cache
+ * @param {number} [options.timeoutMs=10000] - Firestore operation timeout
+ * @returns {Promise<Object>} The validated shared snapshot
+ */
+export async function loadSharedChatSnapshot(shareId, options = {}) {
+  // 1. Strict shareId validation before any network access
+  if (!isValidShareId(shareId)) {
+    throw new ShareChatError(
+      'The shared conversation link is invalid or malformed.',
+      'INVALID_SHARE_ID'
+    );
+  }
+
+  // 2. Check session cache first for reload resilience (unless network forced)
+  if (!options.forceNetwork) {
+    const cached = getSharedSnapshotSession(shareId);
+    if (cached) {
+      return cached;
+    }
+  }
+
+  // 3. Ensure Firestore is configured if using live database
+  if (!options.getDocImpl) {
+    if (!isFirebaseConfigured() || !db) {
+      throw new ShareChatError(
+        'Shared conversations are currently unavailable because Firebase is not configured.',
+        'FIREBASE_UNAVAILABLE'
+      );
+    }
+  }
+
+  const targetDb = options.firestoreDb !== undefined ? options.firestoreDb : db;
+  const docFn = options.docImpl || doc;
+  const getDocFn = options.getDocImpl || getDoc;
+
+  let docSnap;
+  try {
+    const docRef = docFn(targetDb, 'sharedChats', shareId);
+    docSnap = await withPublishTimeout(getDocFn(docRef), options.timeoutMs || 10000);
+  } catch (err) {
+    if (err instanceof ShareChatError) {
+      throw err;
+    }
+    const rawMsg = String(err?.message || '');
+    if (rawMsg.includes('permission-denied') || err?.code === 'permission-denied') {
+      throw new ShareChatError(
+        'Access to this shared conversation was denied.',
+        'PERMISSION_DENIED'
+      );
+    }
+    if (
+      err?.code === 'unavailable' ||
+      rawMsg.includes('offline') ||
+      (typeof navigator !== 'undefined' && navigator.onLine === false)
+    ) {
+      throw new ShareChatError(
+        'Unable to load shared conversation while offline. Please check your internet connection.',
+        'OFFLINE'
+      );
+    }
+    throw new ShareChatError(
+      'Failed to load shared conversation. Please check your connection and try again.',
+      'LOAD_FAILED'
+    );
+  }
+
+  if (!docSnap || (typeof docSnap.exists === 'function' && !docSnap.exists())) {
+    throw new ShareChatError(
+      'This shared conversation no longer exists or the link is invalid.',
+      'NOT_FOUND'
+    );
+  }
+
+  const rawData = typeof docSnap.data === 'function' ? docSnap.data() : docSnap;
+  const validated = validateSharedSnapshotPayload(rawData, shareId);
+
+  // Cache in session storage for fast reload resilience
+  setSharedSnapshotSession(shareId, validated);
+
+  return validated;
 }

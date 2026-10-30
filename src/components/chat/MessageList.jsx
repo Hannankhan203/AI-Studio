@@ -37,7 +37,8 @@ function MessageList({
   onShareChat,
   canShareChat = false,
   shareChatDisabledReason = '',
-  isSharingChat = false
+  isSharingChat = false,
+  isReadOnly = false
 }) {
   const bottomAnchorRef = useRef(null);
   const orderMemoRef = useRef(null);
@@ -84,6 +85,7 @@ function MessageList({
           canShareChat={canShareChat}
           shareChatDisabledReason={shareChatDisabledReason}
           isSharingChat={isSharingChat}
+          isReadOnly={isReadOnly}
         />
       ))}
 

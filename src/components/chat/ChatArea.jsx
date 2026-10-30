@@ -265,7 +265,14 @@ export default function ChatArea({
   shareChatDisabledReason = '',
   isSharingChat = false,
   shareErrorNotice = null,
-  onDismissShareError
+  onDismissShareError,
+  isReadOnly = false,
+  isSharedView = false,
+  sharedSnapshot = null,
+  sharedError = null,
+  sharedLoading = false,
+  onSignInClick = undefined,
+  onNavigateHome = undefined
 }) {
   const textareaRef = useRef(null);
   const langMenuRef = useRef(null);
@@ -315,6 +322,7 @@ export default function ChatArea({
   }, []);
 
   const handleAttachClick = () => {
+    if (isReadOnly) return;
     if (attachments.length > 0) {
       setAttachmentNotice('Only one attachment can be added per message. Remove the current attachment first to select a different one.');
       return;
@@ -464,6 +472,10 @@ export default function ChatArea({
    * into attachments, while allowing normal text paste to proceed unhindered.
    */
   const handlePaste = (e) => {
+    if (isReadOnly) {
+      e.preventDefault();
+      return;
+    }
     const clipboardData = e.clipboardData || window.clipboardData;
     if (!clipboardData) return;
 
@@ -522,7 +534,7 @@ export default function ChatArea({
    * Allows dragging and dropping an image or supported file directly into the chatbot.
    */
   const handleDragEnter = (e) => {
-    if (!isFileDragEvent(e)) return;
+    if (isReadOnly || !isFileDragEvent(e)) return;
     e.preventDefault();
     e.stopPropagation();
     dragDepthRef.current += 1;
@@ -530,7 +542,7 @@ export default function ChatArea({
   };
 
   const handleDragOver = (e) => {
-    if (!isFileDragEvent(e)) return;
+    if (isReadOnly || !isFileDragEvent(e)) return;
     e.preventDefault();
     e.stopPropagation();
     if (e.dataTransfer) {
@@ -542,7 +554,7 @@ export default function ChatArea({
   };
 
   const handleDragLeave = (e) => {
-    if (!isFileDragEvent(e)) return;
+    if (isReadOnly || !isFileDragEvent(e)) return;
     e.preventDefault();
     e.stopPropagation();
     dragDepthRef.current -= 1;
@@ -553,7 +565,7 @@ export default function ChatArea({
   };
 
   const handleDrop = (e) => {
-    if (!isFileDragEvent(e)) return;
+    if (isReadOnly || !isFileDragEvent(e)) return;
     e.preventDefault();
     e.stopPropagation();
     dragDepthRef.current = 0;
@@ -1042,6 +1054,7 @@ export default function ChatArea({
   };
 
   const handleToggleListening = () => {
+    if (isReadOnly) return;
     if (recordingState === 'listening') {
       void handleStopListening();
     } else if (recordingState === 'paused') {
@@ -1137,6 +1150,11 @@ export default function ChatArea({
     if (typeof window === 'undefined') return;
 
     const handleGlobalKeyDown = (e) => {
+      // 0. Do not capture keystrokes in read-only mode
+      if (isReadOnly) {
+        return;
+      }
+
       // 1. If textarea does not exist or is already focused, do nothing
       if (!textareaRef.current || document.activeElement === textareaRef.current) {
         return;
@@ -1235,7 +1253,7 @@ export default function ChatArea({
     return () => window.removeEventListener('keydown', handleGlobalKeyDown);
   }, []);
   const submitComposerMessage = async (textToSend) => {
-    if (!onSubmit || (!textToSend.trim() && attachments.length === 0) || isLoading) {
+    if (isReadOnly || !onSubmit || (!textToSend.trim() && attachments.length === 0) || isLoading) {
       return;
     }
     const currentAttachments = [...attachments];
@@ -1254,6 +1272,10 @@ export default function ChatArea({
   };
 
   const handleKeyDown = async (e) => {
+    if (isReadOnly) {
+      return;
+    }
+
     if (e.key === 'Escape' && langMenuOpen) {
       e.preventDefault();
       setLangMenuOpen(false);
@@ -1301,6 +1323,7 @@ export default function ChatArea({
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (isReadOnly) return;
     let textToSend = inputValue;
     if (isListening || isPaused || isRequesting) {
       const completed = await stopListening();
@@ -1450,9 +1473,9 @@ Transcript:
     : 'Message Orvix...';
 
   // Single source of truth for composer placeholder:
-  // On mobile when the expanded Recording panel is active, keep the composer displaying the normal prompt
-  // so the composer does NOT render a competing "Listening — speak or..." state underneath the Recording panel.
-  const composerPlaceholder = isLoading
+  const composerPlaceholder = isReadOnly
+    ? 'This is a read-only shared conversation.'
+    : isLoading
     ? isCompactViewport
       ? 'Generating response...'
       : 'Generating response — press Esc to stop...'
@@ -1472,7 +1495,7 @@ Transcript:
 
   return (
     <main
-      className={`chat-area-container ${isDraggingOver ? 'is-drag-over' : ''}`}
+      className={`chat-area-container ${isDraggingOver ? 'is-drag-over' : ''} ${isReadOnly ? 'is-read-only-view' : ''}`}
       role="main"
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
@@ -1489,7 +1512,35 @@ Transcript:
         onTouchCancel={handleViewportTouchEnd}
       >
         <div className="chat-content-constrained">
-          {isNewChat && !hasMessages ? (
+          {sharedLoading ? (
+            <div className="shared-chat-loading-view" role="status" aria-label="Loading shared conversation">
+              <Loader2 size={26} className="spin-icon" />
+              <span className="shared-loading-text">Loading shared conversation...</span>
+            </div>
+          ) : sharedError ? (
+            <div className="shared-chat-error-view" role="alert">
+              <div className="shared-chat-error-card">
+                <AlertCircle size={32} className="shared-error-icon" />
+                <h2 className="shared-error-title">
+                  {sharedError.code === 'INVALID_SHARE_ID' || sharedError.code === 'SNAPSHOT_NOT_FOUND' || sharedError.code === 'MALFORMED_SHARE_URL'
+                    ? 'Conversation Unavailable'
+                    : 'Unable to Load Shared Conversation'}
+                </h2>
+                <p className="shared-error-message">
+                  {sharedError.message || 'This shared conversation link may have expired or is unavailable.'}
+                </p>
+                <div className="shared-error-actions">
+                  <button
+                    type="button"
+                    className="shared-error-home-btn"
+                    onClick={onNavigateHome}
+                  >
+                    Go to Orvix Home
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : isNewChat && !hasMessages ? (
             <WelcomeScreen
               username={username}
             />
@@ -1499,29 +1550,56 @@ Transcript:
               <span>Loading conversation...</span>
             </div>
           ) : (
-            <MessageList
-              messages={messages}
-              isLoading={isLoading}
-              onRetry={onRetry ? stableOnRetry : undefined}
-              onSwitchProvider={onSwitchProvider ? stableOnSwitchProvider : undefined}
-              onRestorePrompt={onRestorePrompt ? stableOnRestorePrompt : undefined}
-              onRegenerate={onRegenerate ? stableOnRegenerate : undefined}
-              onGenerateAlternative={onGenerateAlternative ? stableOnGenerateAlternative : undefined}
-              onSwitchAlternative={onSwitchAlternative ? stableOnSwitchAlternative : undefined}
-              onStopGenerating={onStopGenerating ? stableOnStopGenerating : undefined}
-              onEditResend={onEditResend ? stableOnEditResend : undefined}
-              editingMessageId={editingMessageId}
-              onStartEdit={onStartEdit ? stableOnStartEdit : undefined}
-              onCancelEdit={onCancelEdit ? stableOnCancelEdit : undefined}
-              showTimestamps={showTimestamps}
-              selectedProvider={selectedProvider}
-              activeMode={activeMode}
-              providerConfig={providerConfig}
-              onShareChat={onShareChat ? stableOnShareChat : undefined}
-              canShareChat={canShareChat}
-              shareChatDisabledReason={shareChatDisabledReason}
-              isSharingChat={isSharingChat}
-            />
+            <>
+              {isSharedView && sharedSnapshot && (
+                <div className="shared-chat-indicator-banner" role="region" aria-label="Shared conversation banner">
+                  <div className="shared-banner-left">
+                    <div className="shared-banner-badge">
+                      <span className="shared-badge-dot" aria-hidden="true" />
+                      <span className="shared-badge-title">Shared Conversation · Read Only</span>
+                    </div>
+                    <p className="shared-banner-description">
+                      You are viewing a published snapshot of this conversation. Messaging and edits are disabled in read-only mode.
+                    </p>
+                  </div>
+                  {onSignInClick && (
+                    <div className="shared-banner-right">
+                      <button
+                        type="button"
+                        className="shared-banner-signin-btn"
+                        onClick={onSignInClick}
+                      >
+                        Sign In
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+              <MessageList
+                messages={messages}
+                isLoading={isLoading}
+                onRetry={onRetry ? stableOnRetry : undefined}
+                onSwitchProvider={onSwitchProvider ? stableOnSwitchProvider : undefined}
+                onRestorePrompt={onRestorePrompt ? stableOnRestorePrompt : undefined}
+                onRegenerate={onRegenerate ? stableOnRegenerate : undefined}
+                onGenerateAlternative={onGenerateAlternative ? stableOnGenerateAlternative : undefined}
+                onSwitchAlternative={onSwitchAlternative ? stableOnSwitchAlternative : undefined}
+                onStopGenerating={onStopGenerating ? stableOnStopGenerating : undefined}
+                onEditResend={onEditResend ? stableOnEditResend : undefined}
+                editingMessageId={editingMessageId}
+                onStartEdit={onStartEdit ? stableOnStartEdit : undefined}
+                onCancelEdit={onCancelEdit ? stableOnCancelEdit : undefined}
+                showTimestamps={showTimestamps}
+                selectedProvider={selectedProvider}
+                activeMode={activeMode}
+                providerConfig={providerConfig}
+                onShareChat={onShareChat ? stableOnShareChat : undefined}
+                canShareChat={canShareChat}
+                shareChatDisabledReason={shareChatDisabledReason}
+                isSharingChat={isSharingChat}
+                isReadOnly={isReadOnly}
+              />
+            </>
           )}
         </div>
       </div>
@@ -1548,7 +1626,7 @@ Transcript:
           )}
 
           {/* Quick Continue Prompt Chip if previous response was partitioned */}
-          {canContinueLastMessage && (
+          {!isReadOnly && canContinueLastMessage && (
             <div className="continuation-prompt-chip-container">
               <button
                 type="button"
@@ -2131,15 +2209,19 @@ Transcript:
                 type="button"
                 variant="ghost"
                 size="icon-round"
-                disabled={isLoading}
+                disabled={isLoading || isReadOnly}
                 onClick={handleAttachClick}
                 title={
-                  attachments.length > 0
+                  isReadOnly
+                    ? 'Attachments are disabled in read-only shared mode'
+                    : attachments.length > 0
                     ? `Attached: ${attachments[0].name} (1 file max per message)`
                     : 'Attach file or image (PDF, DOCX, TXT, CSV, PNG, JPG — max 25MB)'
                 }
                 ariaLabel={
-                  attachments.length > 0
+                  isReadOnly
+                    ? 'Attachments are disabled in read-only shared mode'
+                    : attachments.length > 0
                     ? `Attachment selected: ${attachments[0].name}. Maximum one attachment per message.`
                     : 'Attach document or image'
                 }
@@ -2153,6 +2235,7 @@ Transcript:
                 placeholder={composerPlaceholder}
                 value={inputValue}
                 rows={1}
+                disabled={isReadOnly}
                 onChange={(e) => onInputChange && onInputChange(e.target.value)}
                 onFocus={() => {
                   if (scrollViewportRef.current && messagesLengthRef.current > 0) {
@@ -2222,10 +2305,12 @@ Transcript:
                     type="button"
                     variant={isListening ? 'primary' : (isRequesting || isTranscribing || recordingState === 'stopping') ? 'outline' : 'ghost'}
                     size="icon-round"
-                    disabled={isLoading || isTranscribing || isFinalizing || recordingState === 'stopping' || recordingState === 'success'}
+                    disabled={isLoading || isTranscribing || isFinalizing || recordingState === 'stopping' || recordingState === 'success' || isReadOnly}
                     onClick={handleToggleListening}
                     title={
-                      !isSupported
+                      isReadOnly
+                        ? 'Voice dictation is disabled in read-only shared mode'
+                        : !isSupported
                         ? 'Voice dictation is not supported in this browser.'
                         : isTranscribing || recordingState === 'stopping'
                         ? 'Processing dictation...'
@@ -2238,7 +2323,9 @@ Transcript:
                         : `Voice dictation (${activeLang.label})`
                     }
                     ariaLabel={
-                      !isSupported
+                      isReadOnly
+                        ? 'Voice dictation is disabled in read-only shared mode'
+                        : !isSupported
                         ? 'Voice dictation not supported'
                         : isTranscribing || recordingState === 'stopping'
                         ? 'Processing dictation'
@@ -2282,18 +2369,20 @@ Transcript:
                 ) : (
                   <Button
                     type="submit"
-                    variant={hasContent ? 'primary' : 'ghost'}
+                    variant={hasContent && !isReadOnly ? 'primary' : 'ghost'}
                     size="icon-round"
-                    disabled={!hasContent}
+                    disabled={!hasContent || isReadOnly}
                     title={
-                      !hasContent
+                      isReadOnly
+                        ? 'Messaging is disabled in read-only shared mode'
+                        : !hasContent
                         ? 'Type a message or attach a file to send'
                         : enterToSend
                         ? 'Send message (Enter)'
                         : 'Send message (Ctrl+Enter / ⌘+Enter)'
                     }
-                    ariaLabel="Send message"
-                    className={`composer-send-btn ${hasContent ? 'is-ready' : 'is-empty'}`}
+                    ariaLabel={isReadOnly ? 'Messaging disabled in read-only mode' : 'Send message'}
+                    className={`composer-send-btn ${hasContent && !isReadOnly ? 'is-ready' : 'is-empty'}`}
                     icon={<ArrowUp size={18} strokeWidth={2.25} />}
                   />
                 )}

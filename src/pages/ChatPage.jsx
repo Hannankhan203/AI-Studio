@@ -93,12 +93,23 @@ import {
 import { normalizeAIError } from '../services/errorNormalizationService.js';
 import {
   createSharedChatSnapshot,
-  evaluateShareEligibility
+  evaluateShareEligibility,
+  loadSharedChatSnapshot,
+  clearSharedSnapshotSession,
+  isValidShareId
 } from '../services/shareChatService.js';
 import ShareChatModal from '../components/chat/ShareChatModal.jsx';
 import { AlertCircle, X, Check, WifiOff } from 'lucide-react';
 
-export default function ChatPage() {
+const AuthScreenModal = React.lazy(() => import('../components/auth/AuthScreen.jsx'));
+
+export default function ChatPage({
+  isSharedView = false,
+  sharedShareId = null,
+  rawShareId = null,
+  isMalformedShareId = false,
+  onNavigateHome = null
+} = {}) {
   const { currentUser, username } = useAuth();
   const { settings } = useSettings();
   const { stopSpeech } = useSpeech();
@@ -113,9 +124,25 @@ export default function ChatPage() {
   const [isOffline, setIsOffline] = useState(() => !isBrowserOnline());
   const [offlineBannerDismissed, setOfflineBannerDismissed] = useState(false);
   const [userChats, setUserChats] = useState([]);
-  const [chatsLoading, setChatsLoading] = useState(isCloudEnabled && isBrowserOnline());
+  const [chatsLoading, setChatsLoading] = useState(isCloudEnabled && isBrowserOnline() && !isSharedView);
+
+  const [sharedSnapshot, setSharedSnapshot] = useState(null);
+  const [sharedLoading, setSharedLoading] = useState(Boolean(isSharedView && sharedShareId && !isMalformedShareId));
+  const [sharedError, setSharedError] = useState(() => {
+    if (isSharedView && isMalformedShareId) {
+      return {
+        code: 'INVALID_SHARE_ID',
+        message: 'This shared conversation link is invalid or malformed.'
+      };
+    }
+    return null;
+  });
+  const [showAuthModal, setShowAuthModal] = useState(false);
 
   const [activeChatId, setActiveChatId] = useState(() => {
+    if (isSharedView) {
+      return null;
+    }
     if (typeof window !== 'undefined') {
       return (
         sessionStorage.getItem('orvix_active_chat') ||
@@ -276,12 +303,49 @@ export default function ChatPage() {
     if (typeof window !== 'undefined') {
       localStorage.setItem('orvix_webllm_model_id', nextModelId);
     }
-    // When Browser AI is active, the [selectedProvider, webllmModelId] effect runs inspectWebLLMReadiness;
-    // avoid firing a duplicate concurrent requestAdapter()/hasModelInCache() call on model change.
     if (selectedProvider !== 'webllm') {
       void inspectWebLLMReadiness(nextModelId).catch(() => {});
     }
   };
+
+  // Load shared snapshot from Firestore or session cache when in shared viewer mode
+  useEffect(() => {
+    if (!isSharedView) return;
+
+    if (isMalformedShareId || !sharedShareId || !isValidShareId(sharedShareId)) {
+      setSharedLoading(false);
+      setSharedError({
+        code: 'INVALID_SHARE_ID',
+        message: 'This shared conversation link is invalid or malformed.'
+      });
+      return;
+    }
+
+    let cancelled = false;
+    setSharedLoading(true);
+    setSharedError(null);
+
+    loadSharedChatSnapshot(sharedShareId)
+      .then((snapshot) => {
+        if (cancelled) return;
+        setSharedSnapshot(snapshot);
+        setSharedLoading(false);
+        setActiveMode(snapshot.mode || 'general');
+        updateMessagesState(snapshot.messages || []);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setSharedLoading(false);
+        setSharedError({
+          code: err?.code || 'LOAD_FAILED',
+          message: err?.message || 'Unable to load this shared conversation.'
+        });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isSharedView, sharedShareId, isMalformedShareId]);
 
   // Subscribe to real Browser AI engine state updates
   useEffect(() => {
@@ -557,6 +621,12 @@ export default function ChatPage() {
 
   // 1. Subscribe to the conversation list (re-subscribes cleanly when transitioning back online).
   useEffect(() => {
+    if (isSharedView && !currentUser?.uid) {
+      setUserChats([]);
+      setChatsLoading(false);
+      return undefined;
+    }
+
     if (!isCloudEnabled || !currentUser?.uid) {
       const guestPinned = getGuestPinnedIds();
       const savedGuestChats = getGuestChats();
@@ -609,10 +679,14 @@ export default function ChatPage() {
     );
 
     return () => unsubscribe();
-  }, [isCloudEnabled, currentUser?.uid, isOffline]);
+  }, [isCloudEnabled, currentUser?.uid, isOffline, isSharedView]);
 
   // 2. Restore conversation messages safely.
   useEffect(() => {
+    if (isSharedView) {
+      // In shared viewer mode, messages are strictly provided by the immutable snapshot
+      return undefined;
+    }
     stopSpeech();
     const currentRequestId = ++fetchRequestIdRef.current;
 
@@ -755,7 +829,9 @@ export default function ChatPage() {
     (chat) => chat.id === activeChatId
   );
 
-  const activeTitle = currentChat
+  const activeTitle = isSharedView
+    ? sharedSnapshot?.title || (sharedLoading ? 'Loading shared chat...' : 'Shared Conversation')
+    : currentChat
     ? currentChat.title
     : messages.length > 0
       ? 'Current Conversation'
@@ -764,6 +840,19 @@ export default function ChatPage() {
   // Start a fresh conversation.
   const handleNewChat = () => {
     stopSpeech();
+
+    if (isSharedView) {
+      if (sharedShareId) {
+        clearSharedSnapshotSession(sharedShareId);
+      }
+      if (onNavigateHome) {
+        onNavigateHome();
+      } else if (typeof window !== 'undefined') {
+        window.history.pushState(null, '', '/');
+        window.dispatchEvent(new PopStateEvent('popstate'));
+      }
+      return;
+    }
 
     // Update target conversation ref BEFORE cancelling so any outgoing chat's
     // interrupted message persists only to its own chat and never touches New Chat state.
@@ -791,6 +880,15 @@ export default function ChatPage() {
     if (chatId === activeChatIdRef.current) return;
 
     stopSpeech();
+
+    if (isSharedView) {
+      if (onNavigateHome) {
+        onNavigateHome();
+      } else if (typeof window !== 'undefined') {
+        window.history.pushState(null, '', '/');
+        window.dispatchEvent(new PopStateEvent('popstate'));
+      }
+    }
 
     fetchRequestIdRef.current += 1;
     activeChatIdRef.current = chatId;
@@ -953,6 +1051,7 @@ export default function ChatPage() {
 
   // Handle mode selection (both on New Chat and in active conversations)
   const handleSelectMode = async (newMode) => {
+    if (isSharedView) return;
     const modeObj = getChatMode(newMode);
     setActiveMode(newMode);
 
@@ -988,6 +1087,7 @@ export default function ChatPage() {
 
   // Persist messages without duplicate writes (unless forced update).
   const persistMessageSafe = async (chatId, message, force = false) => {
+    if (isSharedView) return;
     if (!chatId || !message?.id) return;
 
     if (force) {
@@ -1188,6 +1288,7 @@ export default function ChatPage() {
 
   // Submit a new message.
   const handleSubmit = async (attachments = [], promptOverride = null) => {
+    if (isSharedView) return false;
     stopSpeech();
 
     const rawText = promptOverride !== null ? promptOverride : inputValue;
@@ -2681,10 +2782,13 @@ export default function ChatPage() {
     chat: effectiveShareChat,
     messages,
     isLoading: isLoading || messagesLoading,
-    isSharedPreview: false
+    isSharedPreview: Boolean(isSharedView)
   });
 
   const handleShareChat = async () => {
+    if (isSharedView) {
+      return;
+    }
     if (isSharingChatRef.current) {
       return;
     }
@@ -2710,7 +2814,7 @@ export default function ChatPage() {
       chat: latestChat,
       messages: messagesRef.current,
       isLoading: isSubmittingRef.current || isLoading || messagesLoading,
-      isSharedPreview: false
+      isSharedPreview: Boolean(isSharedView)
     });
 
     if (!latestEligibility.eligible) {
@@ -2731,7 +2835,7 @@ export default function ChatPage() {
         {
           user: currentUser,
           isLoading: isSubmittingRef.current || isLoading || messagesLoading,
-          isSharedPreview: false
+          isSharedPreview: Boolean(isSharedView)
         }
       );
 
@@ -2769,6 +2873,8 @@ export default function ChatPage() {
       onExportText={handleExportText}
       hasExportableMessages={hasExportableMessages}
       providerConfig={providerConfig}
+      isSharedView={isSharedView}
+      onSignInClick={() => setShowAuthModal(true)}
     >
       {isOffline && !offlineBannerDismissed && (
         <div
@@ -2879,7 +2985,7 @@ export default function ChatPage() {
         messages={messages}
         isLoading={isLoading}
         messagesLoading={messagesLoading}
-        isNewChat={!activeChatId}
+        isNewChat={!activeChatId && !isSharedView}
         username={username}
         inputValue={inputValue}
         onInputChange={setInputValue}
@@ -2918,6 +3024,13 @@ export default function ChatPage() {
         isSharingChat={isSharingChat}
         shareErrorNotice={shareErrorNotice}
         onDismissShareError={() => setShareErrorNotice(null)}
+        isReadOnly={isSharedView}
+        isSharedView={isSharedView}
+        sharedSnapshot={sharedSnapshot}
+        sharedError={sharedError}
+        sharedLoading={sharedLoading}
+        onSignInClick={() => setShowAuthModal(true)}
+        onNavigateHome={onNavigateHome || handleNewChat}
       />
 
       <ShareChatModal
@@ -2925,6 +3038,26 @@ export default function ChatPage() {
         onClose={() => setShareModalData(null)}
         shareData={shareModalData}
       />
+
+      {showAuthModal && !currentUser && (
+        <div
+          className="shared-auth-modal-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Sign In"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setShowAuthModal(false);
+            }
+          }}
+        >
+          <div className="shared-auth-modal-wrapper">
+            <React.Suspense fallback={<div className="shared-auth-modal-loading">Loading...</div>}>
+              <AuthScreenModal onClose={() => setShowAuthModal(false)} />
+            </React.Suspense>
+          </div>
+        </div>
+      )}
     </Layout>
   );
 }

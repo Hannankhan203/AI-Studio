@@ -12783,3 +12783,252 @@ body.theme-light .notice-retry-btn,
   color: #059669;
 }
 
+/* ==========================================================================
+   Prompt 4: Public Shared Chat Viewer & Read-Only Demo Mode
+   ========================================================================== */
+
+/* Shared Conversation Indicator Banner */
+.shared-chat-indicator-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+  padding: 0.85rem 1.15rem;
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.08) 0%, rgba(139, 92, 246, 0.04) 100%);
+  border: 1px solid rgba(99, 102, 241, 0.22);
+  border-radius: 0.85rem;
+  box-shadow: 0 4px 16px -4px rgba(99, 102, 241, 0.08);
+  animation: fadeIn 0.25s ease-out;
+}
+
+.shared-banner-left {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.shared-banner-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.shared-badge-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background-color: #6366f1;
+  box-shadow: 0 0 8px rgba(99, 102, 241, 0.6);
+  flex-shrink: 0;
+}
+
+.shared-badge-title {
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: #818cf8;
+  text-transform: uppercase;
+}
+
+.shared-banner-description {
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.shared-banner-right {
+  flex-shrink: 0;
+}
+
+.shared-banner-signin-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.45rem 0.95rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #ffffff;
+  background-color: var(--accent-primary, #6366f1);
+  border: none;
+  border-radius: 0.5rem;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  box-shadow: 0 2px 6px rgba(99, 102, 241, 0.25);
+}
+
+.shared-banner-signin-btn:hover {
+  background-color: #4f46e5;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 10px rgba(99, 102, 241, 0.35);
+}
+
+.shared-banner-signin-btn:active {
+  transform: translateY(0);
+}
+
+/* Shared Chat Loading View */
+.shared-chat-loading-view {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.85rem;
+  min-height: 280px;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.shared-loading-text {
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+/* Shared Chat Error View */
+.shared-chat-error-view {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 360px;
+  padding: 1.5rem;
+}
+
+.shared-chat-error-card {
+  max-width: 440px;
+  width: 100%;
+  padding: 2rem 1.75rem;
+  background-color: var(--bg-surface, #1e293b);
+  border: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+  border-radius: 1rem;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  box-shadow: 0 12px 32px -8px rgba(0, 0, 0, 0.28);
+}
+
+.shared-error-icon {
+  color: #f87171;
+  margin-bottom: 0.85rem;
+}
+
+.shared-error-title {
+  margin: 0 0 0.5rem 0;
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.shared-error-message {
+  margin: 0 0 1.5rem 0;
+  font-size: 0.88rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.shared-error-actions {
+  display: flex;
+  gap: 0.75rem;
+  justify-content: center;
+  width: 100%;
+}
+
+.shared-error-home-btn {
+  padding: 0.6rem 1.25rem;
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: #ffffff;
+  background-color: var(--accent-primary, #6366f1);
+  border: none;
+  border-radius: 0.55rem;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.shared-error-home-btn:hover {
+  background-color: #4f46e5;
+  transform: translateY(-1px);
+}
+
+/* Read-Only Composer Appearance */
+.chat-area-container.is-read-only-view .composer-textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.72;
+  color: var(--text-muted);
+}
+
+.chat-area-container.is-read-only-view .composer-form {
+  border-color: rgba(99, 102, 241, 0.18);
+  background: var(--bg-composer, rgba(15, 23, 42, 0.45));
+}
+
+/* Header Sign In Buttons */
+.header-signin-btn {
+  font-size: 0.82rem;
+  font-weight: 600;
+  padding: 0.4rem 0.85rem;
+}
+
+.mobile-header-signin-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.35rem 0.75rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #ffffff;
+  background-color: var(--accent-primary, #6366f1);
+  border: none;
+  border-radius: 0.45rem;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.mobile-header-signin-btn:hover {
+  background-color: #4f46e5;
+}
+
+/* Auth Modal Overlay for unauthenticated visitors */
+.shared-auth-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  background-color: rgba(0, 0, 0, 0.72);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  overflow-y: auto;
+}
+
+.shared-auth-modal-wrapper {
+  max-width: 480px;
+  width: 100%;
+  position: relative;
+  animation: modalEnter 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.shared-auth-modal-loading {
+  padding: 2rem;
+  text-align: center;
+  color: var(--text-secondary);
+}
+
+[data-theme="light"] .shared-chat-indicator-banner {
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.07) 0%, rgba(139, 92, 246, 0.03) 100%);
+  border-color: rgba(99, 102, 241, 0.28);
+}
+
+[data-theme="light"] .shared-badge-title {
+  color: #4f46e5;
+}
+
+[data-theme="light"] .shared-chat-error-card {
+  background-color: #ffffff;
+  border-color: rgba(0, 0, 0, 0.12);
+  box-shadow: 0 12px 32px -8px rgba(0, 0, 0, 0.12);
+}
+
