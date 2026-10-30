@@ -25,7 +25,9 @@ import {
   AlertTriangle,
   CheckCircle2,
   Bookmark,
-  Info
+  Info,
+  Share2,
+  Loader2
 } from 'lucide-react';
 import Button from '../ui/Button.jsx';
 import OrvixLogo from '../ui/OrvixLogo.jsx';
@@ -488,21 +490,23 @@ function createMarkdownComponents(isStreaming = false, effectiveMode = 'general'
  * Only re-renders this tiny badge component, completely avoiding chat re-renders.
  */
 
-function LiveResponseTimer({ startTime }) {
+function LiveResponseTimer({ startTime, isLocalGpu = false }) {
   const [elapsedText, setElapsedText] = useState(() => formatLiveElapsed(startTime));
 
   useEffect(() => {
     if (typeof startTime !== 'number' || startTime <= 0) return;
 
     const updateTimer = () => {
-      setElapsedText(formatLiveElapsed(startTime));
+      const next = formatLiveElapsed(startTime);
+      setElapsedText((prev) => (prev === next ? prev : next));
     };
 
     updateTimer();
-    const intervalId = setInterval(updateTimer, 100);
+    const intervalMs = isLocalGpu ? 250 : 100;
+    const intervalId = setInterval(updateTimer, intervalMs);
 
     return () => clearInterval(intervalId);
-  }, [startTime]);
+  }, [startTime, isLocalGpu]);
 
   return (
     <span
@@ -533,7 +537,11 @@ function ChatMessage({
   showTimestamps = true,
   selectedProvider = 'gemini',
   activeMode = 'general',
-  providerConfig = null
+  providerConfig = null,
+  onShareChat,
+  canShareChat = false,
+  shareChatDisabledReason = '',
+  isSharingChat = false
 }) {
   const effectiveMode = message?.mode || activeMode || 'general';
   const isUser = message?.sender === 'user';
@@ -891,7 +899,10 @@ function ChatMessage({
           {!isUser && !isError && !isStopped && !message?.isInterrupted && (
             <>
               {isStreaming && !message?.responseTimeMs && typeof message?.requestStartTime === 'number' && (
-                <LiveResponseTimer startTime={message.requestStartTime} />
+                <LiveResponseTimer
+                  startTime={message.requestStartTime}
+                  isLocalGpu={currentProviderId === 'webllm'}
+                />
               )}
               {formattedResponseTime && (
                 <span
@@ -1487,6 +1498,40 @@ function ChatMessage({
                       </div>
                     )}
                   </div>
+                )}
+
+                {/* Share Chat Action (shares the entire active conversation) */}
+                {onShareChat && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => onShareChat(message)}
+                    disabled={isLoading || isSharingChat || !canShareChat}
+                    className={`message-action-btn share-chat-btn ${isSharingChat ? 'is-sharing' : ''}`}
+                    title={
+                      isSharingChat
+                        ? 'Creating share link...'
+                        : !canShareChat && shareChatDisabledReason
+                        ? shareChatDisabledReason
+                        : isLoading
+                        ? 'Generation in progress...'
+                        : 'Share entire conversation'
+                    }
+                    ariaLabel={
+                      isSharingChat
+                        ? 'Creating share link'
+                        : 'Share Chat'
+                    }
+                    icon={
+                      isSharingChat ? (
+                        <Loader2 size={13} className="animate-spin" />
+                      ) : (
+                        <Share2 size={13} />
+                      )
+                    }
+                  >
+                    {isSharingChat ? 'Sharing...' : 'Share Chat'}
+                  </Button>
                 )}
               </>
             )}

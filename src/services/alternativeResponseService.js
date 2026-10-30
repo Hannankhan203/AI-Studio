@@ -91,6 +91,19 @@ export function createAlternativeRecord({
  * @param {Object|null} [precedingUserMessage=null] - Preceding user message for parent linking
  * @returns {Object} Normalized message with alternatives structure
  */
+function hasActiveAlternativeRecord(alternatives, activeAlternativeId) {
+  if (!activeAlternativeId || !Array.isArray(alternatives) || alternatives.length === 0) {
+    return false;
+  }
+  for (let i = 0; i < alternatives.length; i++) {
+    const alt = alternatives[i];
+    if (alt && alt.id === activeAlternativeId) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function normalizeAssistantMessage(message, precedingUserMessage = null) {
   if (!message || message.sender === 'user') {
     return message;
@@ -105,6 +118,20 @@ export function normalizeAssistantMessage(message, precedingUserMessage = null) 
   const interactionId =
     baseMessage.interactionId ||
     (precedingUserMessage?.interactionId ? precedingUserMessage.interactionId : null);
+
+  // Fast check: if already fully normalized with alternatives, valid activeAlternativeId,
+  // and matching parentMessageId and interactionId, avoid recreating objects
+  if (
+    message.sender === 'assistant' &&
+    Array.isArray(message.alternatives) &&
+    message.alternatives.length > 0 &&
+    message.activeAlternativeId &&
+    (!parentMessageId || message.parentMessageId === parentMessageId) &&
+    (!interactionId || message.interactionId === interactionId) &&
+    hasActiveAlternativeRecord(message.alternatives, message.activeAlternativeId)
+  ) {
+    return message;
+  }
 
   const createdAt =
     typeof baseMessage.createdAt === 'number' && !isNaN(baseMessage.createdAt)
@@ -368,23 +395,469 @@ export function updateAlternativeByIdInMessage(assistantMessage, targetId, updat
  */
 export function ensureConversationAlternatives(messages = []) {
   if (!Array.isArray(messages)) return [];
+  const len = messages.length;
+  if (len === 0) return messages;
 
+  let userById = null;
+  let userByInteractionId = null;
   let lastUserMessage = null;
+  let next = null;
 
-  return messages.map((msg) => {
+  const ensureUserLookups = () => {
+    if (userById !== null) return;
+    userById = new Map();
+    userByInteractionId = new Map();
+    for (let j = 0; j < len; j++) {
+      const m = messages[j];
+      if (m?.sender === 'user' && m.id) {
+        userById.set(m.id, m);
+      }
+    }
+    for (const u of userById.values()) {
+      if (u.interactionId && !userByInteractionId.has(u.interactionId)) {
+        userByInteractionId.set(u.interactionId, u);
+      }
+    }
+  };
+
+  for (let i = 0; i < len; i++) {
+    const msg = messages[i];
+    if (!msg) continue;
+
     if (msg.sender === 'user') {
       lastUserMessage = msg;
-      return msg;
+      continue;
     }
 
     if (msg.sender === 'assistant') {
-      const normalized = normalizeAssistantMessage(msg, lastUserMessage);
-      return normalized;
+      // Zero-allocation fast path when assistant message already carries parentMessageId,
+      // interactionId, and a valid active alternative record.
+      if (
+        msg.parentMessageId &&
+        msg.interactionId &&
+        Array.isArray(msg.alternatives) &&
+        msg.alternatives.length > 0 &&
+        hasActiveAlternativeRecord(msg.alternatives, msg.activeAlternativeId)
+      ) {
+        continue;
+      }
+
+      ensureUserLookups();
+      const linkedUser =
+        (msg.parentMessageId && userById.get(msg.parentMessageId)) ||
+        (msg.interactionId && userByInteractionId.get(msg.interactionId)) ||
+        lastUserMessage;
+      const normalized = normalizeAssistantMessage(msg, linkedUser);
+      if (normalized !== msg) {
+        if (next === null) {
+          next = messages.slice();
+        }
+        next[i] = normalized;
+      }
+    }
+  }
+
+  return next !== null ? next : messages;
+}
+
+function isFastNormalizedAssistantForUser(msg, parentUser) {
+  if (!msg || !parentUser || !parentUser.id) return false;
+  if (msg.parentMessageId !== parentUser.id) return false;
+  if (!msg.interactionId && parentUser.interactionId) return false;
+  return hasActiveAlternativeRecord(msg.alternatives, msg.activeAlternativeId);
+}
+
+function canReuseMessageSlotOrder(prevMsg, nextMsg) {
+  if (!prevMsg || !nextMsg) return false;
+  if (!nextMsg.id || prevMsg.id !== nextMsg.id) return false;
+  if (prevMsg.sender !== nextMsg.sender) return false;
+  if (prevMsg.parentMessageId !== nextMsg.parentMessageId) return false;
+  if (prevMsg.interactionId !== nextMsg.interactionId) return false;
+  if (prevMsg.createdAtMs !== nextMsg.createdAtMs) return false;
+  if (prevMsg.createdAt !== nextMsg.createdAt) return false;
+
+  if (nextMsg.sender === 'assistant') {
+    if (
+      !nextMsg.parentMessageId ||
+      !Array.isArray(nextMsg.alternatives) ||
+      nextMsg.alternatives.length === 0 ||
+      !nextMsg.activeAlternativeId
+    ) {
+      return false;
+    }
+    const expectedParentId = nextMsg.parentMessageId;
+    const expectedInteractionId = nextMsg.interactionId || null;
+    const alts = nextMsg.alternatives;
+    let foundActive = false;
+    for (let i = 0; i < alts.length; i++) {
+      const alt = alts[i];
+      if (!alt || !alt.id) return false;
+      if (alt.parentMessageId !== expectedParentId) {
+        return false;
+      }
+      if (expectedInteractionId && alt.interactionId && alt.interactionId !== expectedInteractionId) {
+        return false;
+      }
+      if (alt.id === nextMsg.activeAlternativeId) {
+        foundActive = true;
+      }
+    }
+    if (!foundActive) return false;
+  }
+
+  return true;
+}
+
+/**
+ * Canonical Conversation Message Ordering & Association Engine
+ *
+ * Guarantees that:
+ * 1. Every user message appears in its correct chronological order.
+ * 2. Every AI response appears directly beneath its originating user message.
+ * 3. Asynchronous completion order, retries, or model switching cannot corrupt or displace message order.
+ * 4. Responses never become detached from their parent user request.
+ * 5. Conversations restored from history/storage preserve exact parent-child pairing.
+ *
+ * @param {Array} messages - Unordered or partially ordered message array
+ * @returns {Array} Canonically ordered and aligned message array
+ */
+export function orderConversationMessages(messages = []) {
+  if (!Array.isArray(messages)) {
+    return [];
+  }
+  const initialLen = messages.length;
+  if (initialLen === 0) {
+    return messages;
+  }
+  if (initialLen === 1) {
+    return messages[0]?.sender === 'assistant'
+      ? ensureConversationAlternatives(messages)
+      : messages;
+  }
+
+  // Zero-allocation single-pass fast path:
+  // If every user message is already chronological and every assistant message is already
+  // normalized and positioned directly beneath its parent user message, return `messages` as-is.
+  let canReturnInputDirectly = true;
+  let fastParentUser = null;
+  let fastLastUserTime = -Infinity;
+
+  for (let i = 0; i < initialLen; i++) {
+    const m = messages[i];
+    if (!m) continue;
+    if (m.sender === 'user') {
+      const uTime = typeof m.createdAtMs === 'number' ? m.createdAtMs : (m.createdAt || null);
+      if (uTime !== null && uTime < fastLastUserTime) {
+        canReturnInputDirectly = false;
+        break;
+      }
+      if (uTime !== null) {
+        fastLastUserTime = uTime;
+      }
+      fastParentUser = m;
+    } else if (m.sender === 'assistant') {
+      if (!isFastNormalizedAssistantForUser(m, fastParentUser)) {
+        canReturnInputDirectly = false;
+        break;
+      }
+    }
+  }
+
+  if (canReturnInputDirectly) {
+    return messages;
+  }
+
+  const normalized = ensureConversationAlternatives(messages);
+
+  // Fast path after normalization: verify if the normalized list is already in strict canonical sequence
+  let isAlreadyOrdered = true;
+  let activeParentUser = null;
+  let lastUserTime = -Infinity;
+
+  for (let i = 0; i < normalized.length; i++) {
+    const m = normalized[i];
+    if (!m) continue;
+    if (m.sender === 'user') {
+      const uTime = typeof m.createdAtMs === 'number' ? m.createdAtMs : (m.createdAt || null);
+      if (uTime !== null && uTime < lastUserTime) {
+        isAlreadyOrdered = false;
+        break;
+      }
+      if (uTime !== null) {
+        lastUserTime = uTime;
+      }
+      activeParentUser = m;
+    } else if (m.sender === 'assistant') {
+      if (!activeParentUser) {
+        isAlreadyOrdered = false;
+        break;
+      }
+      const pId = m.parentMessageId;
+      if (pId && pId !== activeParentUser.id) {
+        isAlreadyOrdered = false;
+        break;
+      }
+    }
+  }
+
+  if (isAlreadyOrdered) {
+    return normalized;
+  }
+
+  // Canonical ordering pass:
+  // Step 1: Catalog all user messages
+  const userOrder = [];
+  const userMap = new Map();
+  const userIndexById = new Map();
+  const assistantBuckets = new Map();
+  const leadingOrphans = [];
+  const trailingOrphans = [];
+
+  for (let i = 0; i < normalized.length; i++) {
+    const m = normalized[i];
+    if (!m) continue;
+    if (m.sender === 'user') {
+      if (!userMap.has(m.id)) {
+        userIndexById.set(m.id, userOrder.length);
+        userOrder.push(m);
+        userMap.set(m.id, m);
+        assistantBuckets.set(m.id, []);
+      } else {
+        const idx = userIndexById.get(m.id);
+        if (idx !== undefined) userOrder[idx] = m;
+        userMap.set(m.id, m);
+      }
+    }
+  }
+
+  if (userOrder.length === 0) {
+    return normalized;
+  }
+
+  // Lazy lookup table for assistant messages missing parentMessageId that link via interactionId
+  let userIdByInteractionKey = null;
+  const resolveParentIdByInteraction = (interactionKey) => {
+    if (userIdByInteractionKey === null) {
+      userIdByInteractionKey = new Map();
+      for (let j = 0; j < userOrder.length; j++) {
+        const u = userOrder[j];
+        if (u.interactionId && !userIdByInteractionKey.has(u.interactionId)) {
+          userIdByInteractionKey.set(u.interactionId, u.id);
+        }
+        if (u.id && !userIdByInteractionKey.has(u.id)) {
+          userIdByInteractionKey.set(u.id, u.id);
+        }
+      }
+    }
+    return userIdByInteractionKey.get(interactionKey) || null;
+  };
+
+  // Step 2: Map each assistant message to its parent user message
+  let runningUser = null;
+
+  for (let i = 0; i < normalized.length; i++) {
+    const m = normalized[i];
+    if (!m) continue;
+
+    if (m.sender === 'user') {
+      runningUser = m;
+      continue;
     }
 
-    return msg;
+    if (m.sender === 'assistant') {
+      let parentId = m.parentMessageId;
+      if (!parentId && m.interactionId) {
+        parentId = resolveParentIdByInteraction(m.interactionId);
+      }
+      if (!parentId && runningUser) {
+        parentId = runningUser.id;
+      }
+
+      if (parentId && assistantBuckets.has(parentId)) {
+        const bucket = assistantBuckets.get(parentId);
+        const existingIdx = bucket.findIndex((a) => a.id === m.id);
+        if (existingIdx >= 0) {
+          bucket[existingIdx] = m;
+        } else {
+          bucket.push(m);
+        }
+      } else {
+        if (!runningUser) {
+          leadingOrphans.push(m);
+        } else {
+          trailingOrphans.push(m);
+        }
+      }
+    } else {
+      if (!runningUser) {
+        leadingOrphans.push(m);
+      } else {
+        trailingOrphans.push(m);
+      }
+    }
+  }
+
+  // Sort user prompts chronologically (stable fallback on original position)
+  userOrder.sort((a, b) => {
+    const timeA = typeof a.createdAtMs === 'number' ? a.createdAtMs : (a.createdAt || null);
+    const timeB = typeof b.createdAtMs === 'number' ? b.createdAtMs : (b.createdAt || null);
+    if (timeA !== null && timeB !== null && timeA !== timeB) {
+      return timeA - timeB;
+    }
+    return 0;
   });
+
+  const result = [...leadingOrphans];
+
+  for (const userMsg of userOrder) {
+    result.push(userMsg);
+    const assistants = assistantBuckets.get(userMsg.id) || [];
+    if (assistants.length > 1) {
+      assistants.sort((a, b) => {
+        const timeA = typeof a.createdAtMs === 'number' ? a.createdAtMs : (a.createdAt || 0);
+        const timeB = typeof b.createdAtMs === 'number' ? b.createdAtMs : (b.createdAt || 0);
+        return timeA - timeB;
+      });
+    }
+    for (const asst of assistants) {
+      result.push(asst);
+    }
+  }
+
+  for (const orphan of trailingOrphans) {
+    result.push(orphan);
+  }
+
+  return result;
 }
+
+/**
+ * Creates an isolated, topology-aware memoized wrapper around `orderConversationMessages`.
+ *
+ * Avoids redundant full normalization, bucket construction, and sorting when:
+ * - The exact same `messages` array reference is passed again (O(1)).
+ * - A shallow copy contains identical message object references in every slot.
+ * - Streaming chunks or in-place updates (e.g. active alternative switches) update message
+ *   content/metadata without altering message count, IDs, sender roles, parent/interaction
+ *   links, or creation timestamps.
+ *
+ * @param {{ onFullOrder?: () => void }} [options]
+ * @returns {(messages?: Array) => Array}
+ */
+export function createConversationOrderMemo(options = {}) {
+  const onFullOrder = typeof options?.onFullOrder === 'function' ? options.onFullOrder : null;
+  /** @type {Array | null} */
+  let prevInput = null;
+  let prevInputLength = -1;
+  /** @type {Array | null} */
+  let prevOutput = null;
+
+  return function memoizedOrderConversationMessages(messages = []) {
+    if (!Array.isArray(messages)) {
+      return [];
+    }
+
+    const len = messages.length;
+
+    if (messages === prevInput && len === prevInputLength && prevOutput !== null) {
+      return prevOutput;
+    }
+
+    if (messages === prevOutput && prevOutput !== null && len === prevOutput.length) {
+      prevInput = prevOutput;
+      prevInputLength = len;
+      return prevOutput;
+    }
+
+    if (len === 0 && prevInputLength === 0 && prevOutput !== null && prevOutput.length === 0) {
+      prevInput = messages;
+      return prevOutput;
+    }
+
+    if (
+      len > 1 &&
+      prevInput !== null &&
+      prevOutput !== null &&
+      len === prevInputLength &&
+      prevOutput.length === len
+    ) {
+      let canReuseTopology = true;
+      let firstChangedIdx = -1;
+      /** @type {Array<number> | null} */
+      let extraChangedIndices = null;
+
+      for (let i = 0; i < len; i++) {
+        const prevMsg = prevInput[i];
+        const nextMsg = messages[i];
+        if (nextMsg === prevMsg) {
+          continue;
+        }
+        if (!canReuseMessageSlotOrder(prevMsg, nextMsg)) {
+          canReuseTopology = false;
+          break;
+        }
+        if (firstChangedIdx === -1) {
+          firstChangedIdx = i;
+        } else {
+          if (extraChangedIndices === null) {
+            extraChangedIndices = [i];
+          } else {
+            extraChangedIndices.push(i);
+          }
+        }
+      }
+
+      if (canReuseTopology) {
+        if (firstChangedIdx === -1) {
+          prevInput = messages;
+          prevInputLength = len;
+          return prevOutput;
+        }
+
+        if (prevOutput === prevInput) {
+          prevInput = messages;
+          prevInputLength = len;
+          prevOutput = messages;
+          return messages;
+        }
+
+        const nextOutput = prevOutput.slice();
+        const firstOutPos = prevOutput.indexOf(prevInput[firstChangedIdx]);
+        if (firstOutPos !== -1) {
+          nextOutput[firstOutPos] = messages[firstChangedIdx];
+          let patchedAll = true;
+          if (extraChangedIndices !== null) {
+            for (let c = 0; c < extraChangedIndices.length; c++) {
+              const idx = extraChangedIndices[c];
+              const outPos = prevOutput.indexOf(prevInput[idx]);
+              if (outPos === -1) {
+                patchedAll = false;
+                break;
+              }
+              nextOutput[outPos] = messages[idx];
+            }
+          }
+          if (patchedAll) {
+            prevInput = messages;
+            prevInputLength = len;
+            prevOutput = nextOutput;
+            return nextOutput;
+          }
+        }
+      }
+    }
+
+    if (onFullOrder) {
+      onFullOrder();
+    }
+    const ordered = orderConversationMessages(messages);
+    prevInput = messages;
+    prevInputLength = len;
+    prevOutput = ordered;
+    return ordered;
+  };
+}
+
 
 /**
  * Returns alternative navigation metrics for an assistant message.

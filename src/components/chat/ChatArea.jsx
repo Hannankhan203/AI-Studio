@@ -21,15 +21,47 @@ import {
 import WelcomeScreen from './WelcomeScreen.jsx';
 import MessageList from './MessageList.jsx';
 import BrowserAIStatusBar from './BrowserAIStatusBar.jsx';
-import DocumentPreviewModal from './DocumentPreviewModal.jsx';
+const DocumentPreviewModal = React.lazy(() => import('./DocumentPreviewModal.jsx'));
 import Button from '../ui/Button.jsx';
 import { useVoiceDictation, combineComposerText } from '../../hooks/useVoiceDictation.js';
 import { sendAIMessage, PROVIDER_OPTIONS } from '../../services/aiRouter.js';
+import { PROVIDER_DEFAULT_MODELS } from '../../services/providerModelSanitizer.js';
 import { WEBLLM_MODEL_CATALOG, DEFAULT_WEBLLM_MODEL_ID } from '../../services/webllmService.js';
 import { responseHasContinuationNotice } from '../../services/multiPartResponseService.js';
 import { polishSpokenTranscript } from '../../utils/speechTextCleaner.js';
 
-function getProviderFootnote(providerId, webllmModelId = DEFAULT_WEBLLM_MODEL_ID) {
+function formatGeminiModelDisplayName(modelId) {
+  if (typeof modelId !== 'string' || !modelId.trim()) return '';
+  return modelId
+    .trim()
+    .replace(/^models\//i, '')
+    .split('-')
+    .filter(Boolean)
+    .map((segment) =>
+      /^[a-z]/i.test(segment)
+        ? segment.charAt(0).toUpperCase() + segment.slice(1)
+        : segment
+    )
+    .join(' ');
+}
+
+function getGeminiFootnote() {
+  const geminiOption = Array.isArray(PROVIDER_OPTIONS)
+    ? PROVIDER_OPTIONS.find((p) => p.id === 'gemini')
+    : null;
+  const configuredModelId =
+    PROVIDER_DEFAULT_MODELS?.gemini || geminiOption?.defaultModel || '';
+  const modelLabel =
+    (geminiOption?.modelTag &&
+    (!configuredModelId || geminiOption.defaultModel === configuredModelId)
+      ? geminiOption.modelTag
+      : formatGeminiModelDisplayName(configuredModelId)) ||
+    geminiOption?.modelTag ||
+    'Gemini';
+  return `Orvix is powered by Google Gemini (${modelLabel}). Client integration — verify important facts independently.`;
+}
+
+export function getProviderFootnote(providerId, webllmModelId = DEFAULT_WEBLLM_MODEL_ID) {
   if (providerId === 'webllm') {
     const modelLabel =
       WEBLLM_MODEL_CATALOG[webllmModelId]?.shortLabel || 'Qwen 2.5 1.5B';
@@ -39,20 +71,24 @@ function getProviderFootnote(providerId, webllmModelId = DEFAULT_WEBLLM_MODEL_ID
     return 'Orvix is powered by Groq (GPT OSS 120B). Ultra-fast inference — verify important facts independently.';
   }
   if (providerId === 'openrouter') {
-    return 'Orvix is powered by OpenRouter (Llama 3.3 70B Free). Multi-model gateway — verify important facts independently.';
+    const openrouterOption = Array.isArray(PROVIDER_OPTIONS)
+      ? PROVIDER_OPTIONS.find((p) => p.id === 'openrouter')
+      : null;
+    const modelLabel = openrouterOption?.modelTag || 'Free Models Router';
+    return `Orvix is powered by OpenRouter (${modelLabel}), dynamically selecting from available free community models.`;
   }
   if (providerId === 'cloudflare') {
     return 'Orvix is powered by Cloudflare Workers AI (Llama 3.1 8B). Serverless inference — verify important facts independently.';
   }
   if (providerId === 'gemini') {
-    return 'Orvix is powered by Google Gemini (Gemini 2.5 Flash). Client integration — verify important facts independently.';
+    return getGeminiFootnote();
   }
   const config = Array.isArray(PROVIDER_OPTIONS) ? PROVIDER_OPTIONS.find((p) => p.id === providerId) : null;
   if (config) {
     const model = config.defaultModel || config.modelTag || 'AI Model';
     return `Orvix is powered by ${config.name} (${model}). ${config.description || 'Inference'} — verify important facts independently.`;
   }
-  return 'Orvix is powered by Google Gemini (Gemini 2.5 Flash). Client integration — verify important facts independently.';
+  return getGeminiFootnote();
 }
 
 // Whitelist of supported image extensions
@@ -223,7 +259,13 @@ export default function ChatArea({
   onLoadWebLLMModel,
   onCancelWebLLMLoad,
   onUnloadWebLLMModel,
-  providerConfig = null
+  providerConfig = null,
+  onShareChat,
+  canShareChat = false,
+  shareChatDisabledReason = '',
+  isSharingChat = false,
+  shareErrorNotice = null,
+  onDismissShareError
 }) {
   const textareaRef = useRef(null);
   const langMenuRef = useRef(null);
@@ -646,7 +688,8 @@ export default function ChatArea({
     onStopGenerating,
     onStartEdit,
     onCancelEdit,
-    onEditResend
+    onEditResend,
+    onShareChat
   });
   messageCallbacksRef.current = {
     onRetry,
@@ -658,7 +701,8 @@ export default function ChatArea({
     onStopGenerating,
     onStartEdit,
     onCancelEdit,
-    onEditResend
+    onEditResend,
+    onShareChat
   };
 
   const stableOnRetry = useCallback((...args) => messageCallbacksRef.current.onRetry?.(...args), []);
@@ -671,6 +715,7 @@ export default function ChatArea({
   const stableOnStartEdit = useCallback((...args) => messageCallbacksRef.current.onStartEdit?.(...args), []);
   const stableOnCancelEdit = useCallback((...args) => messageCallbacksRef.current.onCancelEdit?.(...args), []);
   const stableOnEditResend = useCallback((...args) => messageCallbacksRef.current.onEditResend?.(...args), []);
+  const stableOnShareChat = useCallback((...args) => messageCallbacksRef.current.onShareChat?.(...args), []);
 
   const messagesLengthRef = useRef(messages.length);
   messagesLengthRef.current = messages.length;
@@ -1472,6 +1517,10 @@ Transcript:
               selectedProvider={selectedProvider}
               activeMode={activeMode}
               providerConfig={providerConfig}
+              onShareChat={onShareChat ? stableOnShareChat : undefined}
+              canShareChat={canShareChat}
+              shareChatDisabledReason={shareChatDisabledReason}
+              isSharingChat={isSharingChat}
             />
           )}
         </div>
@@ -1551,6 +1600,26 @@ Transcript:
               >
                 <X size={13} />
               </button>
+            </div>
+          )}
+
+          {/* Share Chat Error Notification */}
+          {shareErrorNotice && (
+            <div className="composer-dictation-error share-chat-error-alert" role="alert">
+              <div className="dictation-error-content">
+                <AlertCircle size={14} className="dictation-error-icon" aria-hidden="true" />
+                <span>{shareErrorNotice}</span>
+              </div>
+              {onDismissShareError && (
+                <button
+                  type="button"
+                  className="dictation-error-dismiss"
+                  onClick={onDismissShareError}
+                  aria-label="Dismiss share error alert"
+                >
+                  <X size={13} />
+                </button>
+              )}
             </div>
           )}
 
@@ -2233,18 +2302,33 @@ Transcript:
           </form>
 
           <p className="composer-footnote">
-            {getProviderFootnote(selectedProvider, webllmModelId)}
+            {getProviderFootnote(
+              selectedProvider,
+              selectedProvider === 'webllm'
+                ? webllmState?.loadedModelId &&
+                  (webllmState.loadedModelId === webllmModelId ||
+                    WEBLLM_MODEL_CATALOG[webllmModelId]?.f32FallbackModelId ===
+                      webllmState.loadedModelId)
+                  ? webllmState.loadedModelId
+                  : webllmState?.hasShaderF16 === false &&
+                      WEBLLM_MODEL_CATALOG[webllmModelId]?.f32FallbackModelId
+                    ? WEBLLM_MODEL_CATALOG[webllmModelId].f32FallbackModelId
+                    : webllmModelId
+                : webllmModelId
+            )}
           </p>
         </div>
       </div>
 
       {/* Pre-Send Composer Attachment Preview Modal */}
       {previewingComposerAttachment && (
-        <DocumentPreviewModal
-          isOpen={Boolean(previewingComposerAttachment)}
-          onClose={() => setPreviewingComposerAttachment(null)}
-          attachment={previewingComposerAttachment}
-        />
+        <React.Suspense fallback={null}>
+          <DocumentPreviewModal
+            isOpen={Boolean(previewingComposerAttachment)}
+            onClose={() => setPreviewingComposerAttachment(null)}
+            attachment={previewingComposerAttachment}
+          />
+        </React.Suspense>
       )}
     </main>
   );

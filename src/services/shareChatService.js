@@ -1,0 +1,997 @@
+import {
+  doc,
+  setDoc,
+  serverTimestamp,
+} from 'firebase/firestore';
+import { db, auth, isFirebaseConfigured } from '../config/firebaseConfig.js';
+import {
+  orderConversationMessages,
+  ensureConversationAlternatives,
+} from './alternativeResponseService.js';
+
+/**
+ * Firestore hard limit is 1,048,576 bytes (1 MiB).
+ * We enforce a conservative 900 KB safety ceiling to account for Firestore
+ * document key paths, index entries, and serverTimestamp representation.
+ */
+export const FIRESTORE_MAX_DOCUMENT_BYTES = 1048576;
+export const MAX_SHARED_SNAPSHOT_BYTES = 900 * 1024; // 921,600 bytes
+export const MAX_SHARED_MESSAGE_COUNT = 500;
+export const MAX_SHARED_MESSAGE_CONTENT_LENGTH = 100000;
+export const MAX_SHARED_TITLE_LENGTH = 120;
+export const SHARE_ID_LENGTH = 24;
+
+export const ALLOWED_CHAT_MODES = ['general', 'coding', 'writing', 'learning'];
+
+export const ALLOWED_SHARED_MESSAGE_KEYS = [
+  'id',
+  'sender',
+  'content',
+  'modelUsed',
+  'provider',
+  'mode',
+  'responseTimeMs',
+  'parentMessageId',
+  'interactionId',
+  'activeAlternativeId',
+  'alternatives',
+  'attachments',
+  'referencedAttachments',
+  'createdAtMs',
+  'clientTimestamp',
+  'timestamp',
+];
+
+const ALLOWED_SHARED_MESSAGE_KEY_SET = new Set(ALLOWED_SHARED_MESSAGE_KEYS);
+
+const URL_SAFE_ALPHABET =
+  'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-';
+
+const SHARE_ID_REGEX = /^[a-zA-Z0-9_-]{12,128}$/;
+
+// Track in-flight publication requests by chat ID to prevent duplicate concurrent writes
+const inFlightShareRequests = new Set();
+
+/**
+ * Custom error class for Share Chat validation and publication failures.
+ */
+export class ShareChatError extends Error {
+  constructor(message, code = 'SHARE_CHAT_ERROR') {
+    super(message);
+    this.name = 'ShareChatError';
+    this.code = code;
+  }
+}
+
+/**
+ * Generates a cryptographically strong, URL-safe share identifier.
+ * Uses Web Crypto API (`crypto.getRandomValues`) with 64-character URL-safe alphabet
+ * (unbiased bitmask `byte & 63`). Never uses `Math.random()`.
+ *
+ * @param {number} [length=SHARE_ID_LENGTH]
+ * @returns {string}
+ */
+export function generateShareId(length = SHARE_ID_LENGTH) {
+  const safeLength =
+    Number.isInteger(length) && length >= 12 && length <= 128
+      ? length
+      : SHARE_ID_LENGTH;
+
+  const cryptoObj =
+    typeof globalThis !== 'undefined' && globalThis.crypto
+      ? globalThis.crypto
+      : null;
+
+  if (!cryptoObj || typeof cryptoObj.getRandomValues !== 'function') {
+    throw new ShareChatError(
+      'Cryptographic random number generator is unavailable in this environment.',
+      'CRYPTO_UNAVAILABLE'
+    );
+  }
+
+  const randomBytes = new Uint8Array(safeLength);
+  cryptoObj.getRandomValues(randomBytes);
+
+  let shareId = '';
+  for (let i = 0; i < safeLength; i += 1) {
+    // 64 is an exact power of 2, so `randomBytes[i] & 63` has zero modulo bias
+    shareId += URL_SAFE_ALPHABET[randomBytes[i] & 63];
+  }
+
+  if (!SHARE_ID_REGEX.test(shareId)) {
+    throw new ShareChatError(
+      'Generated share ID failed format validation.',
+      'INVALID_SHARE_ID'
+    );
+  }
+
+  return shareId;
+}
+
+/**
+ * Validates whether a share ID matches the canonical Firestore rule format.
+ *
+ * @param {string} shareId
+ * @returns {boolean}
+ */
+export function isValidShareId(shareId) {
+  return typeof shareId === 'string' && SHARE_ID_REGEX.test(shareId);
+}
+
+/**
+ * Checks whether a user is eligible to create a shared chat link.
+ * Requires a signed-in, non-anonymous Firebase user (rejects Guest Mode,
+ * anonymous Firebase sessions, and unauthenticated visitors).
+ *
+ * @param {Object|null} user
+ * @returns {boolean}
+ */
+export function isEligibleShareUser(user) {
+  if (!user || typeof user !== 'object') return false;
+  const uid = typeof user.uid === 'string' ? user.uid.trim() : '';
+  if (!uid) return false;
+  if (user.isAnonymous === true) return false;
+  if (uid.startsWith('guest-')) return false;
+  return true;
+}
+
+/**
+ * Checks whether a specific conversation and user state can currently be shared.
+ *
+ * @param {Object} params
+ * @param {Object|null} params.user
+ * @param {Object|null} params.chat
+ * @param {Array} params.messages
+ * @param {boolean} [params.isLoading=false]
+ * @param {boolean} [params.isSharedPreview=false]
+ * @returns {{ eligible: boolean, reason: string|null }}
+ */
+export function evaluateShareEligibility({
+  user,
+  chat,
+  messages,
+  isLoading = false,
+  isSharedPreview = false,
+} = {}) {
+  if (isSharedPreview || chat?.isSharedPreview === true) {
+    return {
+      eligible: false,
+      reason: 'Shared conversation previews cannot be re-shared until imported into your account.',
+    };
+  }
+
+  if (!isEligibleShareUser(user)) {
+    return {
+      eligible: false,
+      reason: 'Please sign in with an Orvix account to share conversations. Guest Mode cannot create public links.',
+    };
+  }
+
+  if (!chat || typeof chat !== 'object' || typeof chat.id !== 'string' || !chat.id.trim()) {
+    return {
+      eligible: false,
+      reason: 'Conversation must be saved before it can be shared.',
+    };
+  }
+
+  if (String(chat.id).startsWith('temp-') || String(chat.id).startsWith('shared-preview-')) {
+    return {
+      eligible: false,
+      reason: 'Temporary conversations cannot be shared until saved to your chat history.',
+    };
+  }
+
+  if (isLoading) {
+    return {
+      eligible: false,
+      reason: 'Please wait for the current AI response to finish before sharing.',
+    };
+  }
+
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return {
+      eligible: false,
+      reason: 'Cannot share an empty conversation.',
+    };
+  }
+
+  const hasStreamingMessage = messages.some((m) => m && m.isStreaming === true);
+  if (hasStreamingMessage) {
+    return {
+      eligible: false,
+      reason: 'Please wait for the current AI response to finish before sharing.',
+    };
+  }
+
+  const shareableMessages = messages.filter(
+    (m) => m && typeof m === 'object' && !m.isError && m.sender !== 'error'
+  );
+  if (shareableMessages.length === 0) {
+    return {
+      eligible: false,
+      reason: 'Cannot share a conversation containing only error messages.',
+    };
+  }
+
+  return { eligible: true, reason: null };
+}
+
+/**
+ * Resolves the canonical base URL for share links.
+ * Checks configured Vite environment variables first, then `window.location.origin`.
+ *
+ * @param {string} [overrideBaseUrl]
+ * @returns {string}
+ */
+export function resolveShareBaseUrl(overrideBaseUrl) {
+  if (typeof overrideBaseUrl === 'string' && overrideBaseUrl.trim()) {
+    return overrideBaseUrl.trim().replace(/\/+$/, '');
+  }
+
+  let envUrl = '';
+  try {
+    envUrl =
+      import.meta.env?.VITE_PUBLIC_APP_URL ||
+      import.meta.env?.VITE_APP_URL ||
+      import.meta.env?.VITE_SITE_URL ||
+      '';
+  } catch {
+    envUrl = '';
+  }
+
+  if (typeof envUrl === 'string' && envUrl.trim()) {
+    return envUrl.trim().replace(/\/+$/, '');
+  }
+
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    return String(window.location.origin).replace(/\/+$/, '');
+  }
+
+  return 'https://orvix.ai';
+}
+
+/**
+ * Builds the canonical shareable URL for a given shareId.
+ * Format: {baseUrl}/share/{shareId}
+ *
+ * @param {string} shareId
+ * @param {string} [baseUrl]
+ * @returns {string}
+ */
+export function buildShareChatUrl(shareId, baseUrl) {
+  if (!isValidShareId(shareId)) {
+    throw new ShareChatError('Cannot build share URL: invalid share ID.', 'INVALID_SHARE_ID');
+  }
+  const resolvedBase = resolveShareBaseUrl(baseUrl);
+  return `${resolvedBase}/share/${shareId}`;
+}
+
+/**
+ * Sanitizes an attachment extraction record so only safe plain-text extraction
+ * metadata is retained and any binary/local fields are stripped.
+ *
+ * @param {Object|null} extraction
+ * @returns {Object|null}
+ */
+function sanitizeAttachmentExtraction(extraction) {
+  if (!extraction || typeof extraction !== 'object' || Array.isArray(extraction)) {
+    return null;
+  }
+
+  const clean = {};
+
+  if (typeof extraction.status === 'string') {
+    clean.status = extraction.status.slice(0, 64);
+  }
+  if (typeof extraction.type === 'string') {
+    clean.type = extraction.type.slice(0, 64);
+  }
+  if (typeof extraction.format === 'string') {
+    clean.format = extraction.format.slice(0, 32);
+  }
+  if (typeof extraction.text === 'string') {
+    clean.text = extraction.text.slice(0, 50000);
+  }
+  if (typeof extraction.charCount === 'number' && Number.isFinite(extraction.charCount)) {
+    clean.charCount = Math.max(0, Math.trunc(extraction.charCount));
+  }
+  if (typeof extraction.wordCount === 'number' && Number.isFinite(extraction.wordCount)) {
+    clean.wordCount = Math.max(0, Math.trunc(extraction.wordCount));
+  }
+  if (typeof extraction.totalWords === 'number' && Number.isFinite(extraction.totalWords)) {
+    clean.totalWords = Math.max(0, Math.trunc(extraction.totalWords));
+  }
+  if (typeof extraction.totalCharacters === 'number' && Number.isFinite(extraction.totalCharacters)) {
+    clean.totalCharacters = Math.max(0, Math.trunc(extraction.totalCharacters));
+  }
+  if (typeof extraction.lineCount === 'number' && Number.isFinite(extraction.lineCount)) {
+    clean.lineCount = Math.max(0, Math.trunc(extraction.lineCount));
+  }
+  if (typeof extraction.confidence === 'number' && Number.isFinite(extraction.confidence)) {
+    clean.confidence = Math.round(extraction.confidence * 100) / 100;
+  }
+  if (typeof extraction.hasText === 'boolean') {
+    clean.hasText = extraction.hasText;
+  }
+  if (typeof extraction.truncated === 'boolean') {
+    clean.truncated = extraction.truncated;
+  }
+  if (Array.isArray(extraction.warnings)) {
+    clean.warnings = extraction.warnings
+      .filter((w) => typeof w === 'string')
+      .slice(0, 10)
+      .map((w) => w.slice(0, 200));
+  }
+
+  return Object.keys(clean).length > 0 ? clean : null;
+}
+
+/**
+ * Sanitizes a single attachment metadata item for public sharing.
+ * Strictly strips `Blob`, `File`, `ArrayBuffer`, `base64`, `dataUrl`, `previewUrl`,
+ * `url`, local filesystem paths, IndexedDB references, or private tokens.
+ *
+ * @param {Object} att
+ * @param {number} index
+ * @returns {Object|null}
+ */
+export function sanitizeAttachmentForShare(att, index = 0) {
+  if (!att || typeof att !== 'object' || Array.isArray(att)) {
+    return null;
+  }
+
+  // Never serialize raw Blob or File instances directly
+  if (typeof Blob !== 'undefined' && att instanceof Blob) {
+    return null;
+  }
+
+  const rawId = typeof att.id === 'string' && att.id.trim() ? att.id.trim() : `att_${index}`;
+  const rawName =
+    (typeof att.name === 'string' && att.name.trim()) ||
+    (typeof att.originalName === 'string' && att.originalName.trim()) ||
+    (typeof att.filename === 'string' && att.filename.trim()) ||
+    'Attachment';
+
+  const clean = {
+    id: rawId.slice(0, 128),
+    name: rawName.slice(0, 255),
+    originalName: (typeof att.originalName === 'string' && att.originalName.trim()
+      ? att.originalName.trim()
+      : rawName
+    ).slice(0, 255),
+    size:
+      typeof att.size === 'number' && Number.isFinite(att.size) && att.size >= 0
+        ? Math.trunc(att.size)
+        : 0,
+    type:
+      typeof att.type === 'string' && att.type.trim()
+        ? att.type.trim().slice(0, 128)
+        : typeof att.mimeType === 'string' && att.mimeType.trim()
+        ? att.mimeType.trim().slice(0, 128)
+        : 'application/octet-stream',
+  };
+
+  if (typeof att.extension === 'string' && att.extension.trim()) {
+    clean.extension = att.extension.trim().slice(0, 32);
+  }
+  if (typeof att.format === 'string' && att.format.trim()) {
+    clean.format = att.format.trim().slice(0, 32);
+  }
+  if (typeof att.category === 'string' && att.category.trim()) {
+    clean.category = att.category.trim().slice(0, 32);
+  }
+  if (typeof att.uploadedAt === 'string' && att.uploadedAt.trim()) {
+    clean.uploadedAt = att.uploadedAt.trim().slice(0, 64);
+  }
+
+  const sanitizedExtraction = sanitizeAttachmentExtraction(att.extraction);
+  if (sanitizedExtraction) {
+    clean.extraction = sanitizedExtraction;
+  }
+
+  return clean;
+}
+
+/**
+ * Sanitizes an assistant alternative response entry for public sharing.
+ *
+ * @param {Object} alt
+ * @param {number} index
+ * @param {string} fallbackMode
+ * @returns {Object|null}
+ */
+function sanitizeAlternativeForShare(alt, index = 0, fallbackMode = 'general') {
+  if (!alt || typeof alt !== 'object' || Array.isArray(alt)) {
+    return null;
+  }
+  if (typeof alt.content !== 'string') {
+    return null;
+  }
+  if (alt.content.length > MAX_SHARED_MESSAGE_CONTENT_LENGTH) {
+    throw new ShareChatError(
+      `Alternative response #${index + 1} exceeds the maximum allowed message length.`,
+      'MESSAGE_CONTENT_TOO_LARGE'
+    );
+  }
+
+  const rawId = typeof alt.id === 'string' && alt.id.trim() ? alt.id.trim() : `alt_${index}`;
+  const cleanAlt = {
+    id: rawId.slice(0, 128),
+    content: alt.content,
+    modelUsed:
+      typeof alt.modelUsed === 'string' && alt.modelUsed.trim()
+        ? alt.modelUsed.trim().slice(0, 120)
+        : null,
+    provider:
+      typeof alt.provider === 'string' && alt.provider.trim()
+        ? alt.provider.trim().slice(0, 64)
+        : null,
+    mode: ALLOWED_CHAT_MODES.includes(alt.mode) ? alt.mode : fallbackMode,
+    responseTimeMs:
+      typeof alt.responseTimeMs === 'number' &&
+      Number.isFinite(alt.responseTimeMs) &&
+      alt.responseTimeMs >= 0
+        ? Math.round(alt.responseTimeMs)
+        : null,
+    createdAtMs:
+      typeof alt.createdAtMs === 'number' && Number.isFinite(alt.createdAtMs)
+        ? Math.trunc(alt.createdAtMs)
+        : null,
+    clientTimestamp:
+      typeof alt.clientTimestamp === 'string' && alt.clientTimestamp.trim()
+        ? alt.clientTimestamp.trim().slice(0, 64)
+        : typeof alt.timestamp === 'string' && alt.timestamp.trim()
+        ? alt.timestamp.trim().slice(0, 64)
+        : null,
+  };
+
+  return cleanAlt;
+}
+
+/**
+ * Validates and sanitizes a single conversation message for the shared snapshot.
+ * Enforces strict alignment with `isValidSharedMessageItem` in `firestore.rules`.
+ * Rejects malformed messages rather than silently truncating or dropping them.
+ *
+ * @param {Object} msg
+ * @param {number} index
+ * @param {string} fallbackMode
+ * @returns {Object}
+ */
+export function sanitizeMessageForShare(msg, index = 0, fallbackMode = 'general') {
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
+    throw new ShareChatError(
+      `Message at position ${index + 1} is invalid.`,
+      'INVALID_MESSAGE_STRUCTURE'
+    );
+  }
+
+  if (msg.isStreaming === true) {
+    throw new ShareChatError(
+      'Cannot share while an AI response is still streaming.',
+      'STREAMING_IN_PROGRESS'
+    );
+  }
+
+  // Validate sender
+  const sender = msg.sender;
+  if (sender !== 'user' && sender !== 'assistant') {
+    throw new ShareChatError(
+      `Message at position ${index + 1} has an invalid sender ("${String(sender)}"). Only "user" and "assistant" messages are permitted.`,
+      'INVALID_MESSAGE_SENDER'
+    );
+  }
+
+  // Validate id
+  const rawId = typeof msg.id === 'string' ? msg.id.trim() : '';
+  if (!rawId || rawId.length > 128) {
+    throw new ShareChatError(
+      `Message at position ${index + 1} is missing a valid message ID.`,
+      'INVALID_MESSAGE_ID'
+    );
+  }
+
+  // Validate content
+  if (typeof msg.content !== 'string') {
+    throw new ShareChatError(
+      `Message at position ${index + 1} has non-string content.`,
+      'INVALID_MESSAGE_CONTENT'
+    );
+  }
+
+  if (msg.content.length > MAX_SHARED_MESSAGE_CONTENT_LENGTH) {
+    throw new ShareChatError(
+      `Message at position ${index + 1} exceeds the 100,000-character limit and cannot be shared without truncation.`,
+      'MESSAGE_CONTENT_TOO_LARGE'
+    );
+  }
+
+  const sanitizedAttachments = Array.isArray(msg.attachments)
+    ? msg.attachments
+        .map((att, attIdx) => sanitizeAttachmentForShare(att, attIdx))
+        .filter(Boolean)
+        .slice(0, 20)
+    : null;
+
+  const sanitizedReferencedAttachments = Array.isArray(msg.referencedAttachments)
+    ? msg.referencedAttachments
+        .map((att, attIdx) => sanitizeAttachmentForShare(att, attIdx))
+        .filter(Boolean)
+        .slice(0, 20)
+    : null;
+
+  const hasAttachments =
+    (Array.isArray(sanitizedAttachments) && sanitizedAttachments.length > 0) ||
+    (Array.isArray(sanitizedReferencedAttachments) && sanitizedReferencedAttachments.length > 0);
+
+  if (msg.content.trim().length === 0 && !hasAttachments) {
+    throw new ShareChatError(
+      `Message at position ${index + 1} has empty content and no attachments.`,
+      'EMPTY_MESSAGE_CONTENT'
+    );
+  }
+
+  const resolvedMode = ALLOWED_CHAT_MODES.includes(msg.mode)
+    ? msg.mode
+    : ALLOWED_CHAT_MODES.includes(fallbackMode)
+    ? fallbackMode
+    : 'general';
+
+  const sanitizedAlternatives =
+    sender === 'assistant' && Array.isArray(msg.alternatives)
+      ? msg.alternatives
+          .map((alt, altIdx) => sanitizeAlternativeForShare(alt, altIdx, resolvedMode))
+          .filter(Boolean)
+          .slice(0, 20)
+      : null;
+
+  const clientTimestamp =
+    typeof msg.clientTimestamp === 'string' && msg.clientTimestamp.trim()
+      ? msg.clientTimestamp.trim().slice(0, 64)
+      : typeof msg.timestamp === 'string' && msg.timestamp.trim()
+      ? msg.timestamp.trim().slice(0, 64)
+      : null;
+
+  const createdAtMs =
+    typeof msg.createdAtMs === 'number' && Number.isFinite(msg.createdAtMs)
+      ? Math.trunc(msg.createdAtMs)
+      : clientTimestamp && Number.isFinite(Date.parse(clientTimestamp))
+      ? Date.parse(clientTimestamp)
+      : null;
+
+  const sanitizedMessage = {
+    id: rawId,
+    sender,
+    content: msg.content,
+    modelUsed:
+      typeof msg.modelUsed === 'string' && msg.modelUsed.trim()
+        ? msg.modelUsed.trim().slice(0, 120)
+        : null,
+    provider:
+      typeof msg.provider === 'string' && msg.provider.trim()
+        ? msg.provider.trim().slice(0, 64)
+        : null,
+    mode: resolvedMode,
+    responseTimeMs:
+      typeof msg.responseTimeMs === 'number' &&
+      Number.isFinite(msg.responseTimeMs) &&
+      msg.responseTimeMs >= 0
+        ? Math.round(msg.responseTimeMs)
+        : null,
+    parentMessageId:
+      typeof msg.parentMessageId === 'string' && msg.parentMessageId.trim()
+        ? msg.parentMessageId.trim().slice(0, 128)
+        : null,
+    interactionId:
+      typeof msg.interactionId === 'string' && msg.interactionId.trim()
+        ? msg.interactionId.trim().slice(0, 128)
+        : null,
+    activeAlternativeId:
+      typeof msg.activeAlternativeId === 'string' && msg.activeAlternativeId.trim()
+        ? msg.activeAlternativeId.trim().slice(0, 128)
+        : null,
+    alternatives:
+      sanitizedAlternatives && sanitizedAlternatives.length > 0
+        ? sanitizedAlternatives
+        : null,
+    attachments:
+      sanitizedAttachments && sanitizedAttachments.length > 0
+        ? sanitizedAttachments
+        : null,
+    referencedAttachments:
+      sanitizedReferencedAttachments && sanitizedReferencedAttachments.length > 0
+        ? sanitizedReferencedAttachments
+        : null,
+    createdAtMs,
+    clientTimestamp,
+    timestamp: clientTimestamp,
+  };
+
+  // Final defensive check: ensure only whitelisted keys exist and no undefined values remain
+  for (const key of Object.keys(sanitizedMessage)) {
+    if (!ALLOWED_SHARED_MESSAGE_KEY_SET.has(key)) {
+      delete sanitizedMessage[key];
+    } else if (sanitizedMessage[key] === undefined) {
+      sanitizedMessage[key] = null;
+    }
+  }
+
+  return sanitizedMessage;
+}
+
+/**
+ * Calculates the UTF-8 serialized byte size of a snapshot document payload.
+ * Replaces Firestore `serverTimestamp()` sentinel with an ISO timestamp placeholder
+ * for accurate byte measurement.
+ *
+ * @param {Object} snapshotPayload
+ * @returns {number}
+ */
+export function calculateSnapshotByteSize(snapshotPayload) {
+  const measurablePayload = {
+    ...snapshotPayload,
+    createdAt: new Date().toISOString(),
+  };
+  const jsonString = JSON.stringify(measurablePayload);
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(jsonString).length;
+  }
+  if (typeof Buffer !== 'undefined') {
+    return Buffer.byteLength(jsonString, 'utf8');
+  }
+  return jsonString.length * 2;
+}
+
+/**
+ * Normalizes and validates the complete conversation payload before writing to Firestore.
+ * Pure helper that can be unit tested independently of Firestore network calls.
+ *
+ * @param {Object} params
+ * @param {string} params.shareId
+ * @param {Object} params.chat
+ * @param {Array} params.messages
+ * @returns {{ documentData: Object, byteSize: number }}
+ */
+export function buildValidatedSharedSnapshot({ shareId, chat, messages }) {
+  if (!isValidShareId(shareId)) {
+    throw new ShareChatError('Invalid share ID.', 'INVALID_SHARE_ID');
+  }
+
+  if (!chat || typeof chat !== 'object' || typeof chat.id !== 'string' || !chat.id.trim()) {
+    throw new ShareChatError(
+      'Conversation must be saved before sharing.',
+      'INVALID_CHAT'
+    );
+  }
+
+  if (!Array.isArray(messages) || messages.length === 0) {
+    throw new ShareChatError(
+      'Cannot share an empty conversation.',
+      'EMPTY_CONVERSATION'
+    );
+  }
+
+  // Reject if any message is actively streaming
+  if (messages.some((m) => m && m.isStreaming === true)) {
+    throw new ShareChatError(
+      'Please wait for the current AI response to finish before sharing.',
+      'STREAMING_IN_PROGRESS'
+    );
+  }
+
+  // Filter out transient UI error banners while keeping all real user & assistant messages
+  const nonErrorMessages = messages.filter(
+    (m) => m && typeof m === 'object' && !m.isError && m.sender !== 'error'
+  );
+
+  if (nonErrorMessages.length === 0) {
+    throw new ShareChatError(
+      'Cannot share a conversation containing only error messages.',
+      'EMPTY_CONVERSATION'
+    );
+  }
+
+  if (nonErrorMessages.length > MAX_SHARED_MESSAGE_COUNT) {
+    throw new ShareChatError(
+      `This conversation has ${nonErrorMessages.length} messages, exceeding the maximum limit of ${MAX_SHARED_MESSAGE_COUNT} messages per shared link. Please share a shorter conversation.`,
+      'SNAPSHOT_TOO_MANY_MESSAGES'
+    );
+  }
+
+  const safeMode = ALLOWED_CHAT_MODES.includes(chat.mode) ? chat.mode : 'general';
+  const rawTitle = typeof chat.title === 'string' && chat.title.trim() ? chat.title.trim() : 'Shared Chat';
+  const safeTitle = rawTitle.slice(0, MAX_SHARED_TITLE_LENGTH);
+
+  // Pre-validate every raw message before normalization so non-string content or invalid senders are never coerced
+  nonErrorMessages.forEach((rawMsg, idx) => {
+    if (!rawMsg || typeof rawMsg !== 'object' || Array.isArray(rawMsg)) {
+      throw new ShareChatError(
+        `Message at position ${idx + 1} is invalid.`,
+        'INVALID_MESSAGE_STRUCTURE'
+      );
+    }
+    if (rawMsg.sender !== 'user' && rawMsg.sender !== 'assistant') {
+      throw new ShareChatError(
+        `Message at position ${idx + 1} has an invalid sender ("${String(rawMsg.sender)}"). Only "user" and "assistant" messages are permitted.`,
+        'INVALID_MESSAGE_SENDER'
+      );
+    }
+    if (typeof rawMsg.content !== 'string') {
+      throw new ShareChatError(
+        `Message at position ${idx + 1} has non-string content.`,
+        'INVALID_MESSAGE_CONTENT'
+      );
+    }
+  });
+
+  // Order messages chronologically and normalize alternatives
+  const orderedMessages = orderConversationMessages(
+    ensureConversationAlternatives(nonErrorMessages)
+  );
+
+  // Validate and sanitize EVERY message in the conversation
+  const sanitizedMessages = orderedMessages.map((msg, idx) =>
+    sanitizeMessageForShare(msg, idx, safeMode)
+  );
+
+  if (sanitizedMessages.length === 0) {
+    throw new ShareChatError(
+      'No valid messages available to share.',
+      'EMPTY_CONVERSATION'
+    );
+  }
+
+  const documentData = {
+    id: shareId,
+    title: safeTitle,
+    mode: safeMode,
+    createdAt: serverTimestamp(),
+    messageCount: sanitizedMessages.length,
+    messages: sanitizedMessages,
+  };
+
+  const byteSize = calculateSnapshotByteSize(documentData);
+  if (byteSize > MAX_SHARED_SNAPSHOT_BYTES) {
+    throw new ShareChatError(
+      'This conversation is too large to share as a single link. Please try sharing a shorter conversation.',
+      'SNAPSHOT_TOO_LARGE'
+    );
+  }
+
+  return { documentData, byteSize };
+}
+
+/**
+ * Bounded timeout wrapper for Firestore operations.
+ */
+function withPublishTimeout(promise, ms = 12000) {
+  let timerId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timerId = setTimeout(() => {
+      reject(
+        new ShareChatError(
+          'Publishing the shared link timed out. Please check your connection and try again.',
+          'PUBLISH_TIMEOUT'
+        )
+      );
+    }, ms);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    clearTimeout(timerId);
+  });
+}
+
+/**
+ * Publishes the entire active conversation as an immutable shared snapshot
+ * at `sharedChats/{shareId}` and returns the generated share metadata.
+ *
+ * @param {Object} chat - Active chat metadata object (`{ id, title, mode, ... }`)
+ * @param {Array} messages - Complete list of messages in the active conversation
+ * @param {Object} [options]
+ * @param {Object} [options.user] - Current authenticated user (defaults to `auth.currentUser`)
+ * @param {Object} [options.firestoreDb] - Optional Firestore instance override for testing
+ * @param {Function} [options.setDocImpl] - Optional `setDoc` override for testing
+ * @param {Function} [options.docImpl] - Optional `doc` override for testing
+ * @param {string} [options.baseUrl] - Optional base URL override
+ * @param {boolean} [options.isSharedPreview=false] - Whether currently viewing a temporary shared preview
+ * @returns {Promise<{ shareId: string, shareUrl: string, title: string, mode: string, messageCount: number, byteSize: number }>}
+ */
+export async function createSharedChatSnapshot(chat, messages, options = {}) {
+  const effectiveUser = options.user !== undefined ? options.user : auth?.currentUser;
+  const eligibility = evaluateShareEligibility({
+    user: effectiveUser,
+    chat,
+    messages,
+    isLoading: Boolean(options.isLoading),
+    isSharedPreview: Boolean(options.isSharedPreview),
+  });
+
+  if (!eligibility.eligible) {
+    throw new ShareChatError(
+      eligibility.reason || 'You are not eligible to share this conversation.',
+      'NOT_ELIGIBLE'
+    );
+  }
+
+  // Also ensure Firebase Auth session matches when using live Firebase
+  if (!options.setDocImpl) {
+    if (!isFirebaseConfigured || !db) {
+      throw new ShareChatError(
+        'Cloud sharing is currently unavailable because Firebase is not configured.',
+        'FIREBASE_UNAVAILABLE'
+      );
+    }
+    const liveAuthUser = auth?.currentUser;
+    if (!isEligibleShareUser(liveAuthUser)) {
+      throw new ShareChatError(
+        'Please sign in with an Orvix account to share conversations.',
+        'AUTH_REQUIRED'
+      );
+    }
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      throw new ShareChatError(
+        'You appear to be offline. Please reconnect to the internet to generate a shareable link.',
+        'OFFLINE'
+      );
+    }
+  }
+
+  const lockKey = String(chat.id);
+  if (inFlightShareRequests.has(lockKey)) {
+    throw new ShareChatError(
+      'A share link is already being generated for this conversation.',
+      'DUPLICATE_IN_FLIGHT'
+    );
+  }
+
+  inFlightShareRequests.add(lockKey);
+
+  try {
+    const shareId = generateShareId();
+    const { documentData, byteSize } = buildValidatedSharedSnapshot({
+      shareId,
+      chat,
+      messages,
+    });
+
+    const targetDb = options.firestoreDb !== undefined ? options.firestoreDb : db;
+    const docFn = options.docImpl || doc;
+    const setDocFn = options.setDocImpl || setDoc;
+
+    const shareDocRef = docFn(targetDb, 'sharedChats', shareId);
+    await withPublishTimeout(setDocFn(shareDocRef, documentData));
+
+    const shareUrl = buildShareChatUrl(shareId, options.baseUrl);
+
+    return {
+      shareId,
+      shareUrl,
+      title: documentData.title,
+      mode: documentData.mode,
+      messageCount: documentData.messageCount,
+      byteSize,
+    };
+  } catch (err) {
+    if (err instanceof ShareChatError) {
+      throw err;
+    }
+    const rawMsg = String(err?.message || '');
+    if (rawMsg.includes('permission-denied') || err?.code === 'permission-denied') {
+      throw new ShareChatError(
+        'Unable to publish shared conversation due to security permissions. Please ensure you are signed in with a full account.',
+        'PERMISSION_DENIED'
+      );
+    }
+    throw new ShareChatError(
+      'Failed to generate share link. Please check your connection and try again.',
+      'PUBLISH_FAILED'
+    );
+  } finally {
+    inFlightShareRequests.delete(lockKey);
+  }
+}
+
+/**
+ * Copies the generated share URL to the clipboard with a reliable fallback
+ * for browsers/iframes where `navigator.clipboard.writeText` is restricted.
+ *
+ * @param {string} shareUrl
+ * @returns {Promise<boolean>}
+ */
+export async function copyShareUrlToClipboard(shareUrl) {
+  if (typeof shareUrl !== 'string' || !shareUrl.trim()) {
+    return false;
+  }
+
+  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      return true;
+    } catch {
+      // Fall through to textarea fallback
+    }
+  }
+
+  if (typeof document !== 'undefined') {
+    try {
+      const textArea = document.createElement('textarea');
+      textArea.value = shareUrl;
+      textArea.setAttribute('readonly', '');
+      textArea.style.position = 'fixed';
+      textArea.style.top = '-9999px';
+      textArea.style.left = '-9999px';
+      textArea.style.opacity = '0';
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+      const copied = document.execCommand('copy');
+      document.body.removeChild(textArea);
+      return Boolean(copied);
+    } catch {
+      return false;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Builds a WhatsApp share URL (`https://wa.me/?text=...`) containing the
+ * conversation title and shareable link.
+ *
+ * @param {string} shareUrl
+ * @param {string} [title]
+ * @returns {string}
+ */
+export function buildWhatsAppShareUrl(shareUrl, title = 'Shared Chat') {
+  const cleanTitle =
+    typeof title === 'string' && title.trim() ? title.trim() : 'Shared Chat';
+  const shareText = `${cleanTitle} — Shared conversation on Orvix AI:\n${shareUrl}`;
+  return `https://wa.me/?text=${encodeURIComponent(shareText)}`;
+}
+
+/**
+ * Checks whether the browser supports the native Web Share API (`navigator.share`).
+ *
+ * @returns {boolean}
+ */
+export function canUseNativeShare() {
+  return (
+    typeof navigator !== 'undefined' &&
+    typeof navigator.share === 'function'
+  );
+}
+
+/**
+ * Invokes the browser's native Web Share sheet (`navigator.share`).
+ * Returns `{ shared: true }` on completion, `{ shared: false, cancelled: true }`
+ * if dismissed by the user, or throws on unexpected error.
+ *
+ * @param {Object} params
+ * @param {string} params.shareUrl
+ * @param {string} [params.title]
+ * @returns {Promise<{ shared: boolean, cancelled?: boolean }>}
+ */
+export async function triggerNativeShare({ shareUrl, title = 'Shared Chat' }) {
+  if (!canUseNativeShare()) {
+    return { shared: false };
+  }
+
+  const cleanTitle =
+    typeof title === 'string' && title.trim() ? title.trim() : 'Shared Chat';
+
+  try {
+    await navigator.share({
+      title: `${cleanTitle} — Orvix AI`,
+      text: `Check out this AI conversation on Orvix AI: "${cleanTitle}"`,
+      url: shareUrl,
+    });
+    return { shared: true };
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      return { shared: false, cancelled: true };
+    }
+    throw err;
+  }
+}

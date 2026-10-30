@@ -22,6 +22,7 @@ import {
   deleteChatMessages,
   toggleChatPinned,
   subscribeToUserChats,
+  subscribeToChatMessages,
   loadConversationMessages,
   generateChatTitle,
   updateChatMode,
@@ -58,7 +59,9 @@ import {
   updateActiveAlternativeInMessage,
   ensureConversationAlternatives,
   createAlternativeRecord,
-  getActiveAlternative
+  getActiveAlternative,
+  orderConversationMessages,
+  createConversationOrderMemo
 } from '../services/alternativeResponseService.js';
 import {
   DEFAULT_WEBLLM_MODEL_ID,
@@ -67,6 +70,7 @@ import {
   subscribeWebLLMState,
   checkWebGPUSupport,
   inspectWebLLMReadiness,
+  preloadWebLLMRuntimeModule,
   ensureWebLLMEngine,
   stopWebLLMGeneration,
   unloadWebLLMEngine,
@@ -87,6 +91,11 @@ import {
   runIsolatedPromptStream
 } from '../services/requestIsolationService.js';
 import { normalizeAIError } from '../services/errorNormalizationService.js';
+import {
+  createSharedChatSnapshot,
+  evaluateShareEligibility
+} from '../services/shareChatService.js';
+import ShareChatModal from '../components/chat/ShareChatModal.jsx';
 import { AlertCircle, X, Check, WifiOff } from 'lucide-react';
 
 export default function ChatPage() {
@@ -129,6 +138,10 @@ export default function ChatPage() {
   const [persistenceError, setPersistenceError] = useState(null);
   const [exportNotice, setExportNotice] = useState(null);
   const [editingMessageId, setEditingMessageId] = useState(null);
+  const [isSharingChat, setIsSharingChat] = useState(false);
+  const [shareModalData, setShareModalData] = useState(null);
+  const [shareErrorNotice, setShareErrorNotice] = useState(null);
+  const isSharingChatRef = useRef(false);
 
   const [selectedProvider, setSelectedProvider] = useState(() => {
     if (typeof window !== 'undefined') {
@@ -188,11 +201,17 @@ export default function ChatPage() {
     isSubmittingRef.current = loading;
   };
 
+  const messageOrderMemoRef = useRef(null);
+  if (!messageOrderMemoRef.current) {
+    messageOrderMemoRef.current = createConversationOrderMemo();
+  }
+
   const updateMessagesState = (updater) => {
     setMessages((previous) => {
       const next = typeof updater === 'function' ? updater(previous) : updater;
-      messagesRef.current = next;
-      return next;
+      const canonicallyOrdered = messageOrderMemoRef.current(next);
+      messagesRef.current = canonicallyOrdered;
+      return canonicallyOrdered;
     });
   };
 
@@ -237,12 +256,22 @@ export default function ChatPage() {
 
     if (typeof window !== 'undefined') {
       localStorage.setItem('orvix_selected_provider', normalized);
-      localStorage.setItem('chatora_selected_provider', normalized);
     }
   };
 
   const handleSelectWebLLMModel = (nextModelId) => {
-    if (!nextModelId || !WEBLLM_MODEL_CATALOG[nextModelId]) return;
+    if (!nextModelId || !WEBLLM_MODEL_CATALOG[nextModelId] || nextModelId === webllmModelId) {
+      return;
+    }
+    if (selectedProvider === 'webllm' && requestControllerRef.current.hasActiveRequest()) {
+      cancelCurrentGeneration('model_switched');
+    } else if (
+      webllmState.status === 'checking' ||
+      webllmState.status === 'downloading' ||
+      webllmState.status === 'loading'
+    ) {
+      stopWebLLMGeneration();
+    }
     setWebllmModelId(nextModelId);
     if (typeof window !== 'undefined') {
       localStorage.setItem('orvix_webllm_model_id', nextModelId);
@@ -309,11 +338,15 @@ export default function ChatPage() {
     inspectWebLLMReadiness(webllmModelId)
       .then((res) => {
         if (cancelled) return;
+        const isSupported = Boolean(res?.gpuSupport?.supported);
         setWebllmGpuCheck({
           checking: false,
-          supported: Boolean(res?.gpuSupport?.supported),
+          supported: isSupported,
           message: res?.gpuSupport?.message || null
         });
+        if (isSupported) {
+          preloadWebLLMRuntimeModule();
+        }
       })
       .catch(() => {
         if (cancelled) return;
@@ -422,10 +455,6 @@ export default function ChatPage() {
           'orvix_guest_pins',
           JSON.stringify(pinnedIds)
         );
-        localStorage.setItem(
-          'chatora_guest_pins',
-          JSON.stringify(pinnedIds)
-        );
       }
     } catch (error) {
       console.warn('Could not save guest pins:', error);
@@ -465,7 +494,6 @@ export default function ChatPage() {
         });
         const serialized = JSON.stringify(sanitizedChats);
         localStorage.setItem('orvix_guest_chats', serialized);
-        localStorage.setItem('chatora_guest_chats', serialized);
       }
     } catch (error) {
       console.warn('Could not save guest chats:', error);
@@ -597,7 +625,6 @@ export default function ChatPage() {
       skipNextChatLoadRef.current = null;
 
       sessionStorage.setItem('orvix_active_chat', activeChatId);
-      sessionStorage.setItem('chatora_active_chat', activeChatId);
 
       setMessagesLoading(false);
       return undefined;
@@ -613,7 +640,6 @@ export default function ChatPage() {
     }
 
     sessionStorage.setItem('orvix_active_chat', activeChatId);
-    sessionStorage.setItem('chatora_active_chat', activeChatId);
 
     // Sync active mode from chat metadata (default to 'general' for legacy chats)
     const matchingChat =
@@ -629,7 +655,7 @@ export default function ChatPage() {
     );
 
     if (sample) {
-      setMessages(ensureConversationAlternatives(sample.messages));
+      setMessages(messageOrderMemoRef.current(sample.messages));
       setActiveMode(sample.mode || 'general');
       setMessagesLoading(false);
       return undefined;
@@ -645,7 +671,7 @@ export default function ChatPage() {
       guestChat &&
       Array.isArray(guestChat.messages)
     ) {
-      setMessages(ensureConversationAlternatives(guestChat.messages));
+      setMessages(messageOrderMemoRef.current(guestChat.messages));
       setMessagesLoading(false);
       return undefined;
     }
@@ -656,8 +682,10 @@ export default function ChatPage() {
 
       setMessagesLoading(true);
 
-      loadConversationMessages(currentUser.uid, activeChatId)
-        .then((loadedMessages) => {
+      const unsubscribe = subscribeToChatMessages(
+        currentUser.uid,
+        activeChatId,
+        (loadedMessages) => {
           if (
             cancelled ||
             fetchRequestIdRef.current !== currentRequestId ||
@@ -667,18 +695,31 @@ export default function ChatPage() {
           }
 
           const safeMessages = Array.isArray(loadedMessages)
-            ? ensureConversationAlternatives(loadedMessages)
+            ? messageOrderMemoRef.current(loadedMessages)
             : [];
 
-          setMessages(safeMessages);
+          setMessages((prevMessages) => {
+            // If a prompt is actively generating or streaming in this tab, preserve the in-progress assistant message
+            if (requestControllerRef.current?.hasActiveRequest()) {
+              const activeMsgs = prevMessages.filter(
+                (m) => m.id && !safeMessages.some((sm) => sm.id === m.id)
+              );
+              if (activeMsgs.length > 0) {
+                return messageOrderMemoRef.current([...safeMessages, ...activeMsgs]);
+              }
+            }
+            return safeMessages;
+          });
 
           safeMessages.forEach((message) => {
             if (message.id) {
               persistedMessageIdsRef.current.add(message.id);
             }
           });
-        })
-        .catch((error) => {
+
+          setMessagesLoading(false);
+        },
+        (error) => {
           if (
             cancelled ||
             fetchRequestIdRef.current !== currentRequestId
@@ -687,7 +728,7 @@ export default function ChatPage() {
           }
 
           console.error(
-            'Failed to load conversation messages:',
+            'Failed to subscribe to conversation messages:',
             error
           );
 
@@ -696,18 +737,13 @@ export default function ChatPage() {
               'Failed to load conversation history from Cloud Firestore.'
             );
           }
-        })
-        .finally(() => {
-          if (
-            !cancelled &&
-            fetchRequestIdRef.current === currentRequestId
-          ) {
-            setMessagesLoading(false);
-          }
-        });
+          setMessagesLoading(false);
+        }
+      );
 
       return () => {
         cancelled = true;
+        unsubscribe();
       };
     }
 
@@ -742,6 +778,8 @@ export default function ChatPage() {
     setLoadingAndSubmitting(false);
     setMessagesLoading(false);
     setModeChangeNotice(null);
+    setShareModalData(null);
+    setShareErrorNotice(null);
     setActiveMode(settings?.defaultMode || 'general');
 
     sessionStorage.removeItem('orvix_active_chat');
@@ -760,6 +798,8 @@ export default function ChatPage() {
 
     setLoadingAndSubmitting(false);
     setEditingMessageId(null);
+    setShareModalData(null);
+    setShareErrorNotice(null);
 
     setActiveChatId(chatId);
     setInputValue('');
@@ -1008,7 +1048,7 @@ export default function ChatPage() {
         return {
           ...chat,
           rawUpdatedAt: Date.now(),
-          messages: updatedMessages
+          messages: orderConversationMessages(updatedMessages)
         };
       });
 
@@ -1684,22 +1724,22 @@ export default function ChatPage() {
           'orvix_active_chat',
           currentChatId
         );
-        sessionStorage.setItem(
-          'chatora_active_chat',
-          currentChatId
-        );
       }
 
       const currentMessagesSnapshot = messagesRef.current;
       const now = Date.now();
+      const interactionId = `interaction-${now}`;
 
       const userMessage = {
         id: `user-${now}`,
+        interactionId,
         sender: 'user',
         timestamp: new Date().toLocaleTimeString([], {
           hour: '2-digit',
           minute: '2-digit'
         }),
+        createdAt: now,
+        createdAtMs: now,
         content: trimmed,
         attachments: processedAttachments
       };
@@ -1746,8 +1786,9 @@ export default function ChatPage() {
       const initialAssistantMessage = normalizeAssistantMessage(
         {
           id: assistantMessageId,
-          sender: 'assistant',
+          interactionId,
           parentMessageId: userMessage.id,
+          sender: 'assistant',
           provider: submitProvider,
           modelUsed: null,
           mode: activeMode || 'general',
@@ -1755,6 +1796,8 @@ export default function ChatPage() {
             hour: '2-digit',
             minute: '2-digit'
           }),
+          createdAt: now,
+          createdAtMs: now,
           content: '',
           isStreaming: true,
           requestStartTime,
@@ -1834,15 +1877,16 @@ export default function ChatPage() {
     const currentChatId = activeChatIdRef.current;
     const currentMessagesSnapshot = messagesRef.current;
 
-    const updatedMessages = currentMessagesSnapshot.filter(
-      (message) => message.id !== failedMessage.id
-    );
-
     const failedIdx = currentMessagesSnapshot.findIndex((m) => m.id === failedMessage.id);
-    const precedingUser = failedIdx > 0 ? currentMessagesSnapshot[failedIdx - 1] : null;
+    const parentUser = failedMessage.parentMessageId
+      ? currentMessagesSnapshot.find((m) => m.id === failedMessage.parentMessageId)
+      : (failedIdx > 0 ? currentMessagesSnapshot[failedIdx - 1] : null);
+    const parentMessageId = parentUser?.id || failedMessage.parentMessageId || null;
+    const interactionId = parentUser?.interactionId || failedMessage.interactionId || null;
+
     let retryAttachments =
       failedMessage.referencedAttachments ||
-      precedingUser?.attachments ||
+      parentUser?.attachments ||
       [];
     if ((!retryAttachments || retryAttachments.length === 0) && currentMessagesSnapshot.length > 0) {
       for (let i = currentMessagesSnapshot.length - 1; i >= 0; i--) {
@@ -1863,27 +1907,53 @@ export default function ChatPage() {
     const assistantMessageId =
       `${providerToUse}-${Date.now()}-retry`;
 
-    const initialAssistantMessage = {
-      id: assistantMessageId,
-      sender: 'assistant',
-      provider: providerToUse,
-      modelUsed: null,
-      timestamp: new Date().toLocaleTimeString([], {
-        hour: '2-digit',
-        minute: '2-digit'
-      }),
-      content: '',
-      isStreaming: true,
-      requestStartTime,
-      referencedAttachments: undefined
-    };
+    const initialAssistantMessage = normalizeAssistantMessage(
+      {
+        id: assistantMessageId,
+        sender: 'assistant',
+        parentMessageId,
+        interactionId,
+        provider: providerToUse,
+        modelUsed: null,
+        timestamp: new Date().toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit'
+        }),
+        createdAt: Date.now(),
+        createdAtMs: Date.now(),
+        content: '',
+        isStreaming: true,
+        requestStartTime,
+        referencedAttachments: undefined
+      },
+      parentUser
+    );
 
-    updateMessagesState([
-      ...updatedMessages,
-      initialAssistantMessage
-    ]);
+    let updatedMessages;
+    if (failedIdx >= 0) {
+      updatedMessages = currentMessagesSnapshot.map((m, idx) =>
+        idx === failedIdx ? initialAssistantMessage : m
+      );
+    } else {
+      const parentIdx = currentMessagesSnapshot.findIndex((m) => m.id === parentMessageId);
+      if (parentIdx >= 0) {
+        updatedMessages = [
+          ...currentMessagesSnapshot.slice(0, parentIdx + 1),
+          initialAssistantMessage,
+          ...currentMessagesSnapshot.slice(parentIdx + 1)
+        ];
+      } else {
+        updatedMessages = [...currentMessagesSnapshot, initialAssistantMessage];
+      }
+    }
 
-    const validHistory = updatedMessages.filter(
+    updateMessagesState(updatedMessages);
+
+    const parentIdx = parentUser ? currentMessagesSnapshot.findIndex((m) => m.id === parentUser.id) : -1;
+    const historySlice = parentIdx >= 0
+      ? currentMessagesSnapshot.slice(0, parentIdx)
+      : updatedMessages.filter((m) => m.id !== initialAssistantMessage.id);
+    const validHistory = historySlice.filter(
       (message) => !message.isError && !message.isInterrupted
     );
 
@@ -1929,15 +1999,16 @@ export default function ChatPage() {
     const currentChatId = activeChatIdRef.current;
     const currentMessagesSnapshot = messagesRef.current;
 
-    const updatedMessages = currentMessagesSnapshot.filter(
-      (message) => message.id !== failedMessage.id
-    );
-
     const failedSwitchIdx = currentMessagesSnapshot.findIndex((m) => m.id === failedMessage.id);
-    const precedingSwitchUser = failedSwitchIdx > 0 ? currentMessagesSnapshot[failedSwitchIdx - 1] : null;
+    const parentSwitchUser = failedMessage.parentMessageId
+      ? currentMessagesSnapshot.find((m) => m.id === failedMessage.parentMessageId)
+      : (failedSwitchIdx > 0 ? currentMessagesSnapshot[failedSwitchIdx - 1] : null);
+    const parentMessageId = parentSwitchUser?.id || failedMessage.parentMessageId || null;
+    const interactionId = parentSwitchUser?.interactionId || failedMessage.interactionId || null;
+
     let switchAttachments =
       failedMessage.referencedAttachments ||
-      precedingSwitchUser?.attachments ||
+      parentSwitchUser?.attachments ||
       [];
     if ((!switchAttachments || switchAttachments.length === 0) && currentMessagesSnapshot.length > 0) {
       for (let i = currentMessagesSnapshot.length - 1; i >= 0; i--) {
@@ -1956,27 +2027,53 @@ export default function ChatPage() {
     const assistantMessageId =
       `${newProviderId}-${Date.now()}-fallback`;
 
-    const initialAssistantMessage = {
-      id: assistantMessageId,
-      sender: 'assistant',
-      provider: newProviderId,
-      modelUsed: null,
-      timestamp: new Date().toLocaleTimeString([], {
-        hour: '2-digit',
-        minute: '2-digit'
-      }),
-      content: '',
-      isStreaming: true,
-      requestStartTime,
-      referencedAttachments: undefined
-    };
+    const initialAssistantMessage = normalizeAssistantMessage(
+      {
+        id: assistantMessageId,
+        sender: 'assistant',
+        parentMessageId,
+        interactionId,
+        provider: newProviderId,
+        modelUsed: null,
+        timestamp: new Date().toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit'
+        }),
+        createdAt: Date.now(),
+        createdAtMs: Date.now(),
+        content: '',
+        isStreaming: true,
+        requestStartTime,
+        referencedAttachments: undefined
+      },
+      parentSwitchUser
+    );
 
-    updateMessagesState([
-      ...updatedMessages,
-      initialAssistantMessage
-    ]);
+    let updatedMessages;
+    if (failedSwitchIdx >= 0) {
+      updatedMessages = currentMessagesSnapshot.map((m, idx) =>
+        idx === failedSwitchIdx ? initialAssistantMessage : m
+      );
+    } else {
+      const parentIdx = currentMessagesSnapshot.findIndex((m) => m.id === parentMessageId);
+      if (parentIdx >= 0) {
+        updatedMessages = [
+          ...currentMessagesSnapshot.slice(0, parentIdx + 1),
+          initialAssistantMessage,
+          ...currentMessagesSnapshot.slice(parentIdx + 1)
+        ];
+      } else {
+        updatedMessages = [...currentMessagesSnapshot, initialAssistantMessage];
+      }
+    }
 
-    const validHistory = updatedMessages.filter(
+    updateMessagesState(updatedMessages);
+
+    const parentIdx = parentSwitchUser ? currentMessagesSnapshot.findIndex((m) => m.id === parentSwitchUser.id) : -1;
+    const historySlice = parentIdx >= 0
+      ? currentMessagesSnapshot.slice(0, parentIdx)
+      : updatedMessages.filter((m) => m.id !== initialAssistantMessage.id);
+    const validHistory = historySlice.filter(
       (message) => !message.isError && !message.isInterrupted
     );
 
@@ -2366,7 +2463,6 @@ export default function ChatPage() {
         activeChatIdRef.current = currentChatId;
         setActiveChatId(currentChatId);
         sessionStorage.setItem('orvix_active_chat', currentChatId);
-        sessionStorage.setItem('chatora_active_chat', currentChatId);
       }
 
       if (!requestControllerRef.current.isRequestActive(editRequestId)) return;
@@ -2565,6 +2661,92 @@ export default function ChatPage() {
     }
   };
 
+  // Share Chat eligibility and handler for publishing the entire active conversation
+  const effectiveShareChat = currentChat
+    ? {
+        ...currentChat,
+        title: currentChat.title || activeTitle || 'Shared Chat',
+        mode: currentChat.mode || activeMode || 'general'
+      }
+    : activeChatId
+    ? {
+        id: activeChatId,
+        title: activeTitle || generateChatTitle(messages[0]?.content || 'Shared Chat'),
+        mode: activeMode || 'general'
+      }
+    : null;
+
+  const shareEligibility = evaluateShareEligibility({
+    user: currentUser,
+    chat: effectiveShareChat,
+    messages,
+    isLoading: isLoading || messagesLoading,
+    isSharedPreview: false
+  });
+
+  const handleShareChat = async () => {
+    if (isSharingChatRef.current) {
+      return;
+    }
+
+    const latestChatId = activeChatIdRef.current;
+    const latestChatRecord = userChatsRef.current.find((c) => c.id === latestChatId);
+    const latestChat = latestChatRecord
+      ? {
+          ...latestChatRecord,
+          title: latestChatRecord.title || activeTitle || 'Shared Chat',
+          mode: latestChatRecord.mode || activeMode || 'general'
+        }
+      : latestChatId
+      ? {
+          id: latestChatId,
+          title: activeTitle || generateChatTitle(messagesRef.current[0]?.content || 'Shared Chat'),
+          mode: activeMode || 'general'
+        }
+      : null;
+
+    const latestEligibility = evaluateShareEligibility({
+      user: currentUser,
+      chat: latestChat,
+      messages: messagesRef.current,
+      isLoading: isSubmittingRef.current || isLoading || messagesLoading,
+      isSharedPreview: false
+    });
+
+    if (!latestEligibility.eligible) {
+      setShareErrorNotice(
+        latestEligibility.reason || 'This conversation cannot be shared right now.'
+      );
+      return;
+    }
+
+    isSharingChatRef.current = true;
+    setIsSharingChat(true);
+    setShareErrorNotice(null);
+
+    try {
+      const snapshotResult = await createSharedChatSnapshot(
+        latestChat,
+        messagesRef.current,
+        {
+          user: currentUser,
+          isLoading: isSubmittingRef.current || isLoading || messagesLoading,
+          isSharedPreview: false
+        }
+      );
+
+      setShareModalData(snapshotResult);
+    } catch (error) {
+      console.error('Failed to create shared conversation snapshot:', error);
+      setShareErrorNotice(
+        error?.message || 'Failed to generate share link. Please try again.'
+      );
+    } finally {
+      isSharingChatRef.current = false;
+      setIsSharingChat(false);
+    }
+  };
+
   return (
     <Layout
       onNewChat={handleNewChat}
@@ -2730,6 +2912,18 @@ export default function ChatPage() {
         onCancelWebLLMLoad={handleCancelWebLLMLoad}
         onUnloadWebLLMModel={handleUnloadWebLLMModel}
         providerConfig={providerConfig}
+        onShareChat={handleShareChat}
+        canShareChat={shareEligibility.eligible}
+        shareChatDisabledReason={shareEligibility.reason || ''}
+        isSharingChat={isSharingChat}
+        shareErrorNotice={shareErrorNotice}
+        onDismissShareError={() => setShareErrorNotice(null)}
+      />
+
+      <ShareChatModal
+        isOpen={Boolean(shareModalData)}
+        onClose={() => setShareModalData(null)}
+        shareData={shareModalData}
       />
     </Layout>
   );

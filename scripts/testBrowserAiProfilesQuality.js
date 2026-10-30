@@ -3,7 +3,7 @@
 /**
  * testBrowserAiProfilesQuality.js
  *
- * Automated verification and evaluation suite for Orvix v0.3.0:
+ * Automated verification and evaluation suite for Orvix v0.2.9:
  * Deep Response Quality Fix for the Three Offline Browser AI Models:
  *   1. SmolLM2 135M
  *   2. SmolLM2 360M Instruct
@@ -64,7 +64,7 @@ function runTest(name, fn) {
   }
 }
 
-console.log('\n--- Orvix v0.3.0: Browser AI Response Profiles & Deep Quality Verification ---\n');
+console.log('\n--- Orvix v0.2.9: Browser AI Response Profiles & Deep Quality Verification ---\n');
 
 // 1. Model Classification & Isolation
 runTest('1. Target Model Isolation: Strictly identifies the 3 target models and rejects protected models', () => {
@@ -84,7 +84,7 @@ runTest('1. Target Model Isolation: Strictly identifies the 3 target models and 
   // Protected models MUST return false / null
   assert.strictEqual(isRefinedTargetModel(DEFAULT_WEBLLM_MODEL_ID), false);
   assert.strictEqual(isRefinedTargetModel(FALLBACK_F32_WEBLLM_MODEL_ID), false);
-  assert.strictEqual(isRefinedTargetModel('Qwen2.5-0.5B-Instruct-q4f16_1-MLC'), false);
+  assert.strictEqual(isRefinedTargetModel('unsupported-browser-model-MLC'), false);
   assert.strictEqual(isRefinedTargetModel('gemini-2.5-flash'), false);
   assert.strictEqual(isRefinedTargetModel('llama-3.3-70b-versatile'), false);
   assert.strictEqual(isRefinedTargetModel(null), false);
@@ -94,7 +94,7 @@ runTest('1. Target Model Isolation: Strictly identifies the 3 target models and 
   assert.strictEqual(getBrowserAiModelProfile(DEFAULT_WEBLLM_MODEL_ID), null);
 });
 
-// 2. Model-Specific Profile Distinctness (v0.3.0 Calibrated Hyperparameters)
+// 2. Model-Specific Profile Distinctness (v0.2.9 Calibrated Hyperparameters)
 runTest('2. Profile Distinctness: Calibrated parameters and extra_body enable_thinking: false for Qwen3', () => {
   const p135 = getBrowserAiModelProfile(SMOLLM2_135M_WEBLLM_MODEL_ID);
   const p360 = getBrowserAiModelProfile(SMOLLM2_360M_WEBLLM_MODEL_ID);

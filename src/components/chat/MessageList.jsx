@@ -1,6 +1,7 @@
-import React, { useRef } from 'react';
+import React, { useRef, useMemo } from 'react';
 import ChatMessage from './ChatMessage.jsx';
 import TypingIndicator from './TypingIndicator.jsx';
+import { createConversationOrderMemo } from '../../services/alternativeResponseService.js';
 
 /**
  * MessageList Component
@@ -32,15 +33,34 @@ function MessageList({
   showTimestamps = true,
   selectedProvider = 'gemini',
   activeMode = 'general',
-  providerConfig = null
+  providerConfig = null,
+  onShareChat,
+  canShareChat = false,
+  shareChatDisabledReason = '',
+  isSharingChat = false
 }) {
   const bottomAnchorRef = useRef(null);
+  const orderMemoRef = useRef(null);
+  if (!orderMemoRef.current) {
+    orderMemoRef.current = createConversationOrderMemo();
+  }
 
-  const hasStreamingMessage = messages.some((m) => m.isStreaming);
+  const orderedMessages = useMemo(() => {
+    return orderMemoRef.current(messages);
+  }, [messages]);
+
+  const hasStreamingMessage = useMemo(() => {
+    for (let i = orderedMessages.length - 1; i >= 0; i--) {
+      if (orderedMessages[i]?.isStreaming) {
+        return true;
+      }
+    }
+    return false;
+  }, [orderedMessages]);
 
   return (
     <div className="messages-stream" role="log" aria-live="polite">
-      {messages.map((msg) => (
+      {orderedMessages.map((msg) => (
         <ChatMessage
           key={msg.id}
           message={msg}
@@ -60,6 +80,10 @@ function MessageList({
           selectedProvider={selectedProvider}
           activeMode={activeMode}
           providerConfig={providerConfig}
+          onShareChat={onShareChat}
+          canShareChat={canShareChat}
+          shareChatDisabledReason={shareChatDisabledReason}
+          isSharingChat={isSharingChat}
         />
       ))}
 
