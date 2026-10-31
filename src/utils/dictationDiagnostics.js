@@ -89,6 +89,7 @@ export function createDiagnosticSession({
     mimeType: '',
     audioBlobSizeBytes: 0,
     audioBlobSizeFormatted: '0 B',
+    audioBlobValid: false,
     durationSec: 0,
     nativeInitialized: false,
     recognitionEndedNormally: false,
@@ -99,8 +100,11 @@ export function createDiagnosticSession({
     provider: 'none',
     model: 'none',
     providerStatus: 0,
+    providerSuccess: false,
+    providerFailureReason: 'none',
     latencyMs: 0,
     rawProviderTranscript: '',
+    finalTranscriptSource: 'none',
     reconciliationDecision: 'none',
     reconciliationReason: 'none',
     cleanedTranscript: '',
@@ -137,7 +141,7 @@ export function finalizeDiagnosticSession(session) {
     return null;
   }
 
-  // Format final payload covering all 17 required diagnostic points
+  // Format final payload covering all diagnostic points
   const report = {
     // 1. Unique recording session ID
     sessionId: session.sessionId,
@@ -147,9 +151,10 @@ export function finalizeDiagnosticSession(session) {
     language: session.language,
     // 4. MediaRecorder MIME type
     mimeType: session.mimeType || 'none',
-    // 5. Audio Blob size and recording duration
+    // 5. Audio Blob size, duration, and validity
     audioBlobSizeBytes: session.audioBlobSizeBytes,
     audioBlobSizeFormatted: session.audioBlobSizeFormatted,
+    audioBlobValid: Boolean(session.audioBlobValid ?? (session.audioBlobSizeBytes > 0)),
     durationSec: session.durationSec,
     // 6. Whether native Web Speech recognition was initialized
     nativeInitialized: Boolean(session.nativeInitialized),
@@ -166,13 +171,16 @@ export function finalizeDiagnosticSession(session) {
     // 12. Actual transcription provider and model
     provider: session.provider || 'none',
     model: session.model || 'none',
-    // 13. Provider response status and latency
+    // 13. Provider response status, success/failure, and latency
     providerStatus: session.providerStatus || 0,
+    providerSuccess: Boolean(session.providerSuccess),
+    providerFailureReason: session.providerFailureReason || (session.providerSuccess ? 'none' : 'not_invoked_or_failed'),
     latencyMs: session.latencyMs || 0,
     // 14. Raw provider transcript before client-side processing
     rawProviderTranscript: session.rawProviderTranscript || '',
-    // 15. Reconciliation decision and reason
-    reconciliationDecision: session.reconciliationDecision || 'none',
+    // 15. Final transcript source (provider or native) and decision reason
+    finalTranscriptSource: session.finalTranscriptSource || session.reconciliationDecision || 'none',
+    reconciliationDecision: session.reconciliationDecision || session.finalTranscriptSource || 'none',
     reconciliationReason: session.reconciliationReason || 'none',
     // 16. Transcript after cleaning and formatting
     cleanedTranscript: session.cleanedTranscript || '',
@@ -212,17 +220,17 @@ export function finalizeDiagnosticSession(session) {
     console.log('2. Engine Mode:                 ', report.engineMode);
     console.log('3. Selected Language (BCP-47):  ', report.language);
     console.log('4. MediaRecorder MIME Type:     ', report.mimeType);
-    console.log(`5. Audio Blob Size & Duration:   ${report.audioBlobSizeFormatted} (${report.audioBlobSizeBytes} bytes), ${report.durationSec}s`);
+    console.log(`5. Audio Blob Size & Duration:   ${report.audioBlobSizeFormatted} (${report.audioBlobSizeBytes} bytes), ${report.durationSec}s (Valid: ${report.audioBlobValid})`);
     console.log('6. Native Speech Initialized:   ', report.nativeInitialized);
     console.log('7. Native Completed Normally:   ', report.recognitionEndedNormally);
     console.log('8. Native Had Final Results:    ', report.hadFinalResults);
     console.log('9. Raw Native Transcript:       ', report.rawNativeTranscript ? `"${report.rawNativeTranscript}"` : '[EMPTY]');
-    console.log('10. Server Fallback Invoked:    ', report.serverTranscriptionInvoked);
-    console.log('11. Fallback Decision Reason:   ', report.fallbackReason);
+    console.log('10. Server Transcription Invoked:', report.serverTranscriptionInvoked);
+    console.log('11. Invocation / Bypass Reason: ', report.fallbackReason);
     console.log(`12. Actual Provider & Model:    ${report.provider} (${report.model})`);
-    console.log(`13. Provider Status & Latency:  HTTP ${report.providerStatus}, ${report.latencyMs}ms`);
+    console.log(`13. Provider Status & Latency:  HTTP ${report.providerStatus}, ${report.latencyMs}ms (Success: ${report.providerSuccess}${report.providerFailureReason !== 'none' ? `, Failure: ${report.providerFailureReason}` : ''})`);
     console.log('14. Raw Provider Transcript:    ', report.rawProviderTranscript ? `"${report.rawProviderTranscript}"` : '[NONE]');
-    console.log(`15. Reconciliation Decision:    ${report.reconciliationDecision} (Reason: ${report.reconciliationReason})`);
+    console.log(`15. Final Transcript Source:    ${report.finalTranscriptSource} (Decision: ${report.reconciliationDecision}, Reason: ${report.reconciliationReason})`);
     console.log('16. Cleaned / Formatted Speech: ', report.cleanedTranscript ? `"${report.cleanedTranscript}"` : '[EMPTY]');
     console.log('17. Final Emitted to Composer:  ', report.finalComposerTranscript ? `"${report.finalComposerTranscript}"` : '[EMPTY]');
 
